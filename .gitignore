@@ -1,0 +1,25 @@
+# Dependencies & build artifacts
+node_modules/
+dist/
+target/
+*.tsbuildinfo
+
+# Python / Packer environments
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Large model weights & generated test binaries
+*.gguf
+*.safetensors
+*.bin
+*.ignis
+*.wbin
+*.npy
+weights/
+fixtures/large/
+
+# OS & editor files
+.DS_Store
+Thumbs.db
