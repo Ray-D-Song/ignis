@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Ignis Phase 2 Numerical Alignment Test</title>
+</head>
+<body>
+  <pre id="out">Waiting...</pre>
+  <script type="module">
+    import { IgnisEngine } from '/runtime/ignis-engine.mjs';
+
+    function cosSim(a, b) {
+      let dot = 0, na = 0, nb = 0;
+      for (let i = 0; i < a.length; i++) {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+      }
+      return dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-12);
+    }
+
+    function argmax(arr) {
+      let bestIdx = 0;
+      let bestVal = arr[0];
+      for (let i = 1; i < arr.length; i++) {
+        if (arr[i] > bestVal) {
+          bestVal = arr[i];
+          bestIdx = i;
+        }
+      }
+      return bestIdx;
+    }
+
+    window.__runPhase2Test = async () => {
+      const golden = await (await fetch('/tests/fixtures/tiny-spark-quant-golden.json')).json();
+      const engine = await IgnisEngine.create('/tests/fixtures/tiny-spark-ignis', '/kernels', {
+        maxSeqLen: 64,
+        maxBatchTokens: 32,
+      });
+
+      const pre = await engine.forward(golden.prompt_ids, { captureTraces: true });
+      const firstTok = argmax(pre.logits);
+      const generated = [firstTok];
+
+      const decodeCos = [];
+      for (let step = 0; step < golden.decode_steps.length; step++) {
+        const res = await engine.forward([generated[generated.length - 1]], { captureTraces: true });
+        const gStep = golden.decode_steps[step];
+        decodeCos.push({
+          step,
+          layer0: cosSim(res.traces.layer_0, gStep.layer_0),
+          layer3: cosSim(res.traces.layer_3, gStep.layer_3),
+          finalNorm: cosSim(res.traces.final_norm, gStep.final_norm),
+        });
+        generated.push(argmax(res.logits));
+      }
+
+      const result = {
+        prefillCos: {
+          embed: cosSim(pre.traces.embed_last, golden.prefill_last.embed),
+          layer0: cosSim(pre.traces.layer_0, golden.prefill_last.layer_0),
+          layer3: cosSim(pre.traces.layer_3, golden.prefill_last.layer_3),
+          finalNorm: cosSim(pre.traces.final_norm, golden.prefill_last.final_norm),
+        },
+        decodeCos,
+        expectedGreedy: golden.generated_greedy_ids,
+        actualGreedy: generated,
+        greedyExactMatch: JSON.stringify(generated) === JSON.stringify(golden.generated_greedy_ids),
+      };
+      document.getElementById('out').textContent = JSON.stringify(result, null, 2);
+      return result;
+    };
+  </script>
+</body>
+</html>

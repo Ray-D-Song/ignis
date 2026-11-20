@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8" /><title>Ignis Kernel Unit Tests</title></head>
+<body>
+<script type="module">
+window.__runKernelTests = async (golden) => {
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  const device = await adapter.requestDevice({
+    requiredFeatures: ['shader-f16', 'subgroups'],
+  });
+
+  async function compile(fname) {
+    const code = await (await fetch(`/kernels/${fname}`)).text();
+    const mod = device.createShaderModule({ code, label: fname });
+    const info = await mod.getCompilationInfo();
+    const errs = info.messages.filter((m) => m.type === 'error');
+    if (errs.length) throw new Error(`${fname}: ${errs.map((e) => e.message).join('; ')}`);
+    return mod;
+  }
+
+  function makeBuf(data, usage) {
+    const buf = device.createBuffer({ size: Math.max(16, Math.ceil(data.byteLength / 16) * 16), usage: usage | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(buf, 0, data);
+    return buf;
+  }
+
+  async function readF32(buf, count) {
+    const rb = device.createBuffer({ size: count * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(buf, 0, rb, 0, count * 4);
+    device.queue.submit([enc.finish()]);
+    await rb.mapAsync(GPUMapMode.READ);
+    const out = Array.from(new Float32Array(rb.getMappedRange().slice(0)));
+    rb.unmap();
+    rb.destroy();
+    return out;
+  }
+
+  // Test 1: RMSNorm
+  const rmsMod = await compile('rmsnorm.wgsl');
+  const rmsPipe = device.createComputePipeline({ layout: 'auto', compute: { module: rmsMod, entryPoint: 'main' } });
+  const uRms = new ArrayBuffer(16);
+  new Uint32Array(uRms)[0] = golden.rms.dim;
+  new Uint32Array(uRms)[1] = golden.rms.tokens;
+  new Float32Array(uRms)[2] = golden.rms.eps;
+  const bURms = makeBuf(uRms, GPUBufferUsage.UNIFORM);
+  const bXRms = makeBuf(new Float32Array(golden.rms.x), GPUBufferUsage.STORAGE);
+  const bWRms = makeBuf(new Float32Array(golden.rms.w), GPUBufferUsage.STORAGE);
+  const bORms = device.createBuffer({ size: golden.rms.x.length * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  let enc = device.createCommandEncoder();
+  let pass = enc.beginComputePass();
+  pass.setPipeline(rmsPipe);
+  pass.setBindGroup(0, device.createBindGroup({
+    layout: rmsPipe.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: bURms } },
+      { binding: 1, resource: { buffer: bXRms } },
+      { binding: 2, resource: { buffer: bWRms } },
+      { binding: 3, resource: { buffer: bORms } },
+    ],
+  }));
+  pass.dispatchWorkgroups(golden.rms.tokens);
+  pass.end();
+  device.queue.submit([enc.finish()]);
+  const rmsOut = await readF32(bORms, golden.rms.x.length);
+
+  // Test 2: GEMV & GEMM4
+  const qmmMod = await compile('quant_matmul.wgsl');
+  const gemvPipe = device.createComputePipeline({ layout: 'auto', compute: { module: qmmMod, entryPoint: 'gemv_q4_g64' } });
+  const gemmPipe = device.createComputePipeline({ layout: 'auto', compute: { module: qmmMod, entryPoint: 'gemm4_q4_g64' } });
+
+  const bQ = makeBuf(new Uint32Array(golden.qmm.quants), GPUBufferUsage.STORAGE);
+  const bS = makeBuf(new Uint32Array(golden.qmm.scales), GPUBufferUsage.STORAGE);
+  const bX = makeBuf(new Float32Array(golden.qmm.x), GPUBufferUsage.STORAGE);
+  const bOGemv = device.createBuffer({ size: golden.qmm.M * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const bOGemm = device.createBuffer({ size: golden.qmm.T * golden.qmm.M * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+
+  const uGemv = new Uint32Array([golden.qmm.M, golden.qmm.K, 1, golden.qmm.K_pad]);
+  const uGemm = new Uint32Array([golden.qmm.M, golden.qmm.K, golden.qmm.T, golden.qmm.K_pad]);
+  const bUGemv = makeBuf(uGemv, GPUBufferUsage.UNIFORM);
+  const bUGemm = makeBuf(uGemm, GPUBufferUsage.UNIFORM);
+
+  enc = device.createCommandEncoder();
+  pass = enc.beginComputePass();
+  pass.setPipeline(gemvPipe);
+  pass.setBindGroup(0, device.createBindGroup({
+    layout: gemvPipe.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: bUGemv } },
+      { binding: 1, resource: { buffer: bQ } },
+      { binding: 2, resource: { buffer: bS } },
+      { binding: 3, resource: { buffer: bX } },
+      { binding: 4, resource: { buffer: bOGemv } },
+    ],
+  }));
+  pass.dispatchWorkgroups(Math.ceil(golden.qmm.M / 4), 1, 1);
+  pass.end();
+
+  pass = enc.beginComputePass();
+  pass.setPipeline(gemmPipe);
+  pass.setBindGroup(0, device.createBindGroup({
+    layout: gemmPipe.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: bUGemm } },
+      { binding: 1, resource: { buffer: bQ } },
+      { binding: 2, resource: { buffer: bS } },
+      { binding: 3, resource: { buffer: bX } },
+      { binding: 4, resource: { buffer: bOGemm } },
+    ],
+  }));
+  pass.dispatchWorkgroups(Math.ceil(golden.qmm.M / 4), Math.ceil(golden.qmm.T / 4), 1);
+  pass.end();
+  device.queue.submit([enc.finish()]);
+
+  const gemvOut = await readF32(bOGemv, golden.qmm.M);
+  const gemmOut = await readF32(bOGemm, golden.qmm.T * golden.qmm.M);
+
+  // Test 3: GeGLU
+  const ewMod = await compile('elementwise.wgsl');
+  const gegluPipe = device.createComputePipeline({ layout: 'auto', compute: { module: ewMod, entryPoint: 'geglu' } });
+  const uEw = new Uint32Array([golden.geglu.a.length, 0, 0, 0]);
+  const bUEw = makeBuf(uEw, GPUBufferUsage.UNIFORM);
+  const bA = makeBuf(new Float32Array(golden.geglu.a), GPUBufferUsage.STORAGE);
+  const bB = makeBuf(new Float32Array(golden.geglu.b), GPUBufferUsage.STORAGE);
+  const bOEw = device.createBuffer({ size: golden.geglu.a.length * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  enc = device.createCommandEncoder();
+  pass = enc.beginComputePass();
+  pass.setPipeline(gegluPipe);
+  pass.setBindGroup(0, device.createBindGroup({
+    layout: gegluPipe.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: bUEw } },
+      { binding: 1, resource: { buffer: bA } },
+      { binding: 2, resource: { buffer: bB } },
+      { binding: 3, resource: { buffer: bOEw } },
+    ],
+  }));
+  pass.dispatchWorkgroups(Math.ceil(golden.geglu.a.length / 256));
+  pass.end();
+  device.queue.submit([enc.finish()]);
+  const gegluOut = await readF32(bOEw, golden.geglu.a.length);
+
+  // Test 4: linear_f32 + rope_kv + attention
+  const linMod = await compile('linear_f32.wgsl');
+  const linPipe = device.createComputePipeline({ layout: 'auto', compute: { module: linMod, entryPoint: 'linear_f32' } });
+  const ropeMod = await compile('rope_kv.wgsl');
+  const ropePipe = device.createComputePipeline({ layout: 'auto', compute: { module: ropeMod, entryPoint: 'main' } });
+  const attnMod = await compile('attention.wgsl');
+  const attnPipe = device.createComputePipeline({ layout: 'auto', compute: { module: attnMod, entryPoint: 'main' } });
+
+  const { T, start_pos, q_heads, kv_heads, head_dim, rope_dim, kv_capacity, sliding_window, is_swa, has_gate, rope_theta } = golden.attn;
+  const qDim = q_heads * head_dim;
+  const kvDim = kv_heads * head_dim;
+  const bQkv = makeBuf(new Float32Array(golden.attn.qkv), GPUBufferUsage.STORAGE);
+  const bQRot = device.createBuffer({ size: T * qDim * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const kvBytes = kv_heads * kv_capacity * head_dim * 2;
+  const bKCache = device.createBuffer({ size: kvBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const bVCache = device.createBuffer({ size: kvBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const bGate = makeBuf(new Float32Array(golden.attn.gate), GPUBufferUsage.STORAGE);
+  const bAttnOut = device.createBuffer({ size: T * qDim * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+
+  const uRopeAb = new ArrayBuffer(48);
+  const uRopeU = new Uint32Array(uRopeAb);
+  const uRopeF = new Float32Array(uRopeAb);
+  uRopeU[0] = T; uRopeU[1] = start_pos; uRopeU[2] = q_heads; uRopeU[3] = kv_heads;
+  uRopeU[4] = head_dim; uRopeU[5] = rope_dim; uRopeU[6] = kv_capacity; uRopeU[7] = is_swa;
+  uRopeF[8] = rope_theta;
+  const bURope = makeBuf(new Uint8Array(uRopeAb), GPUBufferUsage.UNIFORM);
+
+  const uAttnAb = new ArrayBuffer(48);
+  const uAttnU = new Uint32Array(uAttnAb);
+  const uAttnF = new Float32Array(uAttnAb);
+  uAttnU[0] = T; uAttnU[1] = start_pos; uAttnU[2] = q_heads; uAttnU[3] = kv_heads;
+  uAttnU[4] = head_dim; uAttnU[5] = kv_capacity; uAttnU[6] = sliding_window; uAttnU[7] = is_swa; uAttnU[8] = has_gate;
+  uAttnF[9] = 1.0 / Math.sqrt(head_dim);
+  const bUAttn = makeBuf(new Uint8Array(uAttnAb), GPUBufferUsage.UNIFORM);
+
+  enc = device.createCommandEncoder();
+  pass = enc.beginComputePass();
+  pass.setPipeline(ropePipe);
+  pass.setBindGroup(0, device.createBindGroup({
+    layout: ropePipe.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: bURope } },
+      { binding: 1, resource: { buffer: bQkv } },
+      { binding: 2, resource: { buffer: bQRot } },
+      { binding: 3, resource: { buffer: bKCache } },
+      { binding: 4, resource: { buffer: bVCache } },
+    ],
+  }));
+  pass.dispatchWorkgroups(Math.ceil(Math.max(qDim, kvDim) / 128), T, 1);
+  pass.end();
+
+  pass = enc.beginComputePass();
+  pass.setPipeline(attnPipe);
+  pass.setBindGroup(0, device.createBindGroup({
+    layout: attnPipe.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: bUAttn } },
+      { binding: 1, resource: { buffer: bQRot } },
+      { binding: 2, resource: { buffer: bKCache } },
+      { binding: 3, resource: { buffer: bVCache } },
+      { binding: 4, resource: { buffer: bGate } },
+      { binding: 5, resource: { buffer: bAttnOut } },
+    ],
+  }));
+  pass.dispatchWorkgroups(q_heads, T, 1);
+  pass.end();
+  device.queue.submit([enc.finish()]);
+
+  const qRotOut = await readF32(bQRot, T * qDim);
+  const attnOut = await readF32(bAttnOut, T * qDim);
+
+  device.destroy();
+  return { rmsOut, gemvOut, gemmOut, gegluOut, qRotOut, attnOut };
+};
+</script>
+</body>
+</html>
