@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8" /><title>Ignis Phase 5 Multi-Arch SwiGLU Test</title></head>
+<body>
+<script type="module">
+  import { IgnisEngine } from '/runtime/ignis-engine.mjs';
+
+  function cosSim(a, b) {
+    let dot = 0, na = 0, nb = 0;
+    for (let i = 0; i < a.length; i++) { dot += a[i]*b[i]; na += a[i]*a[i]; nb += b[i]*b[i]; }
+    return dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-12);
+  }
+  function argmax(arr) {
+    let bi = 0, bv = arr[0];
+    for (let i = 1; i < arr.length; i++) { if (arr[i] > bv) { bv = arr[i]; bi = i; } }
+    return bi;
+  }
+
+  window.__runPhase5MultiArch = async () => {
+    const golden = await (await fetch('/tests/fixtures/tiny-llama-quant-golden.json')).json();
+    const engine = await IgnisEngine.create('/tests/fixtures/tiny-llama-ignis', '/kernels', {
+      maxSeqLen: 64,
+      maxBatchTokens: 32,
+    });
+    const pre = await engine.forward(golden.prompt_ids, { captureTraces: true });
+    const gen = [argmax(pre.logits)];
+    const decCos = [];
+    for (let s = 0; s < golden.decode_steps.length; s++) {
+      const res = await engine.forward([gen[gen.length - 1]], { captureTraces: true });
+      decCos.push(cosSim(res.traces.final_norm, golden.decode_steps[s].final_norm));
+      gen.push(argmax(res.logits));
+    }
+    engine.destroy();
+    return {
+      hiddenAct: engine.bp.hidden_act,
+      hasGate: engine.bp.has_attn_gate,
+      prefillFinalNormCos: cosSim(pre.traces.final_norm, golden.prefill_last.final_norm),
+      decodeFinalNormCos: decCos,
+      expectedGreedy: golden.generated_greedy_ids,
+      actualGreedy: gen,
+      greedyMatch: JSON.stringify(gen) === JSON.stringify(golden.generated_greedy_ids),
+    };
+  };
+</script>
+</body>
+</html>

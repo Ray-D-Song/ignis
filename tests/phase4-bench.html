@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8" /><title>Ignis Phase 4 Full-Scale 4B Shape Benchmark</title></head>
+<body>
+<pre id="out">Running...</pre>
+<script type="module">
+  // Benchmark exact Spark-X2.6-4B layer dimensions (36 layers: 27 SWA + 9 Full, D=2560, FF=10240, V=131072)
+  // using 4 distinct layers repeated 9x in VRAM so it executes real 2.2 GB weight traffic & 36-layer dispatch
+  // without needing an 8GB download yet.
+  window.__runPhase4Bench = async () => {
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    const hasTs = adapter.features.has('timestamp-query');
+    const features = ['shader-f16', 'subgroups', ...(hasTs ? ['timestamp-query'] : [])];
+    const device = await adapter.requestDevice({
+      requiredFeatures: features,
+      requiredLimits: {
+        maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+        maxBufferSize: adapter.limits.maxBufferSize,
+        maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
+      },
+    });
+    device.addEventListener('uncapturederror', (ev) => {
+      console.error('[WebGPU uncapturederror]', ev.error?.message || ev.error);
+    });
+
+    async function loadPipe(fname, entry, layout = 'auto') {
+      const code = await (await fetch(`/kernels/${fname}`)).text();
+      const mod = device.createShaderModule({ code, label: fname });
+      return device.createComputePipeline({ layout, compute: { module: mod, entryPoint: entry } });
+    }
+
+    const attnDecodeBgl = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      ],
+    });
+    const attnDecodeLayout = device.createPipelineLayout({ bindGroupLayouts: [attnDecodeBgl] });
+
+    const pNorm = await loadPipe('rmsnorm.wgsl', 'main');
+    const pGemv = await loadPipe('quant_matmul.wgsl', 'gemv_q4_g64');
+    const pGemvAdd = await loadPipe('quant_matmul.wgsl', 'gemv_q4_g64_add');
+    const pGemm4 = await loadPipe('quant_matmul.wgsl', 'gemm4_q4_g64');
+    const pGemm4Add = await loadPipe('quant_matmul.wgsl', 'gemm4_q4_g64_add');
+    const pGegluGemv = await loadPipe('fused_geglu_q4.wgsl', 'gemv_geglu_q4_g64');
+    const pGegluGemm4 = await loadPipe('fused_geglu_q4.wgsl', 'gemm4_geglu_q4_g64');
+    const pLin = await loadPipe('linear_f32.wgsl', 'linear_f32');
+    const pRope = await loadPipe('rope_kv.wgsl', 'main');
+    const pAttnSplit = await loadPipe('attention_decode.wgsl', 'split_kv_gqa', attnDecodeLayout);
+    const pAttnReduce = await loadPipe('attention_decode.wgsl', 'reduce_kv_gqa', attnDecodeLayout);
+
+    const D = 2560, FF = 10240, QH = 16, KVH = 4, HD = 256, QDIM = 4096, KVDIM = 1024, QKV = 6144, V = 131072;
+    const MAX_BATCH = 128;
+    const SWA_CAP = 512 + MAX_BATCH;
+    const FULL_CAP = 4096;
+
+    const mkBuf = (bytes, usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST) =>
+      device.createBuffer({ size: Math.ceil(bytes / 16) * 16, usage });
+    const mkUni = (setup) => {
+      const ab = new ArrayBuffer(64);
+      setup(new Uint32Array(ab), new Float32Array(ab));
+      const b = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(b, 0, ab);
+      return b;
+    };
+
+    const allocQ4 = (M, K) => ({
+      M, K,
+      q: mkBuf(M * (K / 8) * 4),
+      s: mkBuf(M * (K / 64) * 4),
+    });
+
+    // Allocate 4 distinct physical layer weight sets (~240 MB) + LM Head (~189 MB)
+    const layers = [];
+    for (let i = 0; i < 4; i++) {
+      layers.push({
+        isSwa: i < 3,
+        attnNorm: mkBuf(D * 4),
+        qkv: allocQ4(QKV, D),
+        gate: mkBuf(QH * D * 4),
+        o: allocQ4(D, QDIM),
+        ffnNorm: mkBuf(D * 4),
+        ffnGate: allocQ4(FF, D),
+        ffnUp: allocQ4(FF, D),
+        ffnDown: allocQ4(D, FF),
+        k: mkBuf(KVH * (i < 3 ? SWA_CAP : FULL_CAP) * HD * 2),
+        v: mkBuf(KVH * (i < 3 ? SWA_CAP : FULL_CAP) * HD * 2),
+      });
+    }
+    const outNorm = mkBuf(D * 4);
+    const lmHead = allocQ4(V, D);
+
+    const bufs = {
+      x: mkBuf(MAX_BATCH * D * 4),
+      norm: mkBuf(MAX_BATCH * D * 4),
+      qkv: mkBuf(MAX_BATCH * QKV * 4),
+      qRot: mkBuf(MAX_BATCH * QDIM * 4),
+      attnGate: mkBuf(MAX_BATCH * QH * 4),
+      attnSplit: mkBuf(QH * 16 * (HD + 2) * 4),
+      attnOut: mkBuf(MAX_BATCH * QDIM * 4),
+      ffnAct: mkBuf(MAX_BATCH * FF * 4),
+      logits: mkBuf(V * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC),
+    };
+    device.queue.writeBuffer(bufs.x, 0, new Float32Array(MAX_BATCH * D).fill(0.01));
+
+    const tsQs = hasTs ? device.createQuerySet({ type: 'timestamp', count: 24 }) : null;
+    const tsRes = hasTs ? device.createBuffer({ size: 24 * 8, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC }) : null;
+    const tsRead = hasTs ? device.createBuffer({ size: 24 * 8, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }) : null;
+    const logitRead = device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+
+    // Build Static 36-layer Decode Plan (4 physical layers cycled 9 times)
+    const uNorm1 = mkUni((u, f) => { u[0] = D; u[1] = 1; f[2] = 1e-6; });
+    const uGate1 = mkUni((u) => { u[0] = QH; u[1] = D; u[2] = 1; });
+    const uMatQkv1 = mkUni((u) => { u[0] = QKV; u[1] = D; u[2] = 1; u[3] = D; });
+    const uMatO1 = mkUni((u) => { u[0] = D; u[1] = QDIM; u[2] = 1; u[3] = QDIM; });
+    const uMatFf1 = mkUni((u) => { u[0] = FF; u[1] = D; u[2] = 1; u[3] = D; });
+    const uMatDn1 = mkUni((u) => { u[0] = D; u[1] = FF; u[2] = 1; u[3] = FF; });
+    const uMatLm1 = mkUni((u) => { u[0] = V; u[1] = D; u[2] = 1; u[3] = D; });
+
+    const uRopeSwa = mkUni((u, f) => { u[0]=1; u[1]=0; u[2]=QH; u[3]=KVH; u[4]=HD; u[5]=256; u[6]=SWA_CAP; u[7]=1; f[8]=10000; });
+    const uRopeFull = mkUni((u, f) => { u[0]=1; u[1]=0; u[2]=QH; u[3]=KVH; u[4]=HD; u[5]=64; u[6]=FULL_CAP; u[7]=0; f[8]=5000000; });
+    const uAttnSwa = mkUni((u, f) => { u[0]=1; u[1]=0; u[2]=QH; u[3]=KVH; u[4]=HD; u[5]=SWA_CAP; u[6]=512; u[7]=1; u[8]=1; f[9]=1/Math.sqrt(HD); });
+    const uAttnFull = mkUni((u, f) => { u[0]=1; u[1]=0; u[2]=QH; u[3]=KVH; u[4]=HD; u[5]=FULL_CAP; u[6]=0; u[7]=0; u[8]=1; f[9]=1/Math.sqrt(HD); });
+
+    const decodeSteps = [];
+    for (let li = 0; li < 36; li++) {
+      const L = layers[li % 4];
+      decodeSteps.push({
+        pipe: pNorm, wgX: 1, wgY: 1,
+        bg: device.createBindGroup({ layout: pNorm.getBindGroupLayout(0), entries: [
+          { binding: 0, resource: { buffer: uNorm1, size: 16 } }, { binding: 1, resource: { buffer: bufs.x } },
+          { binding: 2, resource: { buffer: L.attnNorm } }, { binding: 3, resource: { buffer: bufs.norm } },
+        ]}),
+      });
+      decodeSteps.push({
+        pipe: pGemv, wgX: Math.ceil(QKV / 4), wgY: 1,
+        bg: device.createBindGroup({ layout: pGemv.getBindGroupLayout(0), entries: [
+          { binding: 0, resource: { buffer: uMatQkv1, size: 16 } }, { binding: 1, resource: { buffer: L.qkv.q } },
+          { binding: 2, resource: { buffer: L.qkv.s } }, { binding: 3, resource: { buffer: bufs.norm } }, { binding: 4, resource: { buffer: bufs.qkv } },
+        ]}),
+      });
+      decodeSteps.push({
+        pipe: pLin, wgX: Math.ceil(QH / 4), wgY: 1,
+        bg: device.createBindGroup({ layout: pLin.getBindGroupLayout(0), entries: [
+          { binding: 0, resource: { buffer: uGate1, size: 16 } }, { binding: 1, resource: { buffer: L.gate } },
+          { binding: 2, resource: { buffer: bufs.norm } }, { binding: 3, resource: { buffer: bufs.attnGate } },
+        ]}),
+      });
+      decodeSteps.push({
+        pipe: pRope, wgX: Math.ceil(QDIM / 128), wgY: 1,
+        bg: device.createBindGroup({ layout: pRope.getBindGroupLayout(0), entries: [
+          { binding: 0, resource: { buffer: L.isSwa ? uRopeSwa : uRopeFull, size: 48 } },
+          { binding: 1, resource: { buffer: bufs.qkv } }, { binding: 2, resource: { buffer: bufs.qRot } },
+          { binding: 3, resource: { buffer: L.k } }, { binding: 4, resource: { buffer: L.v } },
+        ]}),
+      });
+      const bgAttnDec = device.createBindGroup({
+        layout: attnDecodeBgl,
+        entries: [
+          { binding: 0, resource: { buffer: L.isSwa ? uAttnSwa : uAttnFull, size: 48 } },
+          { binding: 1, resource: { buffer: bufs.qRot } }, { binding: 2, resource: { buffer: L.k } },
+          { binding: 3, resource: { buffer: L.v } }, { binding: 4, resource: { buffer: bufs.attnGate } },
+          { binding: 5, resource: { buffer: bufs.attnSplit } }, { binding: 6, resource: { buffer: bufs.attnOut } },
+        ],
+      });
+      decodeSteps.push({ pipe: pAttnSplit, wgX: KVH * 16, wgY: 1, bg: bgAttnDec });
+      decodeSteps.push({ pipe: pAttnReduce, wgX: QH, wgY: 1, bg: bgAttnDec });
+      decodeSteps.push({
+        pipe: pGemvAdd, wgX: Math.ceil(D / 4), wgY: 1,
+        bg: device.createBindGroup({ layout: pGemvAdd.getBindGroupLayout(0), entries: [
+          { binding: 0, resource: { buffer: uMatO1, size: 16 } }, { binding: 1, resource: { buffer: L.o.q } },
+          { binding: 2, resource: { buffer: L.o.s } }, { binding: 3, resource: { buffer: bufs.attnOut } }, { binding: 4, resource: { buffer: bufs.x } },
+        ]}),
+      });
+      decodeSteps.push({
+        pipe: pNorm, wgX: 1, wgY: 1,
+        bg: device.createBindGroup({ layout: pNorm.getBindGroupLayout(0), entries: [
+          { binding: 0, resource: { buffer: uNorm1, size: 16 } }, { binding: 1, resource: { buffer: bufs.x } },
+          { binding: 2, resource: { buffer: L.ffnNorm } }, { binding: 3, resource: { buffer: bufs.norm } },
+        ]}),
+      });
+      decodeSteps.push({
+        pipe: pGegluGemv, wgX: Math.ceil(FF / 4), wgY: 1,
+        bg: device.createBindGroup({ layout: pGegluGemv.getBindGroupLayout(0), entries: [
+          { binding: 0, resource: { buffer: uMatFf1, size: 16 } },
+          { binding: 1, resource: { buffer: L.ffnGate.q } }, { binding: 2, resource: { buffer: L.ffnGate.s } },
+          { binding: 3, resource: { buffer: L.ffnUp.q } }, { binding: 4, resource: { buffer: L.ffnUp.s } },
+          { binding: 5, resource: { buffer: bufs.norm } }, { binding: 6, resource: { buffer: bufs.ffnAct } },
+        ]}),
+      });
+      decodeSteps.push({
+        pipe: pGemvAdd, wgX: Math.ceil(D / 4), wgY: 1,
+        bg: device.createBindGroup({ layout: pGemvAdd.getBindGroupLayout(0), entries: [
+          { binding: 0, resource: { buffer: uMatDn1, size: 16 } }, { binding: 1, resource: { buffer: L.ffnDown.q } },
+          { binding: 2, resource: { buffer: L.ffnDown.s } }, { binding: 3, resource: { buffer: bufs.ffnAct } }, { binding: 4, resource: { buffer: bufs.x } },
+        ]}),
+      });
+    }
+    decodeSteps.push({
+      pipe: pNorm, wgX: 1, wgY: 1,
+      bg: device.createBindGroup({ layout: pNorm.getBindGroupLayout(0), entries: [
+        { binding: 0, resource: { buffer: uNorm1, size: 16 } }, { binding: 1, resource: { buffer: bufs.x } },
+        { binding: 2, resource: { buffer: outNorm } }, { binding: 3, resource: { buffer: bufs.norm } },
+      ]}),
+    });
+    decodeSteps.push({
+      pipe: pGemv, wgX: Math.ceil(V / 4), wgY: 1,
+      bg: device.createBindGroup({ layout: pGemv.getBindGroupLayout(0), entries: [
+        { binding: 0, resource: { buffer: uMatLm1, size: 16 } }, { binding: 1, resource: { buffer: lmHead.q } },
+        { binding: 2, resource: { buffer: lmHead.s } }, { binding: 3, resource: { buffer: bufs.norm } }, { binding: 4, resource: { buffer: bufs.logits } },
+      ]}),
+    });
+
+    async function runDecodeStep(pos, profile) {
+      const hdr = new Uint32Array([1, pos]);
+      device.queue.writeBuffer(uRopeSwa, 0, hdr);
+      device.queue.writeBuffer(uAttnSwa, 0, hdr);
+      device.queue.writeBuffer(uRopeFull, 0, hdr);
+      device.queue.writeBuffer(uAttnFull, 0, hdr);
+
+      const enc = device.createCommandEncoder();
+      // Record timestamps for layer 0 (steps 0..8), total (0..last), and LM head (last step)
+      for (let s = 0; s < decodeSteps.length; s++) {
+        const st = decodeSteps[s];
+        let desc = {};
+        if (profile && hasTs) {
+          if (s <= 9) {
+            desc = { timestampWrites: { querySet: tsQs, beginningOfPassWriteIndex: s * 2, endOfPassWriteIndex: s * 2 + 1 } };
+          } else if (s === decodeSteps.length - 1) {
+            desc = { timestampWrites: { querySet: tsQs, beginningOfPassWriteIndex: 20, endOfPassWriteIndex: 21 } };
+          }
+        }
+        const pass = enc.beginComputePass(desc);
+        pass.setPipeline(st.pipe);
+        pass.setBindGroup(0, st.bg);
+        pass.dispatchWorkgroups(st.wgX, st.wgY, 1);
+        pass.end();
+      }
+      if (profile && hasTs) {
+        enc.resolveQuerySet(tsQs, 0, 22, tsRes, 0);
+        enc.copyBufferToBuffer(tsRes, 0, tsRead, 0, 22 * 8);
+      }
+      enc.copyBufferToBuffer(bufs.logits, 0, logitRead, 0, 16);
+      device.queue.submit([enc.finish()]);
+      await logitRead.mapAsync(GPUMapMode.READ);
+      logitRead.unmap();
+      if (profile && hasTs) {
+        await tsRead.mapAsync(GPUMapMode.READ);
+        const ts = new BigInt64Array(tsRead.getMappedRange().slice(0));
+        tsRead.unmap();
+        return {
+          totalMs: Number(ts[21] - ts[0]) / 1e6,
+          l0: {
+            norm1: Number(ts[1] - ts[0]) / 1e6,
+            qkv: Number(ts[3] - ts[2]) / 1e6,
+            gate: Number(ts[5] - ts[4]) / 1e6,
+            rope: Number(ts[7] - ts[6]) / 1e6,
+            attnSplit: Number(ts[9] - ts[8]) / 1e6,
+            attnReduce: Number(ts[11] - ts[10]) / 1e6,
+            o: Number(ts[13] - ts[12]) / 1e6,
+            norm2: Number(ts[15] - ts[14]) / 1e6,
+            geglu: Number(ts[17] - ts[16]) / 1e6,
+            down: Number(ts[19] - ts[18]) / 1e6,
+          },
+          lmHead: Number(ts[21] - ts[20]) / 1e6,
+        };
+      }
+      return null;
+    }
+
+    // Warmup + timed 10 decode steps at kv_len=512
+    await runDecodeStep(512, false);
+    const gpuSamples = [];
+    const t0 = performance.now();
+    for (let k = 0; k < 10; k++) {
+      const p = await runDecodeStep(513 + k, true);
+      if (p != null) gpuSamples.push(p);
+    }
+    const wallTotalMs = performance.now() - t0;
+    const avgWallMs = wallTotalMs / 10;
+    const avgGpuMs = gpuSamples.length ? gpuSamples.reduce((a, b) => a + b.totalMs, 0) / gpuSamples.length : avgWallMs;
+    const lastBreakdown = gpuSamples[gpuSamples.length - 1];
+
+    // 36 layers Q4 body + LM head bytes read per token = (36 * 104.86M + 335.5M) * 0.5625 bytes
+    const weightBytesPerToken = (36 * (QKV * D + D * QDIM + 3 * FF * D) + V * D) * 0.5625;
+    const effectiveGBps = (weightBytesPerToken / 1e9) / (avgGpuMs / 1000);
+
+    const out = {
+      adapter: adapter.info,
+      hasTimestampQuery: hasTs,
+      passesPerToken: decodeSteps.length,
+      weightTrafficGBPerToken: +(weightBytesPerToken / 1e9).toFixed(3),
+      avgWallMsPerToken: +avgWallMs.toFixed(2),
+      avgGpuMsPerToken: +avgGpuMs.toFixed(2),
+      wallTokPerSec: +(1000 / avgWallMs).toFixed(2),
+      gpuTokPerSec: +(1000 / avgGpuMs).toFixed(2),
+      effectiveBandwidthGBps: +effectiveGBps.toFixed(1),
+      breakdownMs: lastBreakdown,
+    };
+    device.destroy();
+    document.getElementById('out').textContent = JSON.stringify(out, null, 2);
+    return out;
+  };
+</script>
+</body>
+</html>

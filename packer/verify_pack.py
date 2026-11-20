@@ -139,7 +139,9 @@ def forward_ignis_ref(
         x = x + F.linear(attn_out, tw[f"blk.{i}.attn_output"])
 
         hf = rms_norm(x, tw[f"blk.{i}.ffn_norm"], eps)
-        mlp_h = F.gelu(F.linear(hf, tw[f"blk.{i}.ffn_gate"])) * F.linear(hf, tw[f"blk.{i}.ffn_up"])
+        gate_val = F.linear(hf, tw[f"blk.{i}.ffn_gate"])
+        act_val = F.silu(gate_val) if bp.get("hidden_act") == "silu" else F.gelu(gate_val)
+        mlp_h = act_val * F.linear(hf, tw[f"blk.{i}.ffn_up"])
         x = x + F.linear(mlp_h, tw[f"blk.{i}.ffn_down"])
         traces[f"layer_{i}"] = x.clone()
 
@@ -171,19 +173,23 @@ def main() -> None:
         next_tok = int(torch.argmax(last_logits).item())
         generated = [next_tok]
         decode_steps = []
+        last_layer_key = f"layer_{bp['num_layers'] - 1}"
         for step in range(5):
             pos = torch.tensor([len(prompt_ids) + step], dtype=torch.long)
             cin = torch.tensor([[generated[-1]]], dtype=torch.long)
             d_logits, d_tr = forward_ignis_ref(bp, tw, cin, pos, kv_cache)
-            decode_steps.append({
+            step_obj = {
                 "pos": int(pos.item()),
                 "token_in": generated[-1],
                 "layer_0": d_tr["layer_0"][0, 0].tolist(),
-                "layer_3": d_tr["layer_3"][0, 0].tolist(),
+                "last_layer": d_tr[last_layer_key][0, 0].tolist(),
                 "final_norm": d_tr["final_norm"][0, 0].tolist(),
                 "logits_top8_idx": torch.topk(d_logits[0, 0], 8).indices.tolist(),
                 "logits_top8_val": torch.topk(d_logits[0, 0], 8).values.tolist(),
-            })
+            }
+            if "layer_3" in d_tr:
+                step_obj["layer_3"] = d_tr["layer_3"][0, 0].tolist()
+            decode_steps.append(step_obj)
             generated.append(int(torch.argmax(d_logits[0, 0]).item()))
 
     def cos_sim(a: list[float], b: list[float]) -> float:
@@ -196,16 +202,20 @@ def main() -> None:
     print(f"[verify_pack] SHA-256 & headers OK | prefill final_norm cos={cos_pre:.6f} | decode0 final_norm cos={cos_dec0:.6f}")
     print(f"[verify_pack] FP16 greedy={fp_golden['generated_greedy_ids']} | Q4 .ignis greedy={generated}")
 
+    prefill_obj = {
+        "embed": pre_tr["embed"][0, -1].tolist(),
+        "layer_0": pre_tr["layer_0"][0, -1].tolist(),
+        "last_layer": pre_tr[last_layer_key][0, -1].tolist(),
+        "final_norm": pre_tr["final_norm"][0, -1].tolist(),
+        "logits_top8_idx": torch.topk(last_logits, 8).indices.tolist(),
+        "logits_top8_val": torch.topk(last_logits, 8).values.tolist(),
+    }
+    if "layer_3" in pre_tr:
+        prefill_obj["layer_3"] = pre_tr["layer_3"][0, -1].tolist()
+
     quant_golden = {
         "prompt_ids": prompt_ids,
-        "prefill_last": {
-            "embed": pre_tr["embed"][0, -1].tolist(),
-            "layer_0": pre_tr["layer_0"][0, -1].tolist(),
-            "layer_3": pre_tr["layer_3"][0, -1].tolist(),
-            "final_norm": pre_tr["final_norm"][0, -1].tolist(),
-            "logits_top8_idx": torch.topk(last_logits, 8).indices.tolist(),
-            "logits_top8_val": torch.topk(last_logits, 8).values.tolist(),
-        },
+        "prefill_last": prefill_obj,
         "generated_greedy_ids": generated,
         "decode_steps": decode_steps,
     }

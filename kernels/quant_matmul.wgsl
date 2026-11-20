@@ -13,30 +13,13 @@ struct Params {
 @group(0) @binding(3) var<storage, read> x: array<f32>;
 @group(0) @binding(4) var<storage, read_write> out: array<f32>;
 
-// Fixed geometry: 256 threads/workgroup = 4 rows * 64 threads/row.
-// Works identically for any subgroup_size in {8, 16, 32, 64} because 64 is a multiple of sg_size.
 const ROWS_PER_WG: u32 = 4u;
 const THREADS_PER_ROW: u32 = 64u;
 var<workgroup> sg_partial: array<f32, 32>;
 var<workgroup> sg_partial_gemm: array<vec4<f32>, 32>;
 
-@compute @workgroup_size(256)
-fn gemv_q4_g64(
-  @builtin(workgroup_id) wid: vec3<u32>,
-  @builtin(local_invocation_id) lid: vec3<u32>,
-  @builtin(subgroup_invocation_id) sg_lid: u32,
-  @builtin(subgroup_id) sg_id: u32,
-  @builtin(subgroup_size) sg_size: u32,
-) {
-  let tok = wid.y;
-  if (tok >= params.T) {
-    return;
-  }
-  let local_row = lid.x / THREADS_PER_ROW;
-  let lane = lid.x % THREADS_PER_ROW;
-  let row = wid.x * ROWS_PER_WG + local_row;
+fn gemv_row_dot(row: u32, lane: u32, tok: u32) -> f32 {
   let safe_row = min(row, params.M - 1u);
-
   let k_words = params.K_pad >> 3u;
   let k_groups = params.K_pad >> 6u;
   let row_q_off = safe_row * k_words;
@@ -78,41 +61,11 @@ fn gemv_q4_g64(
 
     acc += dot(q0 * scale + min_v, xv0) + dot(q1 * scale + min_v, xv1);
   }
-
-  let sg_sum = subgroupAdd(acc);
-  if (sg_lid == 0u) {
-    sg_partial[sg_id] = sg_sum;
-  }
-  workgroupBarrier();
-
-  if (lane == 0u && row < params.M) {
-    let sg_per_row = max(1u, THREADS_PER_ROW / sg_size);
-    let sg_start = local_row * sg_per_row;
-    var total: f32 = 0.0;
-    for (var s: u32 = 0u; s < sg_per_row; s += 1u) {
-      total += sg_partial[sg_start + s];
-    }
-    out[tok * params.M + row] = total;
-  }
+  return acc;
 }
 
-@compute @workgroup_size(256)
-fn gemm4_q4_g64(
-  @builtin(workgroup_id) wid: vec3<u32>,
-  @builtin(local_invocation_id) lid: vec3<u32>,
-  @builtin(subgroup_invocation_id) sg_lid: u32,
-  @builtin(subgroup_id) sg_id: u32,
-  @builtin(subgroup_size) sg_size: u32,
-) {
-  let t0 = wid.y * 4u;
-  if (t0 >= params.T) {
-    return;
-  }
-  let local_row = lid.x / THREADS_PER_ROW;
-  let lane = lid.x % THREADS_PER_ROW;
-  let row = wid.x * ROWS_PER_WG + local_row;
+fn gemm4_row_dot(row: u32, lane: u32, t0: u32) -> vec4<f32> {
   let safe_row = min(row, params.M - 1u);
-
   let k_words = params.K_pad >> 3u;
   let k_groups = params.K_pad >> 6u;
   let row_q_off = safe_row * k_words;
@@ -123,7 +76,6 @@ fn gemm4_q4_g64(
   let t3 = min(t0 + 3u, params.T - 1u);
 
   var acc = vec4<f32>(0.0);
-
   for (var w_idx: u32 = lane; w_idx < k_words; w_idx += THREADS_PER_ROW) {
     let word = quants[row_q_off + w_idx];
     let sm = unpack2x16float(scales[row_s_off + (w_idx >> 3u)]);
@@ -173,23 +125,119 @@ fn gemm4_q4_g64(
       }
     }
   }
+  return acc;
+}
 
-  let sg_sum = subgroupAdd(acc);
-  if (sg_lid == 0u) {
-    sg_partial_gemm[sg_id] = sg_sum;
+@compute @workgroup_size(256)
+fn gemv_q4_g64(
+  @builtin(workgroup_id) wid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+  @builtin(subgroup_invocation_id) sg_lid: u32,
+  @builtin(subgroup_id) sg_id: u32,
+  @builtin(subgroup_size) sg_size: u32,
+) {
+  let tok = wid.y;
+  if (tok >= params.T) { return; }
+  let local_row = lid.x / THREADS_PER_ROW;
+  let lane = lid.x % THREADS_PER_ROW;
+  let row = wid.x * ROWS_PER_WG + local_row;
+
+  let sg_sum = subgroupAdd(gemv_row_dot(row, lane, tok));
+  if (sg_lid == 0u) { sg_partial[sg_id] = sg_sum; }
+  workgroupBarrier();
+
+  if (lane == 0u && row < params.M) {
+    let sg_per_row = max(1u, THREADS_PER_ROW / sg_size);
+    let sg_start = local_row * sg_per_row;
+    var total: f32 = 0.0;
+    for (var s: u32 = 0u; s < sg_per_row; s += 1u) { total += sg_partial[sg_start + s]; }
+    out[tok * params.M + row] = total;
   }
+}
+
+@compute @workgroup_size(256)
+fn gemv_q4_g64_add(
+  @builtin(workgroup_id) wid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+  @builtin(subgroup_invocation_id) sg_lid: u32,
+  @builtin(subgroup_id) sg_id: u32,
+  @builtin(subgroup_size) sg_size: u32,
+) {
+  let tok = wid.y;
+  if (tok >= params.T) { return; }
+  let local_row = lid.x / THREADS_PER_ROW;
+  let lane = lid.x % THREADS_PER_ROW;
+  let row = wid.x * ROWS_PER_WG + local_row;
+
+  let sg_sum = subgroupAdd(gemv_row_dot(row, lane, tok));
+  if (sg_lid == 0u) { sg_partial[sg_id] = sg_sum; }
+  workgroupBarrier();
+
+  if (lane == 0u && row < params.M) {
+    let sg_per_row = max(1u, THREADS_PER_ROW / sg_size);
+    let sg_start = local_row * sg_per_row;
+    var total: f32 = 0.0;
+    for (var s: u32 = 0u; s < sg_per_row; s += 1u) { total += sg_partial[sg_start + s]; }
+    out[tok * params.M + row] += total;
+  }
+}
+
+@compute @workgroup_size(256)
+fn gemm4_q4_g64(
+  @builtin(workgroup_id) wid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+  @builtin(subgroup_invocation_id) sg_lid: u32,
+  @builtin(subgroup_id) sg_id: u32,
+  @builtin(subgroup_size) sg_size: u32,
+) {
+  let t0 = wid.y * 4u;
+  if (t0 >= params.T) { return; }
+  let local_row = lid.x / THREADS_PER_ROW;
+  let lane = lid.x % THREADS_PER_ROW;
+  let row = wid.x * ROWS_PER_WG + local_row;
+
+  let sg_sum = subgroupAdd(gemm4_row_dot(row, lane, t0));
+  if (sg_lid == 0u) { sg_partial_gemm[sg_id] = sg_sum; }
   workgroupBarrier();
 
   if (lane == 0u && row < params.M) {
     let sg_per_row = max(1u, THREADS_PER_ROW / sg_size);
     let sg_start = local_row * sg_per_row;
     var total = vec4<f32>(0.0);
-    for (var s: u32 = 0u; s < sg_per_row; s += 1u) {
-      total += sg_partial_gemm[sg_start + s];
-    }
+    for (var s: u32 = 0u; s < sg_per_row; s += 1u) { total += sg_partial_gemm[sg_start + s]; }
     out[t0 * params.M + row] = total.x;
     if (t0 + 1u < params.T) { out[(t0 + 1u) * params.M + row] = total.y; }
     if (t0 + 2u < params.T) { out[(t0 + 2u) * params.M + row] = total.z; }
     if (t0 + 3u < params.T) { out[(t0 + 3u) * params.M + row] = total.w; }
+  }
+}
+
+@compute @workgroup_size(256)
+fn gemm4_q4_g64_add(
+  @builtin(workgroup_id) wid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+  @builtin(subgroup_invocation_id) sg_lid: u32,
+  @builtin(subgroup_id) sg_id: u32,
+  @builtin(subgroup_size) sg_size: u32,
+) {
+  let t0 = wid.y * 4u;
+  if (t0 >= params.T) { return; }
+  let local_row = lid.x / THREADS_PER_ROW;
+  let lane = lid.x % THREADS_PER_ROW;
+  let row = wid.x * ROWS_PER_WG + local_row;
+
+  let sg_sum = subgroupAdd(gemm4_row_dot(row, lane, t0));
+  if (sg_lid == 0u) { sg_partial_gemm[sg_id] = sg_sum; }
+  workgroupBarrier();
+
+  if (lane == 0u && row < params.M) {
+    let sg_per_row = max(1u, THREADS_PER_ROW / sg_size);
+    let sg_start = local_row * sg_per_row;
+    var total = vec4<f32>(0.0);
+    for (var s: u32 = 0u; s < sg_per_row; s += 1u) { total += sg_partial_gemm[sg_start + s]; }
+    out[t0 * params.M + row] += total.x;
+    if (t0 + 1u < params.T) { out[(t0 + 1u) * params.M + row] += total.y; }
+    if (t0 + 2u < params.T) { out[(t0 + 2u) * params.M + row] += total.z; }
+    if (t0 + 3u < params.T) { out[(t0 + 3u) * params.M + row] += total.w; }
   }
 }

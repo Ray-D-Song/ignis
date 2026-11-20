@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8" /><title>Ignis Phase 4 Chunked Prefill 60fps Test</title></head>
+<body>
+<pre id="out">Running...</pre>
+<script type="module">
+  // Runs 1024-token Chunked Prefill (8 chunks x 128 tokens) across 36 full-width (2560/10240)
+  // layers in a Dedicated Web Worker while measuring main-thread RAF frame drops.
+  window.__runPhase4Prefill = async () => {
+    const workerCode = `
+      self.onmessage = async (ev) => {
+        const { origin, cmd } = ev.data;
+        if (cmd === 'init') {
+          const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+          self.device = await adapter.requestDevice({
+            requiredFeatures: ['shader-f16', 'subgroups'],
+            requiredLimits: {
+              maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+              maxBufferSize: adapter.limits.maxBufferSize,
+              maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
+            },
+          });
+          const device = self.device;
+          async function loadPipe(fname, entry) {
+            const code = await (await fetch(origin + '/kernels/' + fname)).text();
+            const mod = device.createShaderModule({ code });
+            return device.createComputePipeline({ layout: 'auto', compute: { module: mod, entryPoint: entry } });
+          }
+          const pNorm = await loadPipe('rmsnorm.wgsl', 'main');
+          const pGemm4 = await loadPipe('quant_matmul.wgsl', 'gemm4_q4_g64');
+          const pGemm4Add = await loadPipe('quant_matmul.wgsl', 'gemm4_q4_g64_add');
+          const pGeglu4 = await loadPipe('fused_geglu_q4.wgsl', 'gemm4_geglu_q4_g64');
+          const pLin = await loadPipe('linear_f32.wgsl', 'linear_f32');
+          const pRope = await loadPipe('rope_kv.wgsl', 'main');
+          const pAttn = await loadPipe('attention.wgsl', 'main');
+
+          const D = 2560, FF = 10240, QH = 16, KVH = 4, HD = 256, QDIM = 4096, QKV = 6144;
+          const CHUNK = 64;
+          const SWA_CAP = 512 + CHUNK, FULL_CAP = 2048;
+
+          const mkBuf = (bytes) => device.createBuffer({ size: Math.ceil(bytes / 16) * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+          const mkUni = (fn) => {
+            const ab = new ArrayBuffer(64); fn(new Uint32Array(ab), new Float32Array(ab));
+            const b = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+            device.queue.writeBuffer(b, 0, ab);
+            return b;
+          };
+          const allocQ4 = (M, K) => ({ q: mkBuf(M * (K / 8) * 4), s: mkBuf(M * (K / 64) * 4) });
+
+          const layers = [];
+          for (let i = 0; i < 4; i++) {
+            layers.push({
+              isSwa: i < 3,
+              attnNorm: mkBuf(D * 4), qkv: allocQ4(QKV, D), gate: mkBuf(QH * D * 4), o: allocQ4(D, QDIM),
+              ffnNorm: mkBuf(D * 4), ffnGate: allocQ4(FF, D), ffnUp: allocQ4(FF, D), ffnDown: allocQ4(D, FF),
+              k: mkBuf(KVH * (i < 3 ? SWA_CAP : FULL_CAP) * HD * 2),
+              v: mkBuf(KVH * (i < 3 ? SWA_CAP : FULL_CAP) * HD * 2),
+            });
+          }
+          const bufs = {
+            x: mkBuf(CHUNK * D * 4), norm: mkBuf(CHUNK * D * 4), qkv: mkBuf(CHUNK * QKV * 4),
+            qRot: mkBuf(CHUNK * QDIM * 4), attnGate: mkBuf(CHUNK * QH * 4), attnOut: mkBuf(CHUNK * QDIM * 4), ffnAct: mkBuf(CHUNK * FF * 4),
+          };
+
+          const uNorm = mkUni((u, f) => { u[0]=D; u[1]=CHUNK; f[2]=1e-6; });
+          const uGate = mkUni((u) => { u[0]=QH; u[1]=D; u[2]=CHUNK; });
+          const uQkv = mkUni((u) => { u[0]=QKV; u[1]=D; u[2]=CHUNK; u[3]=D; });
+          const uO = mkUni((u) => { u[0]=D; u[1]=QDIM; u[2]=CHUNK; u[3]=QDIM; });
+          const uFf = mkUni((u) => { u[0]=FF; u[1]=D; u[2]=CHUNK; u[3]=D; });
+          const uDn = mkUni((u) => { u[0]=D; u[1]=FF; u[2]=CHUNK; u[3]=FF; });
+          const uRopeSwa = mkUni((u, f) => { u[0]=CHUNK; u[1]=0; u[2]=QH; u[3]=KVH; u[4]=HD; u[5]=256; u[6]=SWA_CAP; u[7]=1; f[8]=10000; });
+          const uRopeFull = mkUni((u, f) => { u[0]=CHUNK; u[1]=0; u[2]=QH; u[3]=KVH; u[4]=HD; u[5]=64; u[6]=FULL_CAP; u[7]=0; f[8]=5000000; });
+          const uAttnSwa = mkUni((u, f) => { u[0]=CHUNK; u[1]=0; u[2]=QH; u[3]=KVH; u[4]=HD; u[5]=SWA_CAP; u[6]=512; u[7]=1; u[8]=1; f[9]=1/Math.sqrt(HD); });
+          const uAttnFull = mkUni((u, f) => { u[0]=CHUNK; u[1]=0; u[2]=QH; u[3]=KVH; u[4]=HD; u[5]=FULL_CAP; u[6]=0; u[7]=0; u[8]=1; f[9]=1/Math.sqrt(HD); });
+
+          const steps = [];
+          const wgY = Math.ceil(CHUNK / 4);
+          for (let li = 0; li < 36; li++) {
+            const L = layers[li % 4];
+            steps.push({ p: pNorm, x: CHUNK, y: 1, bg: device.createBindGroup({ layout: pNorm.getBindGroupLayout(0), entries: [
+              { binding: 0, resource: { buffer: uNorm, size: 16 } }, { binding: 1, resource: { buffer: bufs.x } },
+              { binding: 2, resource: { buffer: L.attnNorm } }, { binding: 3, resource: { buffer: bufs.norm } },
+            ]}) });
+            steps.push({ p: pGemm4, x: Math.ceil(QKV/4), y: wgY, bg: device.createBindGroup({ layout: pGemm4.getBindGroupLayout(0), entries: [
+              { binding: 0, resource: { buffer: uQkv, size: 16 } }, { binding: 1, resource: { buffer: L.qkv.q } },
+              { binding: 2, resource: { buffer: L.qkv.s } }, { binding: 3, resource: { buffer: bufs.norm } }, { binding: 4, resource: { buffer: bufs.qkv } },
+            ]}) });
+            steps.push({ p: pLin, x: Math.ceil(QH/4), y: CHUNK, bg: device.createBindGroup({ layout: pLin.getBindGroupLayout(0), entries: [
+              { binding: 0, resource: { buffer: uGate, size: 16 } }, { binding: 1, resource: { buffer: L.gate } },
+              { binding: 2, resource: { buffer: bufs.norm } }, { binding: 3, resource: { buffer: bufs.attnGate } },
+            ]}) });
+            steps.push({ p: pRope, x: Math.ceil(QDIM/128), y: CHUNK, bg: device.createBindGroup({ layout: pRope.getBindGroupLayout(0), entries: [
+              { binding: 0, resource: { buffer: L.isSwa ? uRopeSwa : uRopeFull, size: 48 } }, { binding: 1, resource: { buffer: bufs.qkv } },
+              { binding: 2, resource: { buffer: bufs.qRot } }, { binding: 3, resource: { buffer: L.k } }, { binding: 4, resource: { buffer: L.v } },
+            ]}) });
+            steps.push({ p: pAttn, x: QH, y: CHUNK, bg: device.createBindGroup({ layout: pAttn.getBindGroupLayout(0), entries: [
+              { binding: 0, resource: { buffer: L.isSwa ? uAttnSwa : uAttnFull, size: 48 } }, { binding: 1, resource: { buffer: bufs.qRot } },
+              { binding: 2, resource: { buffer: L.k } }, { binding: 3, resource: { buffer: L.v } },
+              { binding: 4, resource: { buffer: bufs.attnGate } }, { binding: 5, resource: { buffer: bufs.attnOut } },
+            ]}) });
+            steps.push({ p: pGemm4Add, x: Math.ceil(D/4), y: wgY, bg: device.createBindGroup({ layout: pGemm4Add.getBindGroupLayout(0), entries: [
+              { binding: 0, resource: { buffer: uO, size: 16 } }, { binding: 1, resource: { buffer: L.o.q } },
+              { binding: 2, resource: { buffer: L.o.s } }, { binding: 3, resource: { buffer: bufs.attnOut } }, { binding: 4, resource: { buffer: bufs.x } },
+            ]}) });
+            steps.push({ p: pNorm, x: CHUNK, y: 1, bg: device.createBindGroup({ layout: pNorm.getBindGroupLayout(0), entries: [
+              { binding: 0, resource: { buffer: uNorm, size: 16 } }, { binding: 1, resource: { buffer: bufs.x } },
+              { binding: 2, resource: { buffer: L.ffnNorm } }, { binding: 3, resource: { buffer: bufs.norm } },
+            ]}) });
+            steps.push({ p: pGeglu4, x: Math.ceil(FF/4), y: wgY, bg: device.createBindGroup({ layout: pGeglu4.getBindGroupLayout(0), entries: [
+              { binding: 0, resource: { buffer: uFf, size: 16 } },
+              { binding: 1, resource: { buffer: L.ffnGate.q } }, { binding: 2, resource: { buffer: L.ffnGate.s } },
+              { binding: 3, resource: { buffer: L.ffnUp.q } }, { binding: 4, resource: { buffer: L.ffnUp.s } },
+              { binding: 5, resource: { buffer: bufs.norm } }, { binding: 6, resource: { buffer: bufs.ffnAct } },
+            ]}) });
+            steps.push({ p: pGemm4Add, x: Math.ceil(D/4), y: wgY, bg: device.createBindGroup({ layout: pGemm4Add.getBindGroupLayout(0), entries: [
+              { binding: 0, resource: { buffer: uDn, size: 16 } }, { binding: 1, resource: { buffer: L.ffnDown.q } },
+              { binding: 2, resource: { buffer: L.ffnDown.s } }, { binding: 3, resource: { buffer: bufs.ffnAct } }, { binding: 4, resource: { buffer: bufs.x } },
+            ]}) });
+          }
+
+          self.runChunk = async (startPos) => {
+            const hdr = new Uint32Array([CHUNK, startPos]);
+            device.queue.writeBuffer(uRopeSwa, 0, hdr); device.queue.writeBuffer(uAttnSwa, 0, hdr);
+            device.queue.writeBuffer(uRopeFull, 0, hdr); device.queue.writeBuffer(uAttnFull, 0, hdr);
+            const enc = device.createCommandEncoder();
+            for (const st of steps) {
+              const pass = enc.beginComputePass();
+              pass.setPipeline(st.p); pass.setBindGroup(0, st.bg); pass.dispatchWorkgroups(st.x, st.y, 1);
+              pass.end();
+            }
+            device.queue.submit([enc.finish()]);
+            await device.queue.onSubmittedWorkDone();
+          };
+          await self.runChunk(0);
+          self.postMessage({ ready: true });
+        } else if (cmd === 'prefill') {
+          const TOTAL_TOKENS = 1024, CHUNK = 64;
+          const t0 = performance.now();
+          for (let pos = 0; pos < TOTAL_TOKENS; pos += CHUNK) {
+            await self.runChunk(pos);
+          }
+          const totalMs = performance.now() - t0;
+          self.device.destroy();
+          self.postMessage({ totalTokens: TOTAL_TOKENS, chunkSize: CHUNK, totalMs, prefillTokPerSec: TOTAL_TOKENS / (totalMs / 1000) });
+        }
+      };
+    `;
+
+    const blob = new Blob([workerCode], { type: 'application/javascript' });
+    const w = new Worker(URL.createObjectURL(blob), { type: 'module' });
+    await new Promise((resolve, reject) => {
+      w.onmessage = () => resolve();
+      w.onerror = (e) => reject(new Error(e.message));
+      w.postMessage({ origin: location.origin, cmd: 'init' });
+    });
+
+    let rafRunning = true;
+    let maxFrameMs = 0;
+    let frames = 0;
+    let last = performance.now();
+    const tick = (now) => {
+      if (!rafRunning) return;
+      const dt = now - last;
+      last = now;
+      if (frames > 1 && dt > maxFrameMs) maxFrameMs = dt;
+      frames++;
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+
+    const workerRes = await new Promise((resolve, reject) => {
+      w.onmessage = (e) => resolve(e.data);
+      w.onerror = (e) => reject(new Error(e.message));
+      w.postMessage({ cmd: 'prefill' });
+    });
+    w.terminate();
+    rafRunning = false;
+
+    const out = { ...workerRes, mainThreadFrames: frames, mainThreadMaxFrameMs: +maxFrameMs.toFixed(2) };
+    document.getElementById('out').textContent = JSON.stringify(out, null, 2);
+    return out;
+  };
+</script>
+</body>
+</html>
