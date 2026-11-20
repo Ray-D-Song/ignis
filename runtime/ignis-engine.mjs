@@ -2,6 +2,13 @@
  * Ignis Core WebGPU Inference Engine (Phase 2 Reference Pipeline)
  */
 
+import {
+  ensureOpfsModel,
+  OpfsEmbeddingTable,
+  readOpfsFileBytes,
+  uploadOpfsShardsToGpu,
+} from './opfs-loader.mjs';
+
 const IGNIS_MAGIC = 'IGNIS001';
 
 function alignUp(v, align = 256) {
@@ -22,23 +29,33 @@ function parseShardHeader(buf) {
 }
 
 export class IgnisEngine {
-  constructor(device, manifest, gpuShards, embdBytes, pipelines, subgroupSizeGuess = 32, maxSeqLen = 512, maxBatchTokens = 64) {
+  constructor(device, manifest, gpuShards, embdSource, pipelines, {
+    subgroupSizeGuess = 32,
+    maxSeqLen = 512,
+    maxBatchTokens = 64,
+    cacheHits = 0,
+    cacheMisses = 0,
+  } = {}) {
     this.device = device;
     this.manifest = manifest;
     this.bp = manifest.blueprint;
     this.gpuShards = gpuShards;
-    this.embdBytes = embdBytes;
-    this.embdView = new DataView(embdBytes.buffer, embdBytes.byteOffset, embdBytes.byteLength);
+    this.embdSource = embdSource; // Uint8Array (direct) OR OpfsEmbeddingTable (streaming)
+    this.embdView = embdSource instanceof Uint8Array
+      ? new DataView(embdSource.buffer, embdSource.byteOffset, embdSource.byteLength)
+      : null;
     this.pipelines = pipelines;
     this.subgroupSizeGuess = subgroupSizeGuess;
     this.maxSeqLen = maxSeqLen;
     this.maxBatchTokens = maxBatchTokens;
+    this.cacheHits = cacheHits;
+    this.cacheMisses = cacheMisses;
     this.curPos = 0;
 
     this._allocateWorkBuffers();
   }
 
-  static async create(modelBaseUrl, kernelBaseUrl, { maxSeqLen = 512, maxBatchTokens = 64 } = {}) {
+  static async _initDeviceAndPipelines(kernelBaseUrl) {
     if (!('gpu' in navigator)) {
       throw new Error('WebGPU not supported');
     }
@@ -49,9 +66,13 @@ export class IgnisEngine {
     if (!adapter.features.has('shader-f16') || !adapter.features.has('subgroups')) {
       throw new Error(`Required WebGPU features missing (shader-f16=${adapter.features.has('shader-f16')}, subgroups=${adapter.features.has('subgroups')})`);
     }
+    const requiredFeatures = ['shader-f16', 'subgroups'];
+    if (adapter.features.has('timestamp-query')) {
+      requiredFeatures.push('timestamp-query');
+    }
     const subgroupSizeGuess = adapter.info?.subgroupMinSize || 32;
     const device = await adapter.requestDevice({
-      requiredFeatures: ['shader-f16', 'subgroups'],
+      requiredFeatures,
       requiredLimits: {
         maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
         maxBufferSize: adapter.limits.maxBufferSize,
@@ -59,35 +80,6 @@ export class IgnisEngine {
       },
     });
 
-    const manifestResp = await fetch(`${modelBaseUrl}/manifest.json`);
-    if (!manifestResp.ok) throw new Error(`Failed to fetch manifest.json: ${manifestResp.status}`);
-    const manifest = await manifestResp.json();
-
-    // Load shards
-    const gpuShards = new Map();
-    let embdBytes = null;
-    for (const shardInfo of manifest.shards) {
-      const resp = await fetch(`${modelBaseUrl}/${shardInfo.file}`);
-      if (!resp.ok) throw new Error(`Failed to fetch ${shardInfo.file}: ${resp.status}`);
-      const ab = await resp.arrayBuffer();
-      const hdr = parseShardHeader(ab);
-      if (shardInfo.id === 'embd') {
-        embdBytes = new Uint8Array(ab);
-      } else {
-        const paddedSize = alignUp(ab.byteLength, 4);
-        const gpuBuf = device.createBuffer({
-          size: paddedSize,
-          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-        });
-        device.queue.writeBuffer(gpuBuf, 0, ab);
-        gpuShards.set(shardInfo.id, gpuBuf);
-      }
-      if (hdr.payloadBytes !== shardInfo.payload_bytes) {
-        throw new Error(`Shard payload size mismatch for ${shardInfo.file}`);
-      }
-    }
-
-    // Compile shaders
     const shaderFiles = {
       rmsnorm: 'rmsnorm.wgsl',
       quant_matmul: 'quant_matmul.wgsl',
@@ -119,7 +111,65 @@ export class IgnisEngine {
       addResidual: device.createComputePipeline({ layout: 'auto', compute: { module: modules.elementwise, entryPoint: 'add_residual' } }),
     };
 
-    return new IgnisEngine(device, manifest, gpuShards, embdBytes, pipelines, subgroupSizeGuess, maxSeqLen, maxBatchTokens);
+    return { device, pipelines, subgroupSizeGuess };
+  }
+
+  static async create(modelBaseUrl, kernelBaseUrl, { maxSeqLen = 512, maxBatchTokens = 64 } = {}) {
+    const { device, pipelines, subgroupSizeGuess } = await IgnisEngine._initDeviceAndPipelines(kernelBaseUrl);
+
+    const manifestResp = await fetch(`${modelBaseUrl}/manifest.json`);
+    if (!manifestResp.ok) throw new Error(`Failed to fetch manifest.json: ${manifestResp.status}`);
+    const manifest = await manifestResp.json();
+
+    const gpuShards = new Map();
+    let embdBytes = null;
+    for (const shardInfo of manifest.shards) {
+      const resp = await fetch(`${modelBaseUrl}/${shardInfo.file}`);
+      if (!resp.ok) throw new Error(`Failed to fetch ${shardInfo.file}: ${resp.status}`);
+      const ab = await resp.arrayBuffer();
+      const hdr = parseShardHeader(ab);
+      if (shardInfo.id === 'embd') {
+        embdBytes = new Uint8Array(ab);
+      } else {
+        const paddedSize = alignUp(ab.byteLength, 4);
+        const gpuBuf = device.createBuffer({
+          size: paddedSize,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        device.queue.writeBuffer(gpuBuf, 0, ab);
+        gpuShards.set(shardInfo.id, gpuBuf);
+      }
+      if (hdr.payloadBytes !== shardInfo.payload_bytes) {
+        throw new Error(`Shard payload size mismatch for ${shardInfo.file}`);
+      }
+    }
+
+    return new IgnisEngine(device, manifest, gpuShards, embdBytes, pipelines, { subgroupSizeGuess, maxSeqLen, maxBatchTokens });
+  }
+
+  static async createWithOpfs(modelBaseUrl, modelKey, kernelBaseUrl, {
+    maxSeqLen = 512,
+    maxBatchTokens = 64,
+    onProgress = null,
+  } = {}) {
+    const [{ device, pipelines, subgroupSizeGuess }, opfsRes] = await Promise.all([
+      IgnisEngine._initDeviceAndPipelines(kernelBaseUrl),
+      ensureOpfsModel(modelBaseUrl, modelKey, { onProgress }),
+    ]);
+
+    const { dirHandle, manifest, cacheHits, cacheMisses, hasTokenizer } = opfsRes;
+    const gpuShards = await uploadOpfsShardsToGpu(device, dirHandle, manifest);
+    const embdTable = await OpfsEmbeddingTable.open(dirHandle, manifest.tensors.token_embd);
+    const tokenizerBytes = hasTokenizer ? await readOpfsFileBytes(dirHandle, 'tokenizer.json') : null;
+
+    const engine = new IgnisEngine(device, manifest, gpuShards, embdTable, pipelines, {
+      subgroupSizeGuess,
+      maxSeqLen,
+      maxBatchTokens,
+      cacheHits,
+      cacheMisses,
+    });
+    return { engine, tokenizerBytes, dirHandle };
   }
 
   _allocateWorkBuffers() {
@@ -179,7 +229,10 @@ export class IgnisEngine {
     return { buffer, offset: t.offset, size: alignUp(t.bytes, 4), meta: t };
   }
 
-  lookupEmbeddings(tokenIds) {
+  async lookupEmbeddings(tokenIds) {
+    if (this.embdSource instanceof OpfsEmbeddingTable) {
+      return this.embdSource.lookupBatch(tokenIds);
+    }
     const em = this.manifest.tensors.token_embd;
     const D = this.bp.hidden_size;
     const stride = em.row_stride;
@@ -195,6 +248,19 @@ export class IgnisEngine {
       }
     }
     return out;
+  }
+
+  destroy() {
+    if (this.embdSource instanceof OpfsEmbeddingTable) {
+      this.embdSource.close();
+    }
+    for (const buf of this.gpuShards.values()) buf.destroy();
+    for (const buf of Object.values(this.bufs)) buf.destroy();
+    for (const kv of this.kvCaches) {
+      kv.k.destroy();
+      kv.v.destroy();
+    }
+    this.device.destroy();
   }
 
   _makeUniform(u32OrF32Setup) {
@@ -298,7 +364,7 @@ export class IgnisEngine {
     const qDim = bp.num_attention_heads * bp.head_dim;
     const kvDim = bp.num_key_value_heads * bp.head_dim;
 
-    const emb = this.lookupEmbeddings(tokenIds);
+    const emb = await this.lookupEmbeddings(tokenIds);
     this.device.queue.writeBuffer(this.bufs.x, 0, emb);
 
     const traces = {};

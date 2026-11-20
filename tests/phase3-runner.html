@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8" /><title>Ignis Phase 3 Worker & OPFS E2E</title></head>
+<body>
+<pre id="out">Ready</pre>
+<script type="module">
+  import { IgnisClient } from '/runtime/ignis-client.mjs';
+
+  let rafRunning = false;
+  let maxFrameMs = 0;
+  let frameCount = 0;
+  let lastTs = 0;
+
+  function startFpsProbe() {
+    rafRunning = true;
+    maxFrameMs = 0;
+    frameCount = 0;
+    lastTs = performance.now();
+    const tick = (now) => {
+      if (!rafRunning) return;
+      const dt = now - lastTs;
+      lastTs = now;
+      if (frameCount > 0 && dt > maxFrameMs) maxFrameMs = dt;
+      frameCount++;
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+
+  function stopFpsProbe() {
+    rafRunning = false;
+    return { frameCount, maxFrameMs };
+  }
+
+  window.__runPhase3E2E = async () => {
+    const golden = await (await fetch('/tests/fixtures/tiny-spark-quant-golden.json')).json();
+    const client = new IgnisClient('/runtime/ignis-worker.mjs');
+
+    let deviceLost = null;
+    client.onDeviceLost = (r) => { deviceLost = r; };
+
+    const initInfo = await client.init({
+      modelBaseUrl: '/tests/fixtures/tiny-spark-ignis',
+      modelKey: 'tiny-spark-v1',
+      kernelBaseUrl: '/kernels',
+      wasmUrl: '/runtime/wasm/ignis_tokenizer.wasm',
+      tokenizerJsonUrl: '/tests/fixtures/tokenizer.json',
+      maxSeqLen: 128,
+      maxBatchTokens: 8,
+    });
+
+    // Test real 131K WASM tokenizer inside Worker
+    const tokText = 'Hello, world! 你好世界 12345 def foo(x): return x + 1';
+    const encRes = await client.encode(tokText);
+    const decRes = await client.decode(encRes.ids, false);
+
+    // Run chunked prefill (12 tokens with chunkSize=4 -> 3 chunks) + decode while measuring main-thread RAF
+    const streamedTokens = [];
+    client.onToken = (ev) => streamedTokens.push(ev.tokenId);
+
+    startFpsProbe();
+    const genRes = await client.generate({
+      promptIds: golden.prompt_ids,
+      maxNewTokens: golden.generated_greedy_ids.length,
+      chunkSize: 4,
+      sampling: { temperature: 0.0 },
+      stopOnEos: false,
+    });
+    const fpsStats = stopFpsProbe();
+
+    // Test reset + second run
+    await client.reset();
+    const genRes2 = await client.generate({
+      promptIds: golden.prompt_ids,
+      maxNewTokens: golden.generated_greedy_ids.length,
+      chunkSize: 6,
+      sampling: { temperature: 0.0 },
+      stopOnEos: false,
+    });
+
+    const jsHeapMB = performance.memory ? +(performance.memory.usedJSHeapSize / (1024 * 1024)).toFixed(2) : null;
+    await client.destroy();
+
+    const out = {
+      initInfo,
+      tokIds: encRes.ids,
+      tokRoundTripOk: decRes.text === tokText,
+      expectedGreedy: golden.generated_greedy_ids,
+      actualGreedy1: genRes.generatedIds,
+      actualGreedy2: genRes2.generatedIds,
+      streamedMatches: JSON.stringify(streamedTokens.slice(0, golden.generated_greedy_ids.length)) === JSON.stringify(golden.generated_greedy_ids),
+      fpsStats,
+      jsHeapMB,
+      deviceLost,
+    };
+    document.getElementById('out').textContent = JSON.stringify(out, null, 2);
+    return out;
+  };
+</script>
+</body>
+</html>
