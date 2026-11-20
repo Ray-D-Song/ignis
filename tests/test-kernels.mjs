@@ -19,7 +19,7 @@ function maxAbsErr(a, b) {
 const pyCode = `
 import json, sys, numpy as np, torch, torch.nn.functional as F
 sys.path.insert(0, 'packer')
-from quant import quantize_int4_g64_asym, dequantize_int4_g64_asym
+from quant import quantize_int4_g64_asym, dequantize_int4_g64_asym, quantize_int8_g64_sym, dequantize_int8_g64_sym
 
 rng = np.random.default_rng(7)
 # RMSNorm
@@ -36,6 +36,10 @@ q, s, (Mp, Kp) = quantize_int4_g64_asym(W)
 W_deq = dequantize_int4_g64_asym(q, s, K)
 X = rng.normal(0.0, 1.0, size=(T, K)).astype(np.float32)
 Y = (X @ W_deq.T).astype(np.float32)
+
+q8, s8, _ = quantize_int8_g64_sym(W)
+W_deq8 = dequantize_int8_g64_sym(q8, s8, K)
+Y8 = (X[0] @ W_deq8.T).astype(np.float32)
 
 # GeGLU
 ga = rng.normal(size=(512,)).astype(np.float32)
@@ -70,6 +74,7 @@ attn_expected = ao.transpose(1, 2).contiguous().reshape(-1).numpy().tolist()
 print(json.dumps({
   "rms": {"dim": 256, "tokens": 4, "eps": 1e-6, "x": x_rms.reshape(-1).tolist(), "w": w_rms.tolist(), "expected": y_rms},
   "qmm": {"M": M, "K": K, "T": T, "K_pad": Kp, "quants": q.reshape(-1).tolist(), "scales": s.reshape(-1).tolist(), "x": X.reshape(-1).tolist(), "expected_gemv": Y[0].tolist(), "expected_gemm": Y.reshape(-1).tolist()},
+  "q8": {"quants": q8.reshape(-1).tolist(), "scales": s8.reshape(-1).tolist(), "expected": Y8.tolist()},
   "geglu": {"a": ga.tolist(), "b": gb.tolist(), "expected": gy},
   "attn": {"T": T_a, "start_pos": 0, "q_heads": q_h, "kv_heads": kv_h, "head_dim": hd, "rope_dim": rdim, "kv_capacity": win + T_a, "sliding_window": win, "is_swa": 1, "has_gate": 1, "rope_theta": 10000.0, "qkv": qkv_np.reshape(-1).tolist(), "gate": gate_np.reshape(-1).tolist(), "expected_qrot": qrot_expected, "expected_attn": attn_expected}
 }))
@@ -103,6 +108,7 @@ try {
   const out = await page.evaluate((g) => window.__runKernelTests(g), golden);
   console.log('RMSNorm maxAbsErr:', maxAbsErr(out.rmsOut, golden.rms.expected));
   console.log('GEMV    maxAbsErr:', maxAbsErr(out.gemvOut, golden.qmm.expected_gemv));
+  console.log('GEMV_Q8 maxAbsErr:', maxAbsErr(out.gemvQ8Out, golden.q8.expected));
   console.log('GEMM4   maxAbsErr:', maxAbsErr(out.gemmOut, golden.qmm.expected_gemm));
   console.log('GeGLU   maxAbsErr:', maxAbsErr(out.gegluOut, golden.geglu.expected));
   console.log('QRot    maxAbsErr:', maxAbsErr(out.qRotOut, golden.attn.expected_qrot));

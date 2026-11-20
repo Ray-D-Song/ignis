@@ -121,3 +121,47 @@ def dequantize_int8_row(raw: bytes, vocab: int, dim: int, row_stride: int) -> np
     scales = np.ascontiguousarray(buf[:, :4]).view(np.float32)
     q = buf[:, 4 : 4 + dim].view(np.int8).astype(np.float32)
     return q * scales
+
+
+def quantize_int8_g64_sym(weight: np.ndarray) -> tuple[np.ndarray, np.ndarray, tuple[int, int]]:
+    """
+    Quantize a 2D float weight [M, K] into INT8_G64_SYM.
+    Returns:
+      quants_u32: uint32 array of shape [M, K_pad // 4] (4x signed int8 packed LE)
+      scales_u32: uint32 array of shape [M, K_pad // 64] (f16 scale low16, 0 high16)
+      padded_shape: (M, K_pad)
+    """
+    if weight.ndim != 2:
+        raise ValueError(f"Expected 2D weight, got shape {weight.shape}")
+    w = np.asarray(weight, dtype=np.float32)
+    m, k = w.shape
+    k_pad = align_up(k, 64)
+    if k_pad != k:
+        w = np.pad(w, ((0, 0), (0, k_pad - k)), mode="constant", constant_values=0.0)
+
+    groups = k_pad // 64
+    wg = w.reshape(m, groups, 64)
+    max_abs = np.max(np.abs(wg), axis=-1)
+    scale_f16 = np.where(max_abs > 0.0, max_abs / 127.0, 0.0).astype(np.float16)
+    scale_f32 = scale_f16.astype(np.float32)[..., None]
+    inv_scale = np.where(scale_f32 > 0.0, 1.0 / scale_f32, 0.0)
+    q_i8 = np.clip(np.round(wg * inv_scale), -127, 127).astype(np.int8)
+
+    quants_u32 = np.ascontiguousarray(q_i8.reshape(m, k_pad)).view(np.uint32)
+    scale_bits = scale_f16.view(np.uint16).astype(np.uint32)
+    scales_u32 = np.ascontiguousarray(scale_bits)
+    return quants_u32, scales_u32, (m, k_pad)
+
+
+def dequantize_int8_g64_sym(quants_u32: np.ndarray, scales_u32: np.ndarray, orig_k: int | None = None) -> np.ndarray:
+    """Dequantize INT8_G64_SYM back to float32 for verification."""
+    m, k_words = quants_u32.shape
+    k_pad = k_words * 4
+    groups = k_pad // 64
+    q = np.ascontiguousarray(quants_u32).view(np.int8).reshape(m, groups, 64).astype(np.float32)
+    scale_bits = (scales_u32 & 0xFFFF).astype(np.uint16)
+    scale = scale_bits.view(np.float16).astype(np.float32)[..., None]
+    w = (q * scale).reshape(m, k_pad)
+    if orig_k is not None and orig_k < k_pad:
+        w = w[:, :orig_k]
+    return w

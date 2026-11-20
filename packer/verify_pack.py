@@ -16,7 +16,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from quant import IGNIS_MAGIC, PAYLOAD_OFFSET, dequantize_int4_g64_asym, dequantize_int8_row
+from quant import IGNIS_MAGIC, PAYLOAD_OFFSET, dequantize_int4_g64_asym, dequantize_int8_g64_sym, dequantize_int8_row
 from gen_tiny_fixture import apply_rotary_pos_emb, compute_rope_cos_sin
 
 
@@ -57,7 +57,10 @@ def read_ignis_package(pkg_dir: Path) -> tuple[dict[str, Any], dict[str, np.ndar
             s_raw = shard_bytes[s_info["shard"]][s_info["offset"] : s_info["offset"] + s_info["bytes"]]
             q_arr = np.frombuffer(q_raw, dtype=np.uint32).reshape(info["shape"])
             s_arr = np.frombuffer(s_raw, dtype=np.uint32).reshape(s_info["shape"])
-            tensors[base] = dequantize_int4_g64_asym(q_arr, s_arr, info["orig_shape"][1])
+            if info["dtype"] == "u32_q8":
+                tensors[base] = dequantize_int8_g64_sym(q_arr, s_arr, info["orig_shape"][1])
+            else:
+                tensors[base] = dequantize_int4_g64_asym(q_arr, s_arr, info["orig_shape"][1])
         elif name.endswith(".scales"):
             continue
         else:

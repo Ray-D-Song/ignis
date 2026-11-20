@@ -241,3 +241,63 @@ fn gemm4_q4_g64_add(
     if (t0 + 3u < params.T) { out[(t0 + 3u) * params.M + row] += total.w; }
   }
 }
+
+// INT8_G64_SYM GEMV (4x signed int8 per u32, group_size=64 -> 16 u32 words per scale)
+@compute @workgroup_size(256)
+fn gemv_q8_g64(
+  @builtin(workgroup_id) wid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+  @builtin(subgroup_invocation_id) sg_lid: u32,
+  @builtin(subgroup_id) sg_id: u32,
+  @builtin(subgroup_size) sg_size: u32,
+) {
+  let tok = wid.y;
+  if (tok >= params.T) { return; }
+  let local_row = lid.x / THREADS_PER_ROW;
+  let lane = lid.x % THREADS_PER_ROW;
+  let row = wid.x * ROWS_PER_WG + local_row;
+  let safe_row = min(row, params.M - 1u);
+
+  let k_words = params.K_pad >> 2u;   // 4 i8 per u32
+  let k_groups = params.K_pad >> 6u;  // 64 weights per group
+  let row_q_off = safe_row * k_words;
+  let row_s_off = safe_row * k_groups;
+  let x_off = tok * params.K;
+
+  var acc: f32 = 0.0;
+  for (var w_idx: u32 = lane; w_idx < k_words; w_idx += THREADS_PER_ROW) {
+    let word = i32(quants[row_q_off + w_idx]);
+    let sm = unpack2x16float(scales[row_s_off + (w_idx >> 4u)]);
+    let scale = sm.x;
+    let k_base = w_idx << 2u;
+
+    var xv = vec4<f32>(0.0);
+    if (k_base + 3u < params.K) {
+      xv = vec4<f32>(x[x_off + k_base], x[x_off + k_base + 1u], x[x_off + k_base + 2u], x[x_off + k_base + 3u]);
+    } else {
+      for (var j: u32 = 0u; j < 4u; j += 1u) {
+        if (k_base + j < params.K) { xv[j] = x[x_off + k_base + j]; }
+      }
+    }
+
+    let qv = vec4<f32>(
+      f32(extractBits(word, 0u, 8u)),
+      f32(extractBits(word, 8u, 8u)),
+      f32(extractBits(word, 16u, 8u)),
+      f32(extractBits(word, 24u, 8u)),
+    );
+    acc += dot(qv * scale, xv);
+  }
+
+  let sg_sum = subgroupAdd(acc);
+  if (sg_lid == 0u) { sg_partial[sg_id] = sg_sum; }
+  workgroupBarrier();
+
+  if (lane == 0u && row < params.M) {
+    let sg_per_row = max(1u, THREADS_PER_ROW / sg_size);
+    let sg_start = local_row * sg_per_row;
+    var total: f32 = 0.0;
+    for (var s: u32 = 0u; s < sg_per_row; s += 1u) { total += sg_partial[sg_start + s]; }
+    out[tok * params.M + row] = total;
+  }
+}

@@ -134,6 +134,7 @@ export class IgnisEngine {
       rmsnorm: device.createComputePipeline({ layout: 'auto', compute: { module: modules.rmsnorm, entryPoint: 'main' } }),
       gemv: device.createComputePipeline({ layout: 'auto', compute: { module: modules.quant_matmul, entryPoint: 'gemv_q4_g64' } }),
       gemvAdd: device.createComputePipeline({ layout: 'auto', compute: { module: modules.quant_matmul, entryPoint: 'gemv_q4_g64_add' } }),
+      gemvQ8: device.createComputePipeline({ layout: 'auto', compute: { module: modules.quant_matmul, entryPoint: 'gemv_q8_g64' } }),
       gemm4: device.createComputePipeline({ layout: 'auto', compute: { module: modules.quant_matmul, entryPoint: 'gemm4_q4_g64' } }),
       gemm4Add: device.createComputePipeline({ layout: 'auto', compute: { module: modules.quant_matmul, entryPoint: 'gemm4_q4_g64_add' } }),
       gegluGemv: device.createComputePipeline({ layout: 'auto', compute: { module: modules.fused_glu_q4, entryPoint: 'gemv_glu_q4_g64' } }),
@@ -476,9 +477,10 @@ export class IgnisEngine {
       this.decodeSteps.push(mkQ4Step(p.gemvAdd, `blk.${i}.ffn_down`, this.bufs.ffnAct, this.bufs.x));
     }
 
-    // Final norm + LM head
+    // Final norm & LM head (supports both u32_q4 and u32_q8)
     this.decodeSteps.push(mkNormStep('output_norm'));
-    this.decodeSteps.push(mkQ4Step(p.gemv, 'output', this.bufs.norm, this.bufs.logits));
+    const lmHeadDtype = this.manifest.tensors['output.quants'].dtype;
+    this.decodeSteps.push(mkQ4Step(lmHeadDtype === 'u32_q8' ? p.gemvQ8 : p.gemv, 'output', this.bufs.norm, this.bufs.logits));
   }
 
   reset() {
@@ -593,9 +595,12 @@ export class IgnisEngine {
     tempUniforms.push(uBuf);
 
     const isGemv = T === 1;
-    const pipe = isGemv
-      ? (addResidual ? this.pipelines.gemvAdd : this.pipelines.gemv)
-      : (addResidual ? this.pipelines.gemm4Add : this.pipelines.gemm4);
+    const isQ8 = q.meta.dtype === 'u32_q8';
+    const pipe = isQ8
+      ? this.pipelines.gemvQ8
+      : isGemv
+        ? (addResidual ? this.pipelines.gemvAdd : this.pipelines.gemv)
+        : (addResidual ? this.pipelines.gemm4Add : this.pipelines.gemm4);
     const bg = this.device.createBindGroup({
       layout: pipe.getBindGroupLayout(0),
       entries: [
@@ -609,7 +614,7 @@ export class IgnisEngine {
     const pass = enc.beginComputePass();
     pass.setPipeline(pipe);
     pass.setBindGroup(0, bg);
-    pass.dispatchWorkgroups(Math.ceil(M / 4), isGemv ? 1 : Math.ceil(T / 4), 1);
+    pass.dispatchWorkgroups(Math.ceil(M / 4), (isGemv || isQ8) ? (isQ8 ? T : 1) : Math.ceil(T / 4), 1);
     pass.end();
   }
 

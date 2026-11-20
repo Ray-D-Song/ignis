@@ -64,10 +64,11 @@ window.__runKernelTests = async (golden) => {
   device.queue.submit([enc.finish()]);
   const rmsOut = await readF32(bORms, golden.rms.x.length);
 
-  // Test 2: GEMV & GEMM4
+  // Test 2: GEMV, GEMM4, and GEMV_Q8
   const qmmMod = await compile('quant_matmul.wgsl');
   const gemvPipe = device.createComputePipeline({ layout: 'auto', compute: { module: qmmMod, entryPoint: 'gemv_q4_g64' } });
   const gemmPipe = device.createComputePipeline({ layout: 'auto', compute: { module: qmmMod, entryPoint: 'gemm4_q4_g64' } });
+  const gemvQ8Pipe = device.createComputePipeline({ layout: 'auto', compute: { module: qmmMod, entryPoint: 'gemv_q8_g64' } });
 
   const bQ = makeBuf(new Uint32Array(golden.qmm.quants), GPUBufferUsage.STORAGE);
   const bS = makeBuf(new Uint32Array(golden.qmm.scales), GPUBufferUsage.STORAGE);
@@ -114,6 +115,27 @@ window.__runKernelTests = async (golden) => {
 
   const gemvOut = await readF32(bOGemv, golden.qmm.M);
   const gemmOut = await readF32(bOGemm, golden.qmm.T * golden.qmm.M);
+
+  const bQ8 = makeBuf(new Uint32Array(golden.q8.quants), GPUBufferUsage.STORAGE);
+  const bS8 = makeBuf(new Uint32Array(golden.q8.scales), GPUBufferUsage.STORAGE);
+  const bOQ8 = device.createBuffer({ size: golden.qmm.M * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  enc = device.createCommandEncoder();
+  pass = enc.beginComputePass();
+  pass.setPipeline(gemvQ8Pipe);
+  pass.setBindGroup(0, device.createBindGroup({
+    layout: gemvQ8Pipe.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: bUGemv } },
+      { binding: 1, resource: { buffer: bQ8 } },
+      { binding: 2, resource: { buffer: bS8 } },
+      { binding: 3, resource: { buffer: bX } },
+      { binding: 4, resource: { buffer: bOQ8 } },
+    ],
+  }));
+  pass.dispatchWorkgroups(Math.ceil(golden.qmm.M / 4), 1, 1);
+  pass.end();
+  device.queue.submit([enc.finish()]);
+  const gemvQ8Out = await readF32(bOQ8, golden.qmm.M);
 
   // Test 3: GeGLU
   const ewMod = await compile('elementwise.wgsl');
@@ -212,7 +234,7 @@ window.__runKernelTests = async (golden) => {
   const attnOut = await readF32(bAttnOut, T * qDim);
 
   device.destroy();
-  return { rmsOut, gemvOut, gemmOut, gegluOut, qRotOut, attnOut };
+  return { rmsOut, gemvOut, gemmOut, gemvQ8Out, gegluOut, qRotOut, attnOut };
 };
 </script>
 </body>

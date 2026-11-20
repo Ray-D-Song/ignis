@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8" /><title>Ignis 4B Real Model Benchmark & Quality Eval</title></head>
+<body>
+<pre id="out">Ready</pre>
+<script type="module">
+  import { IgnisEngine } from '/runtime/ignis-engine.mjs';
+  import { IgnisTokenizer } from '/runtime/wasm-tokenizer.mjs';
+  import { IgnisClient } from '/runtime/ignis-client.mjs';
+
+  // Run accuracy + timestamp-query benchmark directly in engine (no OPFS bloat between variants),
+  // AND optionally test OPFS Worker lifecycle on a variant.
+  window.__eval4BVariant = async ({ modelBaseUrl, prompts, maxSeqLen = 2048, maxBatchTokens = 64 }) => {
+    const tInit0 = performance.now();
+    const engine = await IgnisEngine.create(modelBaseUrl, '/kernels', { maxSeqLen, maxBatchTokens });
+    const initMs = performance.now() - tInit0;
+
+    const wasmBytes = await (await fetch('/runtime/wasm/ignis_tokenizer.wasm')).arrayBuffer();
+    const tokJsonBytes = await (await fetch(`${modelBaseUrl}/tokenizer.json`)).arrayBuffer();
+    const tok = await IgnisTokenizer.fromBuffers(wasmBytes, tokJsonBytes);
+
+    const gpuBytes = engine.manifest.shards
+      .filter((s) => s.id !== 'embd')
+      .reduce((acc, s) => acc + s.bytes, 0);
+    const embdBytes = engine.manifest.shards.find((s) => s.id === 'embd')?.bytes || 0;
+
+    const promptResults = [];
+    let allDecodeWallMs = [];
+    let allDecodeGpuMs = [];
+
+    for (const p of prompts) {
+      engine.reset();
+      const tPre0 = performance.now();
+      let preLogits = null;
+      for (let off = 0; off < p.ids.length; off += maxBatchTokens) {
+        const chunk = p.ids.slice(off, off + maxBatchTokens);
+        const res = await engine.forward(chunk);
+        preLogits = res.logits;
+      }
+      const prefillMs = performance.now() - tPre0;
+
+      // Save first-step full logits to send back via binary endpoint or evaluate topK + full Float32Array
+      const firstLogitsF32 = new Float32Array(preLogits);
+
+      // Greedy decode 24 tokens (measuring GPU timestamp-query on decode steps)
+      const gen = [];
+      let curLogits = firstLogitsF32;
+      const eosId = engine.bp.eos_token_id;
+      for (let step = 0; step < 24; step++) {
+        let bestIdx = 0;
+        let bestVal = curLogits[0];
+        for (let i = 1; i < curLogits.length; i++) {
+          if (curLogits[i] > bestVal) { bestVal = curLogits[i]; bestIdx = i; }
+        }
+        gen.push(bestIdx);
+        if (bestIdx === eosId) break;
+        if (step + 1 < 24) {
+          const tD0 = performance.now();
+          const dRes = await engine.forward([bestIdx], { profileGpu: true });
+          const wallMs = performance.now() - tD0;
+          if (step > 0) { // skip step 0 warmup if any
+            allDecodeWallMs.push(wallMs);
+            if (dRes.gpuMs != null) allDecodeGpuMs.push(dRes.gpuMs);
+          }
+          curLogits = dRes.logits;
+        }
+      }
+
+      const decodedText = tok.decode(gen, false);
+      // Post full logits to local node collector to avoid huge Playwright JSON serialization
+      await fetch(`/upload-logits?name=${encodeURIComponent(p.name)}`, {
+        method: 'POST',
+        body: firstLogitsF32.buffer,
+      });
+
+      promptResults.push({
+        name: p.name,
+        promptLen: p.ids.length,
+        prefillMs: +prefillMs.toFixed(1),
+        prefillTokPerSec: +(p.ids.length / (prefillMs / 1000)).toFixed(1),
+        greedyIds: gen,
+        decodedText,
+      });
+    }
+
+    const avg = (arr) => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
+    const avgWallMs = avg(allDecodeWallMs);
+    const avgGpuMs = avg(allDecodeGpuMs);
+    const jsHeapMB = performance.memory ? +(performance.memory.usedJSHeapSize / (1024 * 1024)).toFixed(2) : null;
+
+    tok.free();
+    engine.destroy();
+
+    return {
+      modelBaseUrl,
+      lmHeadDtype: engine.manifest.tensors['output.quants'].dtype,
+      gpuShardsMiB: +(gpuBytes / (1024 * 1024)).toFixed(2),
+      embdMiB: +(embdBytes / (1024 * 1024)).toFixed(2),
+      initMs: +initMs.toFixed(1),
+      avgDecodeWallMs: avgWallMs ? +avgWallMs.toFixed(2) : null,
+      avgDecodeGpuMs: avgGpuMs ? +avgGpuMs.toFixed(2) : null,
+      wallTokPerSec: avgWallMs ? +(1000 / avgWallMs).toFixed(2) : null,
+      gpuTokPerSec: avgGpuMs ? +(1000 / avgGpuMs).toFixed(2) : null,
+      jsHeapMB,
+      prompts: promptResults,
+    };
+  };
+
+  // Dedicated Worker + OPFS test on 4B to measure real cold/warm load + 60fps main thread
+  window.__eval4BWorkerOpfs = async ({ modelBaseUrl, modelKey, promptIds }) => {
+    const client = new IgnisClient('/runtime/ignis-worker.mjs');
+    let rafRunning = true, maxFrameMs = 0, frames = 0, last = performance.now();
+    const tick = (now) => {
+      if (!rafRunning) return;
+      const dt = now - last; last = now;
+      if (frames > 1 && dt > maxFrameMs) maxFrameMs = dt;
+      frames++;
+      requestAnimationFrame(tick);
+    };
+    const initInfo = await client.init({
+      modelBaseUrl,
+      modelKey,
+      kernelBaseUrl: '/kernels',
+      wasmUrl: '/runtime/wasm/ignis_tokenizer.wasm',
+      maxSeqLen: 2048,
+      maxBatchTokens: 64,
+    });
+    requestAnimationFrame(tick);
+    const genRes = await client.generate({
+      promptIds,
+      maxNewTokens: 32,
+      chunkSize: 64,
+      sampling: { temperature: 0.0 },
+      stopOnEos: true,
+    });
+    rafRunning = false;
+    const jsHeapMB = performance.memory ? +(performance.memory.usedJSHeapSize / (1024 * 1024)).toFixed(2) : null;
+    await client.destroy();
+    return {
+      initMs: +initInfo.initMs.toFixed(1),
+      cacheHits: initInfo.cacheHits,
+      cacheMisses: initInfo.cacheMisses,
+      prefillMs: +genRes.prefillMs.toFixed(1),
+      decodeMs: +genRes.decodeMs.toFixed(1),
+      decodeTokPerSec: +genRes.decodeTokPerSec.toFixed(2),
+      generatedIds: genRes.generatedIds,
+      generatedText: genRes.generatedText,
+      mainThreadFrames: frames,
+      mainThreadMaxFrameMs: +maxFrameMs.toFixed(2),
+      jsHeapMB,
+    };
+  };
+</script>
+</body>
+</html>

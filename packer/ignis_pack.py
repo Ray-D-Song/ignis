@@ -17,9 +17,11 @@ from quant import (
     TENSOR_ALIGN,
     align_up,
     dequantize_int4_g64_asym,
+    dequantize_int8_g64_sym,
     dequantize_int8_row,
     make_shard_header,
     quantize_int4_g64_asym,
+    quantize_int8_g64_sym,
     quantize_int8_row,
 )
 
@@ -105,22 +107,35 @@ def build_blueprint(cfg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def load_hf_tensors(model_dir: Path) -> dict[str, np.ndarray]:
+def load_hf_tensor_reader(model_dir: Path):
+    """Returns a lazy tensor accessor supporting BF16/FP16/FP32 safetensors via PyTorch."""
     index_file = model_dir / "model.safetensors.index.json"
     if index_file.exists():
         index = json.loads(index_file.read_text(encoding="utf-8"))
-        files = sorted(set(index["weight_map"].values()))
+        weight_map = index["weight_map"]
+        files = sorted(set(weight_map.values()))
     else:
         files = sorted(p.name for p in model_dir.glob("*.safetensors"))
+        weight_map = None
     if not files:
         raise FileNotFoundError(f"No .safetensors files found in {model_dir}")
 
-    tensors: dict[str, np.ndarray] = {}
-    for fname in files:
-        with safe_open(str(model_dir / fname), framework="numpy") as f:
-            for key in f.keys():
-                tensors[key] = f.get_tensor(key)
-    return tensors
+    handles = {fname: safe_open(str(model_dir / fname), framework="pt", device="cpu") for fname in files}
+    if weight_map is None:
+        weight_map = {}
+        for fname, h in handles.items():
+            for k in h.keys():
+                weight_map[k] = fname
+
+    class Reader:
+        def __contains__(self, key: str) -> bool:
+            return key in weight_map
+
+        def get(self, key: str) -> np.ndarray:
+            fname = weight_map[key]
+            return handles[fname].get_tensor(key).float().numpy()
+
+    return Reader()
 
 
 def pack_model(
@@ -128,11 +143,12 @@ def pack_model(
     out_dir: Path,
     max_shard_mb: int = 512,
     verify: bool = True,
+    lm_head_dtype: str = "int4",
 ) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     cfg = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     blueprint = build_blueprint(cfg)
-    hf_tensors = load_hf_tensors(model_dir)
+    hf_tensors = load_hf_tensor_reader(model_dir)
 
     writer = ShardWriter(out_dir, max_shard_bytes=max_shard_mb * 1024 * 1024)
     tensors_meta: dict[str, Any] = {}
@@ -179,9 +195,38 @@ def pack_model(
             cos = float(np.sum(orig_f32 * deq) / (np.linalg.norm(orig_f32) * np.linalg.norm(deq) + 1e-12))
             quant_errors.append((ignis_name, cos))
 
+    def register_q8(ignis_name: str, arr: np.ndarray) -> None:
+        quants_u32, scales_u32, padded_shape = quantize_int8_g64_sym(arr)
+        q_shard, q_off, q_bytes = writer.add_tensor(quants_u32.tobytes())
+        s_shard, s_off, s_bytes = writer.add_tensor(scales_u32.tobytes())
+        tensors_meta[f"{ignis_name}.quants"] = {
+            "shard": q_shard,
+            "offset": q_off,
+            "bytes": q_bytes,
+            "shape": list(quants_u32.shape),
+            "orig_shape": list(arr.shape),
+            "padded_shape": list(padded_shape),
+            "dtype": "u32_q8",
+            "layout": "row_major",
+        }
+        tensors_meta[f"{ignis_name}.scales"] = {
+            "shard": s_shard,
+            "offset": s_off,
+            "bytes": s_bytes,
+            "shape": list(scales_u32.shape),
+            "dtype": "u32_f16x2",
+            "group_size": 64,
+            "layout": "row_major",
+        }
+        if verify:
+            orig_f32 = arr.astype(np.float32)
+            deq = dequantize_int8_g64_sym(quants_u32, scales_u32, arr.shape[1])
+            cos = float(np.sum(orig_f32 * deq) / (np.linalg.norm(orig_f32) * np.linalg.norm(deq) + 1e-12))
+            quant_errors.append((ignis_name, cos))
+
     # 1. Externalized Embedding -> embd.ignis
     embd_key = "model.embedding.weight" if "model.embedding.weight" in hf_tensors else "model.embed_tokens.weight"
-    embd_w = hf_tensors[embd_key]
+    embd_w = hf_tensors.get(embd_key)
     embd_raw, row_stride = quantize_int8_row(embd_w)
     embd_header = make_shard_header(0xFFFFFFFF, len(embd_raw))
     embd_bytes = embd_header + embd_raw
@@ -205,36 +250,43 @@ def pack_model(
     }
 
     # 2. LM Head (either explicit or tied to embedding)
-    lm_head_w = embd_w if blueprint["tie_word_embeddings"] or "lm_head.weight" not in hf_tensors else hf_tensors["lm_head.weight"]
-    register_q4("output", lm_head_w)
-    register_f32("output_norm", hf_tensors["model.norm.weight"])
+    lm_head_w = embd_w if blueprint["tie_word_embeddings"] or "lm_head.weight" not in hf_tensors else hf_tensors.get("lm_head.weight")
+    del embd_w
+    if lm_head_dtype == "int8":
+        register_q8("output", lm_head_w)
+    elif lm_head_dtype == "int4":
+        register_q4("output", lm_head_w)
+    else:
+        raise ValueError(f"Unsupported lm_head_dtype: {lm_head_dtype}")
+    del lm_head_w
+    register_f32("output_norm", hf_tensors.get("model.norm.weight"))
 
     # 3. Transformer layers
     for i in range(blueprint["num_layers"]):
         pfx = f"model.layers.{i}"
         opfx = f"blk.{i}"
-        register_f32(f"{opfx}.attn_norm", hf_tensors[f"{pfx}.input_layernorm.weight"])
-        register_f32(f"{opfx}.ffn_norm", hf_tensors[f"{pfx}.post_attention_layernorm.weight"])
+        register_f32(f"{opfx}.attn_norm", hf_tensors.get(f"{pfx}.input_layernorm.weight"))
+        register_f32(f"{opfx}.ffn_norm", hf_tensors.get(f"{pfx}.post_attention_layernorm.weight"))
 
         if f"{pfx}.self_attn.q_k_v_proj.weight" in hf_tensors:
-            qkv_w = hf_tensors[f"{pfx}.self_attn.q_k_v_proj.weight"]
+            qkv_w = hf_tensors.get(f"{pfx}.self_attn.q_k_v_proj.weight")
         else:
             qkv_w = np.concatenate([
-                hf_tensors[f"{pfx}.self_attn.q_proj.weight"],
-                hf_tensors[f"{pfx}.self_attn.k_proj.weight"],
-                hf_tensors[f"{pfx}.self_attn.v_proj.weight"],
+                hf_tensors.get(f"{pfx}.self_attn.q_proj.weight"),
+                hf_tensors.get(f"{pfx}.self_attn.k_proj.weight"),
+                hf_tensors.get(f"{pfx}.self_attn.v_proj.weight"),
             ], axis=0)
         register_q4(f"{opfx}.attn_qkv", qkv_w)
 
         o_key = f"{pfx}.self_attn.out_proj.weight" if f"{pfx}.self_attn.out_proj.weight" in hf_tensors else f"{pfx}.self_attn.o_proj.weight"
-        register_q4(f"{opfx}.attn_output", hf_tensors[o_key])
+        register_q4(f"{opfx}.attn_output", hf_tensors.get(o_key))
 
         if blueprint["has_attn_gate"]:
-            register_f32(f"{opfx}.attn_gate", hf_tensors[f"{pfx}.self_attn.g_proj.weight"])
+            register_f32(f"{opfx}.attn_gate", hf_tensors.get(f"{pfx}.self_attn.g_proj.weight"))
 
-        register_q4(f"{opfx}.ffn_gate", hf_tensors[f"{pfx}.mlp.gate_proj.weight"])
-        register_q4(f"{opfx}.ffn_up", hf_tensors[f"{pfx}.mlp.up_proj.weight"])
-        register_q4(f"{opfx}.ffn_down", hf_tensors[f"{pfx}.mlp.down_proj.weight"])
+        register_q4(f"{opfx}.ffn_gate", hf_tensors.get(f"{pfx}.mlp.gate_proj.weight"))
+        register_q4(f"{opfx}.ffn_up", hf_tensors.get(f"{pfx}.mlp.up_proj.weight"))
+        register_q4(f"{opfx}.ffn_down", hf_tensors.get(f"{pfx}.mlp.down_proj.weight"))
 
     gpu_shards = writer.finalize()
     shards_meta = [
@@ -277,9 +329,10 @@ def main() -> None:
     parser.add_argument("--input", type=Path, required=True, help="HF model directory containing config.json & *.safetensors")
     parser.add_argument("--output", type=Path, required=True, help="Output directory for .ignis package")
     parser.add_argument("--max-shard-mb", type=int, default=512, help="Max GPU shard size in MiB")
+    parser.add_argument("--lm-head-dtype", choices=["int4", "int8"], default="int4", help="Quantization dtype for LM head")
     parser.add_argument("--no-verify", action="store_true", help="Skip dequantization cosine verification")
     args = parser.parse_args()
-    pack_model(args.input, args.output, max_shard_mb=args.max_shard_mb, verify=not args.no_verify)
+    pack_model(args.input, args.output, max_shard_mb=args.max_shard_mb, verify=not args.no_verify, lm_head_dtype=args.lm_head_dtype)
 
 
 if __name__ == "__main__":
