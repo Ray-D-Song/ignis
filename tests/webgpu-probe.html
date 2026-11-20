@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Ignis Phase 0 - WebGPU Hardware & Sandbox Probe</title>
+</head>
+<body>
+  <pre id="out">Running Ignis WebGPU Probe...</pre>
+  <script type="module">
+    async function probeWebGPUInContext() {
+      if (!('gpu' in navigator)) {
+        return { supported: false, reason: 'navigator.gpu missing' };
+      }
+      const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+      if (!adapter) {
+        return { supported: false, reason: 'requestAdapter returned null' };
+      }
+
+      const features = Array.from(adapter.features).sort();
+      const limits = {};
+      for (const k in adapter.limits) {
+        if (typeof adapter.limits[k] === 'number' || typeof adapter.limits[k] === 'bigint') {
+          limits[k] = Number(adapter.limits[k]);
+        }
+      }
+
+      const requiredFeatures = [];
+      if (adapter.features.has('shader-f16')) requiredFeatures.push('shader-f16');
+      if (adapter.features.has('subgroups')) requiredFeatures.push('subgroups');
+
+      const device = await adapter.requestDevice({
+        requiredFeatures,
+        requiredLimits: {
+          maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+          maxBufferSize: adapter.limits.maxBufferSize,
+          maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
+          maxComputeInvocationsPerWorkgroup: adapter.limits.maxComputeInvocationsPerWorkgroup,
+        },
+      });
+
+      // Smoke test a WGSL shader using f16 + subgroups if available
+      const useF16 = device.features.has('shader-f16');
+      const useSubgroups = device.features.has('subgroups');
+      let shaderResult = null;
+      let shaderError = null;
+
+      try {
+        const header = [
+          useF16 ? 'enable f16;' : '',
+          useSubgroups ? 'enable subgroups;' : '',
+        ].filter(Boolean).join('\n');
+
+        const wgsl = `
+          ${header}
+          @group(0) @binding(0) var<storage, read_write> outBuf: array<f32>;
+          @compute @workgroup_size(64)
+          fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+            let val = ${useF16 ? 'f32(f16(lid.x + 1u))' : 'f32(lid.x + 1u)'};
+            ${useSubgroups ? 'let sum = subgroupAdd(val); if (lid.x == 0u) { outBuf[0] = sum; } outBuf[lid.x + 1u] = val;' : 'outBuf[lid.x] = val;'}
+          }
+        `;
+        const module = device.createShaderModule({ code: wgsl });
+        const info = await module.getCompilationInfo();
+        const errs = info.messages.filter((m) => m.type === 'error');
+        if (errs.length > 0) {
+          throw new Error(errs.map((e) => e.message).join('; '));
+        }
+
+        const bufSize = 260;
+        const storage = device.createBuffer({
+          size: bufSize,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+        });
+        const readback = device.createBuffer({
+          size: bufSize,
+          usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+        });
+
+        const pipeline = device.createComputePipeline({
+          layout: 'auto',
+          compute: { module, entryPoint: 'main' },
+        });
+        const bindGroup = device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(0),
+          entries: [{ binding: 0, resource: { buffer: storage } }],
+        });
+
+        const enc = device.createCommandEncoder();
+        const pass = enc.beginComputePass();
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, bindGroup);
+        pass.dispatchWorkgroups(1);
+        pass.end();
+        enc.copyBufferToBuffer(storage, 0, readback, 0, bufSize);
+        device.queue.submit([enc.finish()]);
+
+        await readback.mapAsync(GPUMapMode.READ);
+        const arr = new Float32Array(readback.getMappedRange().slice(0));
+        readback.unmap();
+        shaderResult = Array.from(arr.slice(0, 8));
+        storage.destroy();
+        readback.destroy();
+      } catch (err) {
+        shaderError = String(err);
+      }
+
+      const infoObj = adapter.info ? {
+        vendor: adapter.info.vendor,
+        architecture: adapter.info.architecture,
+        device: adapter.info.device,
+        description: adapter.info.description,
+        subgroupMinSize: adapter.info.subgroupMinSize,
+        subgroupMaxSize: adapter.info.subgroupMaxSize,
+      } : null;
+
+      device.destroy();
+
+      return {
+        supported: true,
+        info: infoObj,
+        features,
+        enabledFeatures: Array.from(device.features),
+        limits,
+        shaderSmoke: { useF16, useSubgroups, shaderResult, shaderError },
+      };
+    }
+
+    async function probeWorkerAndOPFS() {
+      let opfsOk = false;
+      let opfsErr = null;
+      try {
+        const root = await navigator.storage.getDirectory();
+        const fh = await root.getFileHandle('ignis-probe.bin', { create: true });
+        const writable = await fh.createWritable();
+        await writable.write(new Uint8Array([1, 2, 3, 4]));
+        await writable.close();
+        const file = await fh.getFile();
+        opfsOk = file.size === 4;
+        await root.removeEntry('ignis-probe.bin');
+      } catch (e) {
+        opfsErr = String(e);
+      }
+
+      const workerProbe = await new Promise((resolve) => {
+        const code = `
+          self.onmessage = async () => {
+            try {
+              const hasGpu = 'gpu' in navigator;
+              const adapter = hasGpu ? await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }) : null;
+              self.postMessage({
+                hasGpu,
+                hasAdapter: !!adapter,
+                hasF16: adapter ? adapter.features.has('shader-f16') : false,
+                hasSubgroups: adapter ? adapter.features.has('subgroups') : false,
+              });
+            } catch (err) {
+              self.postMessage({ error: String(err) });
+            }
+          };
+        `;
+        const blob = new Blob([code], { type: 'application/javascript' });
+        const worker = new Worker(URL.createObjectURL(blob));
+        worker.onmessage = (ev) => {
+          worker.terminate();
+          resolve(ev.data);
+        };
+        worker.onerror = (ev) => {
+          worker.terminate();
+          resolve({ error: ev.message });
+        };
+        worker.postMessage('go');
+      });
+
+      return {
+        crossOriginIsolated: window.crossOriginIsolated,
+        sharedArrayBuffer: typeof SharedArrayBuffer !== 'undefined',
+        opfs: { ok: opfsOk, error: opfsErr },
+        workerWebGPU: workerProbe,
+      };
+    }
+
+    window.__runIgnisProbe = async () => {
+      const gpu = await probeWebGPUInContext();
+      const sandbox = await probeWorkerAndOPFS();
+      const result = { gpu, sandbox, userAgent: navigator.userAgent };
+      document.getElementById('out').textContent = JSON.stringify(result, null, 2);
+      return result;
+    };
+  </script>
+</body>
+</html>

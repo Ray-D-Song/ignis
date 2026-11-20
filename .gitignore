@@ -19,6 +19,8 @@ venv/
 *.npy
 weights/
 fixtures/large/
+tests/fixtures/
+package-lock.json
 
 # OS & editor files
 .DS_Store
