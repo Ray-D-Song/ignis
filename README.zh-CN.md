@@ -61,4 +61,4 @@ npm run demo:chat
 npm run test:vinext
 ```
 
-详细路线图见 [ROADMAP.md](ROADMAP.md)，进度记录见 [PROGRESS.md](PROGRESS.md)，二进制格式规范见 [docs/format-spec.md](docs/format-spec.md)，Cloudflare Pages + R2 部署指南见 [docs/deploy-cloudflare.md](docs/deploy-cloudflare.md)。
+贡献指南见 [CONTRIBUTING.md](CONTRIBUTING.md)，安全政策见 [SECURITY.md](SECURITY.md)，开源许可见 [LICENSE](LICENSE)。
