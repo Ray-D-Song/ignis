@@ -11,11 +11,11 @@
     "dev": "vinext dev",
     "prebuild": "node scripts/sync-ignis.mjs",
     "build": "vinext build",
+    "build:pages": "node scripts/build-pages.mjs",
     "start": "vinext start"
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
   "type": "module",
   "dependencies": {
     "react": "^19.3.1",

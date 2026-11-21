@@ -38,7 +38,32 @@ declare module '../../../runtime/ignis-client.mjs' {
     encode(text: string): Promise<{ ids: number[] }>;
     decode(ids: number[], skipSpecial?: boolean): Promise<{ text: string }>;
     reset(): Promise<{ curPos: number }>;
-    generate(options: Record<string, unknown>): Promise<{
+    generate(options: {
+      promptIds: number[];
+      images?: Array<{ data: Uint8Array; width: number; height: number; channels: number }>;
+      audios?: Float32Array[];
+      generationMode?: 'text' | 'interleaved' | 'audio';
+      maxNewTokens?: number;
+      maxThinkingTokens?: number;
+      chunkSize?: number;
+      sampling?: Record<string, unknown>;
+      responseFormat?: {
+        type: 'json_schema';
+        json_schema: {
+          name?: string;
+          schema: Record<string, unknown>;
+          strict?: boolean;
+        };
+      };
+      speculative?: {
+        mode: 'ngram' | 'draft';
+        k?: number;
+        ngramN?: number;
+        draftModelUrl?: string;
+        draftModelKey?: string;
+      };
+      stopOnEos?: boolean;
+    }): Promise<{
       promptLen: number;
       generatedIds: number[];
       generatedText: string | null;
@@ -48,6 +73,9 @@ declare module '../../../runtime/ignis-client.mjs' {
       prefillMs: number;
       decodeMs: number;
       decodeTokPerSec: number;
+      fsmMaskMsSamples?: number[];
+      speculativeAccepted?: number;
+      speculativeProposed?: number;
       curPos: number;
     }>;
     abort(): Promise<{ aborted: boolean }>;
@@ -58,4 +86,30 @@ declare module '../../../runtime/ignis-client.mjs' {
 declare module '../../../runtime/multimodal/audio-dsp.mjs' {
   export function decodeWav(arrayBuffer: ArrayBuffer): { samples: Float32Array; sampleRate: number };
   export function resampleLinear(samples: Float32Array, fromSr: number, toSr: number): Float32Array;
+}
+
+declare module '../../../runtime/device-profile.mjs' {
+  export interface IgnisDeviceProfile {
+    supported: boolean;
+    tier: 'tier1_full' | 'tier2_no_subgroups' | 'tier3_constrained' | 'unsupported';
+    hasF16: boolean;
+    hasSubgroups: boolean;
+    hasTimestampQuery: boolean;
+    maxBufferSize: number;
+    maxStorageBufferBindingSize: number;
+    maxComputeWorkgroupStorageSize: number;
+    maxComputeInvocationsPerWorkgroup: number;
+    recommendedWeightBits: number;
+    recommendedUseSubgroups: boolean;
+    recommendedMaxShardBytes: number;
+    estimatedVramClass: 'high' | 'medium' | 'low';
+    adapterInfo: {
+      vendor: string;
+      architecture: string;
+      device: string;
+      description: string;
+    } | null;
+  }
+
+  export function detectDeviceProfile(): Promise<IgnisDeviceProfile>;
 }

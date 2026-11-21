@@ -1,24 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { getPublicCdnModels, type ModelPreset } from './model-catalog';
 
-export interface ModelPreset {
-  id: string;
-  label: string;
-  description: string;
-  dirPath: string;
-  lmHeadDtype: string;
-  architecture: string;
-  topModelType: string;
-  gpuMiB: number;
-  embdMiB: number;
-  pleMiB: number;
-  capabilities: {
-    vision: boolean;
-    audioIn: boolean;
-    audioOut: boolean;
-    thinking: boolean;
-  };
-}
+export type { ModelPreset };
+export { getPublicCdnModels };
 
 function findFixturesRoot(): string {
   const candidates = [
@@ -39,24 +24,28 @@ export function discoverIgnisModels(): ModelPreset[] {
       folder: 'spark-4b-ignis-q8head',
       label: 'Spark-X2.6-4B · INT8_G64 LM Head（推荐）',
       description: '36层 Body INT4_G64 + LM Head INT8_G64 · 更高中文/代码保真度',
+      licenseName: 'Apache-2.0',
     },
     {
       id: 'spark-4b-q4',
       folder: 'spark-4b-ignis-q4',
       label: 'Spark-X2.6-4B · INT4_G64 LM Head（省显存）',
       description: '36层 Body + LM Head 全 INT4_G64 · 极致显存压缩',
+      licenseName: 'Apache-2.0',
     },
     {
       id: 'lfm3-omni-2b',
       folder: 'lfm3-omni-2b-ignis',
       label: 'LFM3-Omni-2B · Full Omni（图/音输入 + 24kHz 语音输出）',
       description: 'ShortConv+SWA 24层主干 + 视觉/音频双编码 + LiquidCodec 24kHz 语音合成',
+      licenseName: 'LFM Open License v1.0',
     },
     {
       id: 'gemma-4-e4b',
       folder: 'gemma-4-e4b-ignis',
       label: 'Gemma-4-E4B-it · Full Omni（PLE + 图像/音频理解）',
       description: '42层 KV-Sharing + INT8_G64 PLE + 262K 词表 + SigLIP2/Conformer 全模态',
+      licenseName: 'Gemma Terms of Use',
     },
   ];
 
@@ -82,12 +71,14 @@ export function discoverIgnisModels(): ModelPreset[] {
       label: d.label,
       description: d.description,
       dirPath,
+      modelBaseUrl: `/api/models/${d.id}`,
       lmHeadDtype,
       architecture,
       topModelType,
       gpuMiB: +(gpuBytes / (1024 * 1024)).toFixed(1),
       embdMiB: +(embdBytes / (1024 * 1024)).toFixed(1),
       pleMiB: +(pleBytes / (1024 * 1024)).toFixed(1),
+      licenseName: d.licenseName,
       capabilities: {
         vision: mmKind === 'lfm3_omni' || mmKind === 'gemma4',
         audioIn: mmKind === 'lfm3_omni' || mmKind === 'gemma4',
@@ -97,4 +88,16 @@ export function discoverIgnisModels(): ModelPreset[] {
     });
   }
   return available;
+}
+
+export function isPublicCdnMode(): boolean {
+  return Boolean((process.env.NEXT_PUBLIC_IGNIS_CDN_BASE || '').trim());
+}
+
+export function getConfiguredModels(): ModelPreset[] {
+  const cdnBase = (process.env.NEXT_PUBLIC_IGNIS_CDN_BASE || '').trim();
+  if (cdnBase) {
+    return getPublicCdnModels(cdnBase);
+  }
+  return discoverIgnisModels();
 }

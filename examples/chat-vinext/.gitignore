@@ -1,6 +1,8 @@
 node_modules/
 dist/
+out/
 .vinext/
 .next/
 public/ignis/
 next-env.d.ts
+tsconfig.tsbuildinfo
