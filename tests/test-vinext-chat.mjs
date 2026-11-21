@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { chromium } from 'playwright-core';
@@ -7,7 +8,17 @@ import { chromium } from 'playwright-core';
 const EDGE_PATH = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
 const ROOT_DIR = path.resolve(import.meta.dirname, '..');
 const APP_DIR = path.join(ROOT_DIR, 'examples', 'chat-vinext');
-const PORT = 4321;
+
+function getFreePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.listen(0, '127.0.0.1', () => {
+      const port = srv.address().port;
+      srv.close(() => resolve(port));
+    });
+    srv.on('error', reject);
+  });
+}
 
 async function waitForServer(url, timeoutMs = 30000) {
   const start = Date.now();
@@ -32,33 +43,42 @@ async function main() {
     p.on('exit', (c) => (c === 0 ? resolve() : reject(new Error(`sync failed: ${c}`))));
   });
 
-  const serverProc = spawn('node', [vinextCli, 'dev', '--host', '127.0.0.1', '--port', String(PORT)], {
-    cwd: APP_DIR,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  // Reuse an already-running vinext dev server if present (e.g. user running npm run demo:chat)
+  let baseUrl = null;
+  let serverProc = null;
+  for (const cand of ['http://localhost:5173', 'http://127.0.0.1:5173']) {
+    try {
+      const r = await fetch(cand);
+      if (r.ok) { baseUrl = cand; break; }
+    } catch { /* not running */ }
+  }
 
   let serverLogs = '';
-  serverProc.stdout.on('data', (d) => { serverLogs += d.toString(); });
-  serverProc.stderr.on('data', (d) => { serverLogs += d.toString(); });
+  if (!baseUrl) {
+    const PORT = await getFreePort();
+    baseUrl = `http://127.0.0.1:${PORT}`;
+    serverProc = spawn('node', [vinextCli, 'dev', '--host', '127.0.0.1', '--port', String(PORT)], {
+      cwd: APP_DIR,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    serverProc.stdout.on('data', (d) => { serverLogs += d.toString(); });
+    serverProc.stderr.on('data', (d) => { serverLogs += d.toString(); });
+  }
 
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ignis-vinext-e2e-'));
   let context;
   const errors = [];
+  let failed = false;
 
   try {
-    const baseUrl = `http://127.0.0.1:${PORT}`;
     await waitForServer(baseUrl);
-    console.log(`[vinext] dev server ready at ${baseUrl}`);
+    console.log(`[vinext] testing against ${baseUrl}`);
 
     context = await chromium.launchPersistentContext(userDataDir, {
       executablePath: EDGE_PATH,
       headless: true,
       args: [
         '--headless=new',
-        '--enable-unsafe-webgpu',
-        '--use-angle=d3d11',
-        '--enable-features=WebGPUDeveloperFeatures,Vulkan',
-        '--ignore-gpu-blocklist',
       ],
     });
     const page = context.pages()[0] || await context.newPage();
@@ -129,13 +149,16 @@ async function main() {
       throw new Error(`Browser console/page errors: ${errors.join(' | ')}`);
     }
     console.log('[PASS] vinext Chat Demo (Spark-X2.6-4B INT8_G64 LM Head) multi-turn WebGPU E2E verified!');
+  } catch (err) {
+    failed = true;
+    throw err;
   } finally {
     if (context) await context.close();
-    if (!serverProc.killed) {
+    if (serverProc && !serverProc.killed) {
       spawn('taskkill', ['/pid', String(serverProc.pid), '/T', '/F'], { stdio: 'ignore' });
     }
     fs.rmSync(userDataDir, { recursive: true, force: true });
-    if (serverLogs && (process.env.DEBUG_VINEXT || errors.length > 0)) console.log(serverLogs);
+    if (serverLogs && (process.env.DEBUG_VINEXT || failed || errors.length > 0)) console.log(serverLogs);
   }
 }
 

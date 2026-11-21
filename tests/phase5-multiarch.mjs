@@ -76,7 +76,7 @@ const port = server.address().port;
 const browser = await chromium.launch({
   executablePath: EDGE_PATH,
   headless: true,
-  args: ['--headless=new', '--enable-unsafe-webgpu', '--use-angle=d3d11', '--enable-features=WebGPUDeveloperFeatures,Vulkan', '--ignore-gpu-blocklist'],
+  args: ['--headless=new'],
 });
 try {
   const page = await browser.newPage();

@@ -49,10 +49,6 @@ async function main() {
       headless: true,
       args: [
         '--headless=new',
-        '--enable-unsafe-webgpu',
-        '--use-angle=d3d11',
-        '--enable-features=WebGPUDeveloperFeatures,Vulkan',
-        '--ignore-gpu-blocklist',
       ],
     });
     const context = await browser.newContext();

@@ -22,8 +22,9 @@ fn main(
   @builtin(local_invocation_id) lid: vec3<u32>,
   @builtin(subgroup_invocation_id) sg_lid: u32,
   @builtin(subgroup_id) sg_id: u32,
-  @builtin(num_subgroups) num_sg: u32,
+  @builtin(subgroup_size) sg_size: u32,
 ) {
+  let num_sg = (WG_SIZE + sg_size - 1u) / sg_size;
   let tok = wid.x;
   if (tok >= params.tokens) {
     return;
