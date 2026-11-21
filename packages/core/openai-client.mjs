@@ -5,7 +5,7 @@
 
 import { IgnisClient } from '../../runtime/ignis-client.mjs';
 import { IgnisEngine } from '../../runtime/ignis-engine.mjs';
-import { IgnisTokenizer } from '../../runtime/wasm-tokenizer.mjs';
+import { IgnisTokenizer, resolveResponseSchema } from '../../runtime/wasm-tokenizer.mjs';
 import { Lfm3OmniRuntime } from '../../runtime/multimodal/lfm3-omni-runtime.mjs';
 import { Gemma4OmniRuntime } from '../../runtime/multimodal/gemma4-omni-runtime.mjs';
 import { decodeWav, resampleLinear } from '../../runtime/multimodal/audio-dsp.mjs';
@@ -407,8 +407,9 @@ export class IgnisOpenAI {
       try {
         await this._ensureLoadedForCall(params.model);
         const modelName = params.model || this.currentModelKey || this.blueprint?.architecture || 'ignis';
+        const fsmSchema = resolveResponseSchema(params.response_format);
         const { prompt, images, audios } = await buildIgnisChatPrompt(params.messages || [], this.blueprint, {
-          enableThinking: !!params.enable_thinking,
+          enableThinking: fsmSchema ? false : !!params.enable_thinking,
           thinkingEffort: params.thinking_effort || 'low',
         });
 
@@ -471,6 +472,7 @@ export class IgnisOpenAI {
                 decodeTokPerSec: res.decodeTokPerSec || 0,
                 speculativeAccepted: res.speculativeAccepted,
                 speculativeProposed: res.speculativeProposed,
+                ...(res.fsmMaskMsSamples ? { fsmMaskMsSamples: res.fsmMaskMsSamples } : {}),
               },
               audio: audioOut,
             });
@@ -551,17 +553,28 @@ export class IgnisOpenAI {
           const { sampleToken } = await import('../../runtime/sampler.mjs');
           const fwd = await this._engine.forward(promptIds);
           let logits = fwd.logits;
-          const eosSet = new Set(this.blueprint.eos_token_ids || [this.blueprint.eos_token_id]);
+          const eosSet = new Set(
+            Array.isArray(this.blueprint.eos_token_ids) && this.blueprint.eos_token_ids.length
+              ? this.blueprint.eos_token_ids
+              : [this.blueprint.eos_token_id]
+          );
+          const fsm = fsmSchema ? this._tokenizer.createFsm(fsmSchema, [...eosSet]) : null;
           const hist = [...promptIds];
-          for (let step = 0; step < maxTokens; step++) {
-            if (this._aborted) break;
-            const tok = sampleToken(logits, hist, sampling);
-            if (eosSet.has(tok)) break;
-            hist.push(tok);
-            emitToken(tok);
-            if (step + 1 < maxTokens && !this._aborted) {
-              logits = (await this._engine.forward([tok])).logits;
+          try {
+            for (let step = 0; step < maxTokens; step++) {
+              if (this._aborted) break;
+              if (fsm) fsm.maskLogits(logits);
+              const tok = sampleToken(logits, hist, sampling);
+              if (eosSet.has(tok)) break;
+              if (fsm && !fsm.advance(tok)) break;
+              hist.push(tok);
+              emitToken(tok);
+              if (step + 1 < maxTokens && !this._aborted) {
+                logits = (await this._engine.forward([tok])).logits;
+              }
             }
+          } finally {
+            if (fsm) fsm.free();
           }
         }
 

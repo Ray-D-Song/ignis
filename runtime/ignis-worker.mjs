@@ -1,5 +1,5 @@
 import { IgnisEngine } from './ignis-engine.mjs';
-import { IgnisTokenizer } from './wasm-tokenizer.mjs';
+import { IgnisTokenizer, resolveResponseSchema } from './wasm-tokenizer.mjs';
 import { sampleToken } from './sampler.mjs';
 import { Lfm3OmniRuntime } from './multimodal/lfm3-omni-runtime.mjs';
 import { Gemma4OmniRuntime } from './multimodal/gemma4-omni-runtime.mjs';
@@ -240,33 +240,52 @@ self.onmessage = async (ev) => {
       const tDec0 = performance.now();
       const streamState = { committedText: '' };
 
-      if (!abortRequested && lastLogits) {
-        let thinkClosed = !(maxThinkingTokens > 0);
-        for (let step = 0; step < maxNewTokens; step++) {
-          if (abortRequested) break;
-          let nextTok;
-          if (!thinkClosed && step >= maxThinkingTokens) {
-            // Budget forcing: close <think> channel with </think> so remaining tokens go to final answer
-            nextTok = endThinkTokenId;
-            thinkClosed = true;
-          } else {
-            nextTok = sampleToken(lastLogits, history, sampling);
-            if (nextTok === endThinkTokenId) {
+      const fsmSchema = resolveResponseSchema(responseFormat);
+      if (fsmSchema && !tokenizer) {
+        throw new Error('Tokenizer required for responseFormat JSON Schema FSM');
+      }
+      const fsm = fsmSchema ? tokenizer.createFsm(fsmSchema, [...eosSet]) : null;
+      const fsmMaskMsSamples = [];
+
+      try {
+        if (!abortRequested && lastLogits) {
+          let thinkClosed = !(maxThinkingTokens > 0);
+          for (let step = 0; step < maxNewTokens; step++) {
+            if (abortRequested) break;
+            let nextTok;
+            if (fsm) {
+              const tMask0 = performance.now();
+              fsm.maskLogits(lastLogits);
+              fsmMaskMsSamples.push(performance.now() - tMask0);
+              nextTok = sampleToken(lastLogits, history, sampling);
+            } else if (!thinkClosed && step >= maxThinkingTokens) {
+              // Budget forcing: close <think> channel with </think> so remaining tokens go to final answer
+              nextTok = endThinkTokenId;
               thinkClosed = true;
+            } else {
+              nextTok = sampleToken(lastLogits, history, sampling);
+              if (nextTok === endThinkTokenId) {
+                thinkClosed = true;
+              }
+            }
+            if (stopOnEos && eosSet.has(nextTok)) {
+              break;
+            }
+            if (fsm && !fsm.advance(nextTok)) {
+              break;
+            }
+            generated.push(nextTok);
+            history.push(nextTok);
+            emitTokenEvent(id, tokenizer, nextTok, step, generated, streamState, tDec0);
+
+            if (step + 1 < maxNewTokens && !abortRequested) {
+              const res = await engine.forward([nextTok]);
+              lastLogits = res.logits;
             }
           }
-          if (stopOnEos && eosSet.has(nextTok)) {
-            break;
-          }
-          generated.push(nextTok);
-          history.push(nextTok);
-          emitTokenEvent(id, tokenizer, nextTok, step, generated, streamState, tDec0);
-
-          if (step + 1 < maxNewTokens && !abortRequested) {
-            const res = await engine.forward([nextTok]);
-            lastLogits = res.logits;
-          }
         }
+      } finally {
+        if (fsm) fsm.free();
       }
       const decodeMs = performance.now() - tDec0;
 
@@ -278,6 +297,7 @@ self.onmessage = async (ev) => {
         prefillMs,
         decodeMs,
         decodeTokPerSec: generated.length > 0 ? (generated.length / (decodeMs / 1000)) : 0,
+        fsmMaskMsSamples: fsmMaskMsSamples.length > 0 ? fsmMaskMsSamples : undefined,
         curPos: engine.curPos,
         deviceLostReason,
       });

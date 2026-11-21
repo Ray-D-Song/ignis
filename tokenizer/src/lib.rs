@@ -1,9 +1,16 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::slice;
+use std::sync::{Arc, OnceLock};
 
 use fancy_regex::Regex;
 use serde::Deserialize;
+
+pub mod fsm;
+pub mod json_schema;
+
+use fsm::{TokenFsm, VocabIndex};
+use json_schema::Dfa;
 
 #[derive(Deserialize)]
 struct TokenizerJson {
@@ -150,6 +157,7 @@ pub struct Tokenizer {
     pre_steps: Vec<PreStep>,
     dec_replaces: Vec<(String, String)>,
     gpt2_default_re: Option<Regex>,
+    vocab_index: OnceLock<Arc<VocabIndex>>,
 }
 
 fn build_byte_tables() -> ([char; 256], HashMap<char, u8>) {
@@ -382,6 +390,7 @@ impl Tokenizer {
             pre_steps,
             dec_replaces,
             gpt2_default_re,
+            vocab_index: OnceLock::new(),
         })
     }
 
@@ -744,6 +753,69 @@ impl Tokenizer {
         }
         String::from_utf8_lossy(&raw_bytes).into_owned()
     }
+
+    pub fn vocab_size(&self) -> usize {
+        self.id_to_token.len()
+    }
+
+    pub fn token_raw_bytes(&self, id: u32) -> Option<Vec<u8>> {
+        if let Some((s, is_special)) = self.added_set.get(&id) {
+            if *is_special || s.is_empty() {
+                return None;
+            }
+            return Some(s.as_bytes().to_vec());
+        }
+        if !self.use_byte_level {
+            if self.byte_fallback {
+                if let Some(&b) = self.sp_byte_rev.get(&id) {
+                    return Some(vec![b]);
+                }
+            }
+            let tok = self.id_to_token.get(id as usize)?;
+            if tok.is_empty() {
+                return None;
+            }
+            if self.dec_replaces.is_empty() {
+                return Some(tok.as_bytes().to_vec());
+            }
+            let mut s = tok.clone();
+            for (from, to) in &self.dec_replaces {
+                if !from.is_empty() && s.contains(from.as_str()) {
+                    s = s.replace(from.as_str(), to.as_str());
+                }
+            }
+            if s.is_empty() {
+                return None;
+            }
+            return Some(s.into_bytes());
+        }
+        let tok = self.id_to_token.get(id as usize)?;
+        if tok.is_empty() {
+            return None;
+        }
+        let mut raw_bytes = Vec::with_capacity(tok.len());
+        for ch in tok.chars() {
+            if let Some(&b) = self.char_to_byte.get(&ch) {
+                raw_bytes.push(b);
+            } else {
+                let mut buf = [0u8; 4];
+                raw_bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+        if raw_bytes.is_empty() { None } else { Some(raw_bytes) }
+    }
+
+    pub fn vocab_index(&self) -> Arc<VocabIndex> {
+        self.vocab_index
+            .get_or_init(|| Arc::new(VocabIndex::build(self.vocab_size(), |id| self.token_raw_bytes(id))))
+            .clone()
+    }
+
+    pub fn create_fsm(&self, schema_json: &str, eos_ids: &[u32]) -> Result<TokenFsm, String> {
+        let dfa = Dfa::from_json_schema_str(schema_json)?;
+        let vocab = self.vocab_index();
+        Ok(TokenFsm::new(dfa, vocab, eos_ids.to_vec()))
+    }
 }
 
 #[no_mangle]
@@ -827,5 +899,162 @@ pub unsafe extern "C" fn ignis_tok_decode(
 pub unsafe extern "C" fn ignis_tok_free_bytes(ptr: *mut u8, len: usize) {
     if !ptr.is_null() && len > 0 {
         drop(Vec::from_raw_parts(ptr, len, len));
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ignis_tok_vocab_size(tok: *const Tokenizer) -> usize {
+    if tok.is_null() {
+        return 0;
+    }
+    (&*tok).vocab_size()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ignis_fsm_create(
+    tok: *const Tokenizer,
+    schema_ptr: *const u8,
+    schema_len: usize,
+    eos_ptr: *const u32,
+    eos_len: usize,
+) -> *mut TokenFsm {
+    if tok.is_null() {
+        return std::ptr::null_mut();
+    }
+    let tok = &*tok;
+    let schema_bytes = if schema_ptr.is_null() || schema_len == 0 {
+        &[]
+    } else {
+        slice::from_raw_parts(schema_ptr, schema_len)
+    };
+    let Ok(schema_str) = std::str::from_utf8(schema_bytes) else {
+        return std::ptr::null_mut();
+    };
+    let eos_ids = if eos_ptr.is_null() || eos_len == 0 {
+        &[][..]
+    } else {
+        slice::from_raw_parts(eos_ptr, eos_len)
+    };
+    match tok.create_fsm(schema_str, eos_ids) {
+        Ok(fsm) => Box::into_raw(Box::new(fsm)),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ignis_fsm_allowed_bitset(
+    fsm: *mut TokenFsm,
+    out_words_len_ptr: *mut usize,
+    out_allowed_count_ptr: *mut u32,
+) -> *const u32 {
+    if fsm.is_null() {
+        return std::ptr::null();
+    }
+    let fsm = &mut *fsm;
+    let (words, count) = fsm.allowed_bitset();
+    if !out_words_len_ptr.is_null() {
+        *out_words_len_ptr = words.len();
+    }
+    if !out_allowed_count_ptr.is_null() {
+        *out_allowed_count_ptr = count;
+    }
+    words.as_ptr()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ignis_fsm_mask_logits(
+    fsm: *mut TokenFsm,
+    logits_ptr: *mut f32,
+    vocab_size: usize,
+) -> u32 {
+    if fsm.is_null() || logits_ptr.is_null() {
+        return 0;
+    }
+    let fsm = &mut *fsm;
+    let logits = slice::from_raw_parts_mut(logits_ptr, vocab_size);
+    fsm.mask_logits(logits)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ignis_fsm_advance(fsm: *mut TokenFsm, token_id: u32) -> u32 {
+    if fsm.is_null() {
+        return 0;
+    }
+    let fsm = &mut *fsm;
+    if fsm.advance(token_id) { 1 } else { 0 }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ignis_fsm_is_done(fsm: *const TokenFsm) -> u32 {
+    if fsm.is_null() {
+        return 0;
+    }
+    if (&*fsm).is_done() { 1 } else { 0 }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ignis_fsm_reset(fsm: *mut TokenFsm) {
+    if !fsm.is_null() {
+        (&mut *fsm).reset();
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ignis_fsm_free(fsm: *mut TokenFsm) {
+    if !fsm.is_null() {
+        drop(Box::from_raw(fsm));
+    }
+}
+
+#[cfg(test)]
+mod fsm_tests {
+    use super::*;
+
+    fn mini_tokenizer_json() -> String {
+        serde_json::json!({
+            "added_tokens": [
+                { "id": 0, "content": "<eos>", "special": true }
+            ],
+            "normalizer": null,
+            "pre_tokenizer": { "type": "ByteLevel", "add_prefix_space": false, "use_regex": false },
+            "decoder": { "type": "ByteLevel" },
+            "model": {
+                "vocab": {
+                    "{": 1, "}": 2, "\"": 3, ":": 4, ",": 5, "Ġ": 6,
+                    "\"city\":": 7, "\"country\":": 8, "\"Paris\"": 9, "\"France\"": 10,
+                    "\"sentiment\":": 11, "\"score\":": 12, "\"verified\":": 13,
+                    "\"positive\"": 14, "true": 15, "false": 16, "42": 17,
+                    "invalid_bare": 18, "中": 19, "text": 20, "[": 21, "]": 22
+                },
+                "merges": []
+            }
+        }).to_string()
+    }
+
+    #[test]
+    fn test_token_fsm_step_and_mask() {
+        let tok = Tokenizer::from_json(&mini_tokenizer_json()).unwrap();
+        let schema = r#"{"type":"object","properties":{"city":{"type":"string"},"country":{"type":"string"}},"required":["city","country"]}"#;
+        let mut fsm = tok.create_fsm(schema, &[0]).unwrap();
+        let mut logits = vec![0.0f32; tok.vocab_size()];
+        let cnt = fsm.mask_logits(&mut logits);
+        assert!(cnt >= 1);
+        assert!(logits[1].is_finite()); // '{'
+        assert!(logits[18].is_infinite() && logits[18] < 0.0); // 'invalid_bare'
+        assert!(logits[0].is_infinite() && logits[0] < 0.0); // '<eos>' not allowed at start
+
+        assert!(fsm.advance(1)); // {
+        assert!(fsm.advance(7)); // "city":
+        assert!(fsm.advance(9)); // "Paris"
+        assert!(fsm.advance(5)); // ,
+        assert!(fsm.advance(8)); // "country":
+        assert!(fsm.advance(10)); // "France"
+        assert!(fsm.advance(2)); // }
+        assert!(fsm.is_done());
+
+        let mut end_logits = vec![0.0f32; tok.vocab_size()];
+        fsm.mask_logits(&mut end_logits);
+        assert!(end_logits[0].is_finite()); // <eos> now allowed!
+        assert!(fsm.advance(0));
     }
 }

@@ -173,6 +173,16 @@ export interface IgnisDeviceProfile {
 
 export function detectDeviceProfile(adapterOrNull?: GPUAdapter | null): Promise<IgnisDeviceProfile>;
 
+export class IgnisFsm {
+  maskLogits(logitsFloat32: Float32Array): number;
+  advance(tokenId: number): boolean;
+  isDone(): boolean;
+  reset(): void;
+  free(): void;
+}
+
+export function resolveResponseSchema(responseFormat?: JsonSchemaResponseFormat | null): Record<string, unknown> | null;
+
 export function buildIgnisChatPrompt(
   messages: ChatMessage[],
   blueprint: Record<string, unknown>,

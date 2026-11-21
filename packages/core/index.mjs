@@ -1,6 +1,6 @@
 export { IgnisEngine } from '../../runtime/ignis-engine.mjs';
 export { IgnisClient } from '../../runtime/ignis-client.mjs';
-export { IgnisTokenizer } from '../../runtime/wasm-tokenizer.mjs';
+export { IgnisTokenizer, IgnisFsm, resolveResponseSchema } from '../../runtime/wasm-tokenizer.mjs';
 export { sampleToken } from '../../runtime/sampler.mjs';
 export { detectDeviceProfile } from '../../runtime/device-profile.mjs';
 export { Lfm3OmniRuntime } from '../../runtime/multimodal/lfm3-omni-runtime.mjs';
