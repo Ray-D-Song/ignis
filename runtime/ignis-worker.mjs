@@ -5,12 +5,18 @@ import { sampleToken } from './sampler.mjs';
 let engine = null;
 let tokenizer = null;
 let deviceLostReason = null;
+let abortRequested = false;
 
 self.onmessage = async (ev) => {
   const { id, cmd, payload } = ev.data;
   const reply = (ok, data, error) => self.postMessage({ id, ok, data, error });
 
   try {
+    if (cmd === 'abort') {
+      abortRequested = true;
+      reply(true, { aborted: true });
+      return;
+    }
     if (cmd === 'init') {
       if (engine) {
         engine.destroy();
@@ -96,13 +102,21 @@ self.onmessage = async (ev) => {
       }
       if (!ids.length) throw new Error('Empty prompt');
 
+      abortRequested = false;
       const tPrefill0 = performance.now();
       let lastLogits = null;
       const stepSize = Math.min(chunkSize, engine.maxBatchTokens);
       for (let off = 0; off < ids.length; off += stepSize) {
+        if (abortRequested) break;
         const chunk = ids.slice(off, off + stepSize);
         const res = await engine.forward(chunk);
         lastLogits = res.logits;
+        self.postMessage({
+          type: 'prefill_progress',
+          requestId: id,
+          processed: Math.min(ids.length, off + chunk.length),
+          total: ids.length,
+        });
         // Yield briefly between prefill chunks so GPU compositor / main page stay responsive
         if (off + stepSize < ids.length) {
           await new Promise((r) => setTimeout(r, 0));
@@ -114,27 +128,46 @@ self.onmessage = async (ev) => {
       const history = [...ids];
       const eosId = engine.bp.eos_token_id;
       const tDec0 = performance.now();
+      let committedText = '';
 
-      for (let step = 0; step < maxNewTokens; step++) {
-        const nextTok = sampleToken(lastLogits, history, sampling);
-        generated.push(nextTok);
-        history.push(nextTok);
+      if (!abortRequested && lastLogits) {
+        for (let step = 0; step < maxNewTokens; step++) {
+          if (abortRequested) break;
+          const nextTok = sampleToken(lastLogits, history, sampling);
+          if (stopOnEos && nextTok === eosId) {
+            break;
+          }
+          generated.push(nextTok);
+          history.push(nextTok);
 
-        const textChunk = tokenizer ? tokenizer.decode([nextTok], true) : '';
-        self.postMessage({
-          type: 'token',
-          requestId: id,
-          tokenId: nextTok,
-          text: textChunk,
-          step,
-        });
+          let fullText = committedText;
+          let deltaText = '';
+          if (tokenizer) {
+            const decoded = tokenizer.decode(generated, true);
+            // Strip trailing incomplete UTF-8 replacement chars (\uFFFD) until remaining bytes arrive
+            const clean = decoded.endsWith('\uFFFD') ? decoded.replace(/\uFFFD+$/, '') : decoded;
+            if (clean.length >= committedText.length) {
+              deltaText = clean.slice(committedText.length);
+              committedText = clean;
+            }
+            fullText = committedText;
+          }
 
-        if (stopOnEos && nextTok === eosId) {
-          break;
-        }
-        if (step + 1 < maxNewTokens) {
-          const res = await engine.forward([nextTok]);
-          lastLogits = res.logits;
+          const elapsedSec = Math.max(0.001, (performance.now() - tDec0) / 1000);
+          self.postMessage({
+            type: 'token',
+            requestId: id,
+            tokenId: nextTok,
+            text: deltaText,
+            fullText,
+            step,
+            tokPerSec: generated.length / elapsedSec,
+          });
+
+          if (step + 1 < maxNewTokens && !abortRequested) {
+            const res = await engine.forward([nextTok]);
+            lastLogits = res.logits;
+          }
         }
       }
       const decodeMs = performance.now() - tDec0;
@@ -143,6 +176,7 @@ self.onmessage = async (ev) => {
         promptLen: ids.length,
         generatedIds: generated,
         generatedText: tokenizer ? tokenizer.decode(generated, true) : null,
+        aborted: abortRequested,
         prefillMs,
         decodeMs,
         decodeTokPerSec: generated.length > 0 ? (generated.length / (decodeMs / 1000)) : 0,

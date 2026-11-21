@@ -1,0 +1,33 @@
+{
+  "name": "chat-vinext",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "sync": "node scripts/sync-ignis.mjs",
+    "predev": "node scripts/sync-ignis.mjs",
+    "dev": "vinext dev",
+    "prebuild": "node scripts/sync-ignis.mjs",
+    "build": "vinext build",
+    "start": "vinext start"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "@vitejs/plugin-rsc": "^0.5.39",
+    "react-server-dom-webpack": "^19.3.1",
+    "typescript": "^7.0.2",
+    "vinext": "^1.4.6",
+    "vite": "^8.3.8"
+  }
+}

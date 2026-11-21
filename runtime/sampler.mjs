@@ -1,6 +1,75 @@
 /**
- * Token Sampler: Greedy, Temperature, Top-K, Top-P, Min-P, Repetition Penalty.
+ * Token Sampler: Greedy, Temperature, Top-K (O(V) min-heap), Top-P, Min-P, Repetition Penalty.
  */
+
+function argmax(arr, len) {
+  let bestIdx = 0;
+  let bestVal = arr[0];
+  for (let i = 1; i < len; i++) {
+    if (arr[i] > bestVal) {
+      bestVal = arr[i];
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
+}
+
+/**
+ * O(V log K) min-heap Top-K selection using typed arrays (zero GC churn over 131K vocab).
+ */
+function selectTopK(logits, V, k) {
+  const heapIdx = new Int32Array(k);
+  const heapVal = new Float32Array(k);
+
+  for (let i = 0; i < k; i++) {
+    heapIdx[i] = i;
+    heapVal[i] = logits[i];
+  }
+  // Heapify min-heap
+  for (let i = (k >> 1) - 1; i >= 0; i--) {
+    siftDown(heapIdx, heapVal, k, i);
+  }
+
+  let minVal = heapVal[0];
+  for (let i = k; i < V; i++) {
+    const v = logits[i];
+    if (v > minVal) {
+      heapIdx[0] = i;
+      heapVal[0] = v;
+      siftDown(heapIdx, heapVal, k, 0);
+      minVal = heapVal[0];
+    }
+  }
+
+  // Sort the small k-element array descending
+  const pairs = new Array(k);
+  for (let i = 0; i < k; i++) {
+    pairs[i] = { idx: heapIdx[i], val: heapVal[i] };
+  }
+  pairs.sort((a, b) => b.val - a.val);
+  return pairs;
+}
+
+function siftDown(hIdx, hVal, size, root) {
+  const idx0 = hIdx[root];
+  const val0 = hVal[root];
+  let i = root;
+  while (true) {
+    const left = (i << 1) + 1;
+    if (left >= size) break;
+    let smallest = left;
+    const right = left + 1;
+    if (right < size && hVal[right] < hVal[left]) {
+      smallest = right;
+    }
+    if (hVal[smallest] >= val0) break;
+    hIdx[i] = hIdx[smallest];
+    hVal[i] = hVal[smallest];
+    i = smallest;
+  }
+  hIdx[i] = idx0;
+  hVal[i] = val0;
+}
 
 export function sampleToken(
   logits,
@@ -8,21 +77,14 @@ export function sampleToken(
   { temperature = 0.0, topK = 40, topP = 0.95, minP = 0.0, repetitionPenalty = 1.0 } = {}
 ) {
   const V = logits.length;
-  // Work on a copy only if penalty/sampling modifies logits
   if (temperature <= 0 && repetitionPenalty === 1.0) {
-    let bestIdx = 0;
-    let bestVal = logits[0];
-    for (let i = 1; i < V; i++) {
-      if (logits[i] > bestVal) {
-        bestVal = logits[i];
-        bestIdx = i;
-      }
-    }
-    return bestIdx;
+    return argmax(logits, V);
   }
 
-  const work = new Float32Array(logits);
+  // Apply repetition penalty in-place on a copy only when needed
+  let work = logits;
   if (repetitionPenalty !== 1.0 && historyIds.length > 0) {
+    work = new Float32Array(logits);
     const seen = new Set(historyIds);
     for (const id of seen) {
       if (id >= 0 && id < V) {
@@ -32,43 +94,28 @@ export function sampleToken(
   }
 
   if (temperature <= 0) {
-    let bestIdx = 0;
-    let bestVal = work[0];
-    for (let i = 1; i < V; i++) {
-      if (work[i] > bestVal) {
-        bestVal = work[i];
-        bestIdx = i;
-      }
-    }
-    return bestIdx;
+    return argmax(work, V);
   }
 
-  // Top-K filtering via partial scan
-  const k = topK > 0 && topK < V ? topK : V;
-  const candidates = [];
-  for (let i = 0; i < V; i++) {
-    candidates.push(i);
-  }
-  candidates.sort((a, b) => work[b] - work[a]);
-  const topSlice = candidates.slice(0, k);
+  const k = topK > 0 && topK < V ? topK : Math.min(V, 256);
+  const topPairs = selectTopK(work, V, k);
 
-  const maxLogit = work[topSlice[0]];
+  const maxLogit = topPairs[0].val;
   let sumExp = 0;
-  const probs = new Float32Array(topSlice.length);
-  for (let i = 0; i < topSlice.length; i++) {
-    const p = Math.exp((work[topSlice[i]] - maxLogit) / temperature);
+  const probs = new Float32Array(k);
+  for (let i = 0; i < k; i++) {
+    const p = Math.exp((topPairs[i].val - maxLogit) / temperature);
     probs[i] = p;
     sumExp += p;
   }
-  for (let i = 0; i < probs.length; i++) {
+  for (let i = 0; i < k; i++) {
     probs[i] /= sumExp;
   }
 
-  // Min-P & Top-P truncation
   const maxProb = probs[0];
   let cum = 0;
-  let cutoff = probs.length;
-  for (let i = 0; i < probs.length; i++) {
+  let cutoff = k;
+  for (let i = 0; i < k; i++) {
     if (minP > 0 && probs[i] < maxProb * minP) {
       cutoff = Math.max(1, i);
       break;
@@ -85,7 +132,7 @@ export function sampleToken(
   let r = Math.random() * finalSum;
   for (let i = 0; i < cutoff; i++) {
     r -= probs[i];
-    if (r <= 0) return topSlice[i];
+    if (r <= 0) return topPairs[i].idx;
   }
-  return topSlice[cutoff - 1];
+  return topPairs[cutoff - 1].idx;
 }

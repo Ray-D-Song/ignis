@@ -41,6 +41,12 @@ npm test
 
 # 运行 36 层 4B 尺寸吞吐与 60fps Chunked Prefill 基准压测
 npm run test:phase4
+
+# 启动 vinext Chat Demo（默认加载 Spark-X2.6-4B · INT8_G64 LM Head）
+npm run demo:chat
+
+# 自动化端到端测试 vinext Chat Demo（Edge WebGPU 双轮对话 + 速度断言）
+npm run test:vinext
 ```
 
 详细路线图见 [ROADMAP.md](ROADMAP.md)，二进制格式规范见 [docs/format-spec.md](docs/format-spec.md)。

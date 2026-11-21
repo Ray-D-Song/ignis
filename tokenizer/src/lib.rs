@@ -22,6 +22,8 @@ struct AddedTokenJson {
     rstrip: bool,
     #[serde(default)]
     single_word: bool,
+    #[serde(default)]
+    special: bool,
 }
 
 #[derive(Deserialize)]
@@ -95,7 +97,7 @@ pub struct Tokenizer {
     char_to_byte: HashMap<char, u8>,
     merges: HashMap<(u32, u32), (u32, u32)>, // (a, b) -> (rank, merged_id)
     added_tokens: Vec<AddedTokenEntry>,
-    added_set: HashMap<u32, String>,
+    added_set: HashMap<u32, (String, bool)>,
     pre_steps: Vec<PreStep>,
     gpt2_default_re: Option<Regex>,
 }
@@ -181,7 +183,7 @@ impl Tokenizer {
                 if (a.id as usize) < id_to_token.len() {
                     id_to_token[a.id as usize] = a.content.clone();
                 }
-                added_set.insert(a.id, a.content.clone());
+                added_set.insert(a.id, (a.content.clone(), a.special));
                 AddedTokenEntry {
                     id: a.id,
                     content: a.content,
@@ -452,8 +454,8 @@ impl Tokenizer {
     pub fn decode(&self, ids: &[u32], skip_special: bool) -> String {
         let mut raw_bytes = Vec::with_capacity(ids.len() * 4);
         for &id in ids {
-            if let Some(s) = self.added_set.get(&id) {
-                if !skip_special {
+            if let Some((s, is_special)) = self.added_set.get(&id) {
+                if !skip_special || !*is_special {
                     raw_bytes.extend_from_slice(s.as_bytes());
                 }
                 continue;

@@ -8,6 +8,7 @@ export class IgnisClient {
     this.nextId = 1;
     this.pending = new Map();
     this.onProgress = null;
+    this.onPrefillProgress = null;
     this.onToken = null;
     this.onDeviceLost = null;
 
@@ -15,6 +16,10 @@ export class IgnisClient {
       const msg = ev.data;
       if (msg.type === 'progress') {
         if (this.onProgress) this.onProgress(msg);
+        return;
+      }
+      if (msg.type === 'prefill_progress') {
+        if (this.onPrefillProgress) this.onPrefillProgress(msg);
         return;
       }
       if (msg.type === 'token') {
@@ -65,6 +70,10 @@ export class IgnisClient {
 
   generate(options) {
     return this._call('generate', options);
+  }
+
+  abort() {
+    return this._call('abort');
   }
 
   async destroy() {
