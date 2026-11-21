@@ -3,10 +3,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { chromium } from 'playwright-core';
+import { resolveBrowserExecutable, resolvePythonExecutable } from './browser-env.mjs';
 
-const EDGE_PATH = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
+const EDGE_PATH = resolveBrowserExecutable();
 const ROOT_DIR = path.resolve(import.meta.dirname, '..');
-const PY = path.join(ROOT_DIR, 'packer/.venv/Scripts/python.exe');
+const PY = resolvePythonExecutable(ROOT_DIR);
 
 // Generate synthetic Llama/Qwen-style SwiGLU + separate q/k/v + untied lm_head fixture
 const genLlamaPy = `
@@ -74,7 +75,7 @@ await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const port = server.address().port;
 
 const browser = await chromium.launch({
-  executablePath: EDGE_PATH,
+  ...(EDGE_PATH ? { executablePath: EDGE_PATH } : {}),
   headless: true,
   args: ['--headless=new'],
 });

@@ -2,6 +2,9 @@
 name = "ignis-tokenizer"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Ray-D-Song/Ignis"
+description = "Zero-JS-dependency BPE / SentencePiece WASM tokenizer and JSON Schema DFA FSM engine for Ignis WebGPU"
 
 [lib]
 crate-type = ["cdylib"]

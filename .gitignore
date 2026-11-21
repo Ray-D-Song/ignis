@@ -2,7 +2,15 @@
 node_modules/
 dist/
 target/
+out/
+examples/chat-vinext/out/
+examples/chat-vinext/public/ignis/
+packages/*/dist/
+packages/packer/py/
+packages/*/LICENSE
+*.tgz
 *.tsbuildinfo
+.wrangler/
 
 # Python / Packer environments
 __pycache__/
@@ -21,6 +29,8 @@ weights/
 fixtures/large/
 tests/fixtures/
 package-lock.json
+pnpm-lock.yaml
+pnpm-workspace.yaml
 
 # OS & editor files
 .DS_Store

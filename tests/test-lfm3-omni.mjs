@@ -3,10 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { chromium } from 'playwright-core';
+import { resolveBrowserExecutable, resolvePythonExecutable } from './browser-env.mjs';
 
 const ROOT_DIR = path.resolve(import.meta.dirname, '..');
-const THORIUM_PATH = 'C:\\Users\\ray\\AppData\\Local\\Thorium\\Application\\thorium.exe';
-const EDGE_PATH = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
 const GOLDEN_DIR = path.join(ROOT_DIR, 'tests', 'fixtures', 'lfm3-omni-golden');
 const MODEL_DIR = path.join(ROOT_DIR, 'tests', 'fixtures', 'lfm3-omni-2b-ignis');
 
@@ -15,7 +14,7 @@ if (!fs.existsSync(path.join(MODEL_DIR, 'manifest.json'))) {
 }
 if (!fs.existsSync(path.join(GOLDEN_DIR, 'golden.json'))) {
   console.log('[test-lfm3-omni] Generating PyTorch golden reference...');
-  execFileSync(path.join(ROOT_DIR, 'packer', '.venv', 'Scripts', 'python.exe'), [path.join(ROOT_DIR, 'tests', 'gen_lfm3_golden.py')], {
+  execFileSync(resolvePythonExecutable(ROOT_DIR), [path.join(ROOT_DIR, 'tests', 'gen_lfm3_golden.py')], {
     cwd: ROOT_DIR,
     stdio: 'inherit',
   });
@@ -276,11 +275,11 @@ const HARNESS_HTML = `<!doctype html><html><body><script type="module">
 
 async function runBrowserSuite() {
   const { server, port } = await startStaticServer(HARNESS_HTML);
-  const exePath = fs.existsSync(THORIUM_PATH) ? THORIUM_PATH : EDGE_PATH;
-  console.log(`[test-lfm3-omni] Launching ${path.basename(exePath)} against http://127.0.0.1:${port}`);
+  const exePath = resolveBrowserExecutable();
+  console.log(`[test-lfm3-omni] Launching ${exePath ? path.basename(exePath) : 'playwright-chromium'} against http://127.0.0.1:${port}`);
 
   const browser = await chromium.launch({
-    executablePath: exePath,
+    ...(exePath ? { executablePath: exePath } : {}),
     headless: true,
     args: ['--headless=new'],
   });

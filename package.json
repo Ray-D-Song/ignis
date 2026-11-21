@@ -1,8 +1,20 @@
 {
-  "name": "ignis",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "name": "ignis-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Zero-dependency browser-native WebGPU LLM & Full-Omni multimodal inference engine (Spark, LFM3-Omni, Gemma 4, Qwen/Llama)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ray-D-Song/Ignis.git"
+  },
+  "homepage": "https://ignis.pages.dev",
+  "bugs": {
+    "url": "https://github.com/Ray-D-Song/Ignis/issues"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "main": "packages/core/index.mjs",
   "directories": {
     "doc": "docs",
     "example": "examples",
@@ -10,7 +22,11 @@
   },
   "scripts": {
     "build:wasm": "cd tokenizer && cargo build --target wasm32-unknown-unknown --release && powershell -NoProfile -Command \"Copy-Item target/wasm32-unknown-unknown/release/ignis_tokenizer.wasm ../runtime/wasm/ignis_tokenizer.wasm -Force\"",
+    "audit:wgsl": "node tests/ci-wgsl-audit.mjs",
+    "pack:check": "node packages/core/scripts/prepare-dist.mjs && node packages/packer/scripts/prepare-dist.mjs && node tests/ci-pack-smoke.mjs",
     "demo:chat": "npm --prefix examples/chat-vinext run dev",
+    "build:demo:pages": "npm --prefix examples/chat-vinext run build:pages",
+    "test:demo:static": "node tests/test-demo-static.mjs",
     "test:vinext": "node tests/test-vinext-chat.mjs",
     "test:probe": "node tests/probe.mjs",
     "test:kernels": "node tests/test-kernels.mjs",
@@ -25,9 +41,17 @@
     "test:phase6": "node tests/test-phase6-degradation.mjs && node tests/test-phase6-fsm.mjs && node tests/test-phase6-speculative.mjs",
     "test": "node tests/probe.mjs && node tests/test-kernels.mjs && node tests/test-tokenizer.mjs && node tests/phase2-numerical.mjs && node tests/phase3-e2e.mjs && node tests/phase5-multiarch.mjs"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": [
+    "webgpu",
+    "llm",
+    "webassembly",
+    "multimodal",
+    "speculative-decoding",
+    "json-schema",
+    "browser-ai"
+  ],
+  "author": "Ray-D-Song",
+  "license": "Apache-2.0",
   "type": "commonjs",
   "devDependencies": {
     "@webgpu/types": "^0.1.74",

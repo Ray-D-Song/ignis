@@ -1,7 +1,9 @@
 {
   "name": "chat-vinext",
-  "version": "1.0.0",
-  "description": "",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "description": "Ignis WebGPU Full-Omni Showcase & Browser Playground powered by vinext",
   "main": "index.js",
   "scripts": {
     "sync": "node scripts/sync-ignis.mjs",

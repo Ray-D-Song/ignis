@@ -3,9 +3,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { chromium } from 'playwright-core';
+import { resolveAllBrowserExecutables, resolvePythonExecutable } from './browser-env.mjs';
 
-const EDGE_PATH = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
-const THORIUM_PATH = 'C:\\Users\\ray\\AppData\\Local\\Thorium\\Application\\thorium.exe';
 const ROOT_DIR = path.resolve(import.meta.dirname, '..');
 
 // Static WGSL W3C-Baseline Specification Compliance Check:
@@ -190,11 +189,12 @@ const server = http.createServer((req, res) => {
 
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const port = server.address().port;
-const candidateBrowsers = [THORIUM_PATH, EDGE_PATH].filter((p) => fs.existsSync(p));
+const detected = resolveAllBrowserExecutables();
+const candidateBrowsers = detected.length > 0 ? detected : [undefined];
 try {
   for (const executablePath of candidateBrowsers) {
     const browser = await chromium.launch({
-      executablePath,
+      ...(executablePath ? { executablePath } : {}),
       headless: true,
       args: ['--headless=new'],
     });
@@ -202,7 +202,7 @@ try {
       const page = await browser.newPage();
       await page.goto(`http://127.0.0.1:${port}/tests/test-kernels.html`);
       const ua = await page.evaluate(() => navigator.userAgent);
-      console.log(`[test-kernels] Browser: ${path.basename(executablePath)} (${ua})`);
+      console.log(`[test-kernels] Browser: ${executablePath ? path.basename(executablePath) : 'playwright-chromium'} (${ua})`);
       const out = await page.evaluate((g) => window.__runKernelTests(g), golden);
       console.log('RMSNorm maxAbsErr:', maxAbsErr(out.rmsOut, golden.rms.expected));
       console.log('GEMV    maxAbsErr:', maxAbsErr(out.gemvOut, golden.qmm.expected_gemv));

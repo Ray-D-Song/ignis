@@ -3,10 +3,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { chromium } from 'playwright-core';
+import { resolveBrowserExecutable } from './browser-env.mjs';
 
 const ROOT_DIR = path.resolve(import.meta.dirname, '..');
-const THORIUM_PATH = 'C:\\Users\\ray\\AppData\\Local\\Thorium\\Application\\thorium.exe';
-const EDGE_PATH = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
 const MODEL_DIR = path.join(ROOT_DIR, 'tests', 'fixtures', 'lfm3-omni-2b-ignis');
 
 if (!fs.existsSync(path.join(MODEL_DIR, 'manifest.json'))) {
@@ -173,15 +172,15 @@ const HARNESS_HTML = `<!doctype html><html><body><script type="module">
 
 async function main() {
   const { server, port } = await startStaticServer(HARNESS_HTML);
-  const exePath = fs.existsSync(THORIUM_PATH) ? THORIUM_PATH : EDGE_PATH;
+  const exePath = resolveBrowserExecutable();
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ignis-sdk-e2e-'));
-  console.log(`[test-sdk-openai] Launching ${path.basename(exePath)} against http://127.0.0.1:${port}`);
+  console.log(`[test-sdk-openai] Launching ${exePath ? path.basename(exePath) : 'playwright-chromium'} against http://127.0.0.1:${port}`);
 
   const errors = [];
   let context;
   try {
     context = await chromium.launchPersistentContext(userDataDir, {
-      executablePath: exePath,
+      ...(exePath ? { executablePath: exePath } : {}),
       headless: true,
       args: ['--headless=new'],
     });

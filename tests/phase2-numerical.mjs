@@ -2,8 +2,9 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { chromium } from 'playwright-core';
+import { resolveBrowserExecutable } from './browser-env.mjs';
 
-const EDGE_PATH = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
+const EDGE_PATH = resolveBrowserExecutable();
 const ROOT_DIR = path.resolve(import.meta.dirname, '..');
 
 function startServer() {
@@ -44,7 +45,7 @@ async function main() {
   let browser;
   try {
     browser = await chromium.launch({
-      executablePath: EDGE_PATH,
+      ...(EDGE_PATH ? { executablePath: EDGE_PATH } : {}),
       headless: true,
       args: [
         '--headless=new',

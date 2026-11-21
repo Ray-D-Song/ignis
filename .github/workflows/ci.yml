@@ -1,0 +1,63 @@
+name: Ignis CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  rust-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Run Rust unit tests (BPE, SentencePiece, JSON Schema DFA, TokenFSM)
+        run: cargo test --manifest-path tokenizer/Cargo.toml
+      - name: Build ignis_tokenizer.wasm (release)
+        run: |
+          cd tokenizer
+          cargo build --target wasm32-unknown-unknown --release
+          cp target/wasm32-unknown-unknown/release/ignis_tokenizer.wasm ../runtime/wasm/ignis_tokenizer.wasm
+
+  audit-and-packages:
+    runs-on: ubuntu-latest
+    needs: rust-wasm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install
+      - name: Static W3C WGSL Audit & WASM Tokenizer/FSM Offline Smoke
+        run: npm run audit:wgsl
+      - name: Cross-platform Tokenizer Test (CI Fixture)
+        run: npm run test:tokenizer
+      - name: Verify Self-Contained npm Packages (ignis-webgpu & ignis-webgpu-packer)
+        run: npm run pack:check
+
+  demo-static-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install chat-vinext dependencies
+        run: npm --prefix examples/chat-vinext install
+      - name: TypeScript type check
+        run: npx --prefix examples/chat-vinext tsc -p examples/chat-vinext/tsconfig.json --noEmit
+      - name: Build Cloudflare Pages static export
+        env:
+          NEXT_PUBLIC_IGNIS_CDN_BASE: https://models.ignis.dev
+        run: npm run build:demo:pages
+      - name: Verify static export artifacts
+        run: |
+          test -f examples/chat-vinext/out/index.html
+          test -f examples/chat-vinext/out/_headers
+          test -f examples/chat-vinext/out/ignis/runtime/ignis-worker.mjs
+          test -f examples/chat-vinext/out/ignis/runtime/wasm/ignis_tokenizer.wasm
+          test -f examples/chat-vinext/out/samples/demo-shapes.png
+          test -f examples/chat-vinext/out/samples/demo-tone.wav
