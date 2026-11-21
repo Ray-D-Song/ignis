@@ -1,56 +1,133 @@
+> **English** | [简体中文](README.zh-CN.md)
+
 # Ignis
 
-**Ignis** 是一个基于第一性原理从零构建的 **Browser-Native WebGPU LLM & Full-Omni 多模态推理引擎与通用框架**。  
-它不依赖 GGUF/ONNX/TVM 等外部推理运行时，从 `.ignis` 分片存储格式、W3C 基线 WGSL 算子代码生成、OPFS 流式底座到 Rust/WASM 分词与 JSON Schema FSM 约束解码全部面向浏览器沙箱垂直设计。
+**A zero-dependency, browser-native WebGPU LLM and Full-Omni multimodal inference engine built from first principles.**
 
-## 核心能力全景
+[**Live Demo**](https://ignis.pages.dev) · [**Format Spec**](docs/format-spec.md) · [**Benchmarks**](docs/benchmark-spark-4b.md) · [**Cloudflare Deploy Guide**](docs/deploy-cloudflare.md)
 
-* **多架构统一 Declarative Blueprint 引擎**：
-  * 原生一套引擎支持 **Spark-X2.6-4B**（Ring SWA + Full + Sigmoid Gate）、**Llama / Qwen2 / Qwen3 / Phi3**、**LiquidAI/LFM3-Omni-2B**（ShortConv `K=7` + SWA + Full + 图像/音频理解 + DepthDecoder + 24 kHz LiquidCodec 语音合成）与 **google/gemma-4-E4B-it**（`262K` 词表 Z-Tiling + 42 层 KV-Sharing +外置 `INT8_ROW` PLE + SigLIP2 + Chunked Conformer）。
-* **WebGPU 原生对齐格式与低显存分级降级**：
-  * 支持 `INT4_G64_ASYM`、`INT8_G64_SYM`（LM Head / PLE 投影）及 **`INT3_G64_ASYM`**（32×3-bit 打入 3×`u32`，LFM3-Omni 显存压缩至 `755 MiB`）；超大词表 `token_embd` 与 Gemma 4 `ple_embd` 常驻 OPFS 外置查表（节省数 GiB VRAM）。
-  * 严格遵循 **W3C WebGPU 基线**：所有 `kernels/` 禁用实验性 `@builtin(subgroup_id)` / `@builtin(num_subgroups)`，内置 `useSubgroups=false` 共享内存归约降级（Bit-Exact 对齐）与 `detectDeviceProfile()` 硬件分级适配。
-* **Rust/WASM 分词与结构化 JSON Schema FSM 约束解码**：
-  * 自研零外部 JS 依赖 Rust/WASM 引擎（`tokenizer/`），同时支持 Byte-Level BPE 与 SentencePiece `ByteFallback`（131K / 128K / 262K 词表 **100% 精确一致**）。
-  * 内置 JSON Schema → Thompson NFA → 等价类 DFA → 状态级 packed `u32` Bitset **FSM 约束解码**（`response_format`），零拷贝屏蔽 131K+ 词表仅 **`0.285 ms/tok`**（`p95 = 2.05 ms`）。
-* **双模式无损投机解码（Speculative Decoding）**：
-  * **N-gram Lookup**（零额外显存后缀匹配，`Spark-4B` 实测 `84.5%` 接受率、`134.0 tok/s` / `1.30x` 加速）。
-  * **Draft-Target**（`INT3_G64` 草稿 + `INT4/INT8` 目标模型，支持 ShortConv 零读取 GPU 状态快照回滚与 Leviathan 无损随机拒绝采样，与自回归基线 **100% 比特级一致**）。
-* **开发者 SDK 与全栈示例**：
-  * `@ignis/core`（`IgnisOpenAI` OpenAI 兼容文本/流式/全模态客户端）与 `@ignis/packer`（`ignis-pack` 离线打包 CLI）。
-  * `examples/chat-vinext/`：基于 `vinext` + React 19 RSC 的多模型全模态浏览器 Chat 工作台（OPFS 缓存、`<think>` 折叠、图像/WAV 上传与 24 kHz 语音播放）。
+Ignis does not wrap ONNX Runtime, llama.cpp/WASM, or Apache TVM. Every layer—from its 256-byte-aligned `.ignis` binary shards and OPFS `SyncAccessHandle` streaming loader, to strict W3C baseline WGSL kernels, Rust/WASM tokenizers, JSON Schema FSM logit masking, and GPU-resident speculative decoding—is engineered specifically around browser sandbox constraints (`ArrayBuffer` caps, COOP/COEP isolation, WGSL subgroup divergence, and VRAM limits).
 
-## 真机实测指标摘要（Thorium 138 · AMD RX 6800 XT）
+## Why Ignis?
 
-| 模型 / 能力 | 显存 / 耗时 | 精度 / 速度实测结果 |
-| :--- | :--- | :--- |
-| **Spark-X2.6-4B** (`INT8_G64` LM Head) | `2.32 GiB` VRAM | Wall **`85.4 tok/s`**（`vinext` 多轮 `86.0 / 81.8 tok/s`），vs BF16 `cos=0.9990~0.9997` |
-| **LFM3-Omni-2B** (Full Omni) | `1054.86 MiB` GPU | 15/15 全模态对拍全过；Text `cos=0.9981` / VQA `0.9981` / Audio `0.9990` / 24kHz WAV `0.9990` |
-| **Gemma-4-E4B-it** (Full Omni + Q8 PLE) | `2588.7 MiB` Base / `3075.8 MiB` Peak | 10/10 全模态对拍全过；Text `cos=0.9988` / VQA `0.9934` / Audio `0.9590`（`Top-1` 全中） |
-| **`INT3_G64` 硬件降级 (`LFM3-2B`)** | **`755.10 MiB`** GPU | `useSubgroups=false` 余弦 `0.99999999996`；Q3 Greedy Token IDs 与 Q4 100% 一致 |
-| **Rust/WASM JSON Schema FSM** | **`0.285 ms/tok`** 中位掩码开销 | Spark-4B + LFM3 × 3 类复杂 Schema **6/6 100% 合法严格匹配** |
-| **双模式投机解码 (`N-gram` + `Draft-Target`)** | Zero-VRAM / Dual-Engine | Greedy **100% 比特级等价**；Spark N-gram **`134.0 tok/s`（`1.30x`）**；LFM3 ShortConv 接受率 **`90.2%`** |
+- **OPFS Externalized Embeddings & 2.8 GiB PLE Streaming**: Instead of pinning massive `vocab_size × hidden_dim` embedding matrices in VRAM, `embd.ignis` and Gemma 4's `2.82 GB` `ple_embd.ignis` live in Origin Private File System and stream row-by-row via Worker `createSyncAccessHandle()` (`~0.1 ms` per token lookup, saving gigabytes of GPU memory).
+- **One Engine, Full-Omni Native Pipelines**: Declarative architecture blueprints (`packer/blueprints.py` + `kernels/codegen.mjs` + `runtime/ignis-engine.mjs`) run standard Transformers (`Spark-X2.6-4B`, `Llama`, `Qwen2/3`, `Phi3`), Hybrid ShortConv+SWA Audio/Vision Omni (`LiquidAI/LFM3-Omni-2B` with 24 kHz `LiquidCodec` speech synthesis), and `262K`-vocab Per-Layer-Embedding Omni (`google/gemma-4-E4B-it` with SigLIP2 Vision + Chunked Conformer Audio) without per-model JS rewrites.
+- **Strict W3C WebGPU Baseline + Verified Tiered Degradation**: Zero experimental `@builtin(subgroup_id)` or `@builtin(num_subgroups)` assumptions (which break Chrome/Edge even when `subgroups` is advertised). Includes bit-accurate `useSubgroups = false` shared-memory tree reduction (`cos = 0.99999999996`) and **`INT3_G64_ASYM`** quantization (packing `32 × 3-bit` weights into `3 × u32`, shrinking `LFM3-Omni-2B` GPU weights to **`755.1 MiB`**).
+- **Sub-Millisecond Rust/WASM Tokenizer & JSON Schema FSM**: Single zero-JS-dependency `ignis_tokenizer.wasm` supports Byte-Level BPE (`131K` Spark) and SentencePiece `ByteFallback` (`128K` LFM3, `262K` Gemma-4) with 100% Oracle parity, plus a compiled NFA -> DFA -> packed `u32` bitset FSM (`response_format`) masking `131K+` logits in **`0.285 ms/tok` median** (`p95 = 2.05 ms/tok`).
+- **Dual-Mode Lossless Speculative Decoding**:
+  - **N-gram Lookup** (0 MiB extra VRAM): `84.5%` acceptance and **`134.0 tok/s` (`1.30x`)** on Spark-X2.6-4B.
+  - **Draft-Target** (`INT3_G64` draft -> `INT4/INT8` target): Zero-readback GPU `ShortConv` state snapshot/rollback + Leviathan lossless rejection sampling, bit-identical to greedy autoregressive decoding (`90.2%` acceptance on LFM3-Omni-2B).
 
-## 快速开始与自动化测试
+## Architecture
 
-```bash
-# 安装测试依赖（Playwright）与构建 Rust/WASM 引擎
-npm install
-npm run build:wasm
+```mermaid
+flowchart LR
+  subgraph Storage["Browser Storage & Network"]
+    CDN["HTTPS Shards / Local Model"] -->|"Range stream (no full-RAM blob)"| OPFS["OPFS Cache (.ignis)"]
+    OPFS -->|"SyncAccessHandle row reads"| Embd["Host Row Lookup (embd.ignis / ple_embd.ignis)"]
+  end
 
-# 离线打包 HuggingFace 模型为 .ignis（支持 Spark / Qwen / Llama / LFM3-Omni / Gemma-4）
-npx ignis-pack --input <hf-model-dir> --output <ignis-out-dir> --lm-head-dtype int8
+  subgraph Worker["Dedicated Web Worker (Isolated Heap ~1-73 MB)"]
+    Tok["Rust/WASM Tokenizer & JSON Schema DFA FSM"] --> Engine["IgnisEngine (Declarative Blueprint)"]
+    MM["Lfm3OmniRuntime / Gemma4OmniRuntime (Vision + Audio + 24 kHz LiquidCodec)"] --> Engine
+    Spec["Speculative Coordinator (N-gram / Draft-Target)"] --> Engine
+  end
 
-# 分别运行核心回归、全模态对拍、SDK 与 Phase 6 全套测试
-npm test
-npm run test:lfm3
-npm run test:gemma4
-npm run test:sdk
-npm run test:phase6
-
-# 启动 vinext 全模态 Chat Demo（默认加载 Spark-X2.6-4B · INT8_G64，可切换 LFM3-Omni 与 Gemma-4-E4B）
-npm run demo:chat
-npm run test:vinext
+  subgraph WebGPU["Strict W3C WebGPU Baseline"]
+    Embd -->|"16 MiB StagingBuffer"| Shards["VRAM Quants (INT3_G64 / INT4_G64 / INT8_G64)"]
+    Engine -->|"Single-submit Decode Graph"| Kernels["WGSL Mega-Kernels & Z-Tiled Output"]
+    Kernels -->|"Optional Shared-Memory Fallback"| Shards
+  end
 ```
 
-详细路线图见 [ROADMAP.md](ROADMAP.md)，进度记录见 [PROGRESS.md](PROGRESS.md)，二进制格式规范见 [docs/format-spec.md](docs/format-spec.md)。
+## Verified Benchmarks (Thorium 138 · AMD Radeon RX 6800 XT)
+
+Every number below is measured on real desktop hardware in Thorium 138 (`shader-f16` + `subgroups`) against PyTorch BF16 reference outputs:
+
+| Model / Capability | GPU VRAM (Loaded) | Throughput / Accuracy |
+| :--- | :--- | :--- |
+| **Spark-X2.6-4B** (`INT4_G64` body, `INT8_G64` LM Head) | `2,371.34 MiB` (`+322 MiB` OPFS) | **`85.44 tok/s`** raw / **`86.0 -> 81.8 tok/s`** multi-turn chat (`cos = 0.9990–0.9997` vs BF16) |
+| **LiquidAI/LFM3-Omni-2B** (Text + Vision + Audio + 24 kHz Voice) | `1,054.86 MiB` (`+251.95 MiB` OPFS) | **15/15** PyTorch parity checks (`Text cos=0.9981`, `VQA 0.9981`, `Audio 0.9990`, `24 kHz WAV 0.9990`) |
+| **google/gemma-4-E4B-it** (`262K` Vocab + Q8 PLE + SigLIP2 + Conformer) | `2,588.7 MiB` base / `3,075.8 MiB` peak | **10/10** PyTorch parity checks (`Text cos=0.9988`, `VQA 0.9934`, `Audio 0.9590`, Top-1 match) |
+| **`INT3_G64` Degradation** (`LFM3-Omni-2B` body) | **`755.10 MiB`** | `useSubgroups=false` cosine `0.99999999996`; Q3 greedy token IDs match Q4 100% |
+| **JSON Schema FSM** (`131K / 128K` vocabs × 3 schemas) | `+0 MiB` VRAM | **6/6** strictly valid JSON; **`0.285 ms/tok`** median mask time (`n = 162`) |
+| **Speculative Decode** (`N-gram k=5` / `INT3->INT4` Draft-Target) | `0 MiB` (N-gram) | Spark N-gram **`134.0 tok/s` (`1.30x`)**; LFM3 Draft-Target `90.2%` accept (`4.36 tok/round`) |
+
+## Quickstart
+
+### 1. Run the OpenAI-Compatible WebGPU SDK (`ignis-webgpu`)
+
+```bash
+npm install ignis-webgpu
+```
+
+```js
+import { IgnisOpenAI } from 'ignis-webgpu';
+
+// Spawns a Dedicated Worker automatically with OPFS shard caching
+const client = await IgnisOpenAI.create({
+  modelBaseUrl: 'https://your-cdn.example.com/lfm3-omni-2b-ignis/',
+  modelId: 'lfm3-omni-2b',
+});
+
+const stream = await client.chat.completions.create({
+  model: 'lfm3-omni-2b',
+  stream: true,
+  response_format: {
+    type: 'json_schema',
+    json_schema: {
+      name: 'summary',
+      strict: true,
+      schema: {
+        type: 'object',
+        properties: { answer: { type: 'string' }, confidence: { type: 'number' } },
+        required: ['answer', 'confidence'],
+        additionalProperties: false,
+      },
+    },
+  },
+  messages: [{ role: 'user', content: 'Summarize WebGPU OPFS streaming.' }],
+});
+
+for await (const chunk of stream) {
+  process.stdout.write(chunk.choices[0]?.delta?.content ?? '');
+}
+```
+
+### 2. Pack Any Supported HuggingFace Model (`ignis-webgpu-packer`)
+
+```bash
+# Install Python dependencies once (numpy, safetensors, torch, transformers)
+npx ignis-webgpu-packer --help
+
+# Quantize to 256B-aligned .ignis shards + OPFS embd.ignis (INT8 LM Head preserves coding/CJK quality)
+npx ignis-webgpu-packer \
+  --input ./path/to/hf-model \
+  --output ./path/to/model-ignis \
+  --lm-head-dtype int8 \
+  --weight-bits 4
+```
+
+### 3. Run Locally from Source & Verify
+
+```bash
+git clone https://github.com/Ray-D-Song/Ignis.git
+cd Ignis
+npm install
+npm run audit:wgsl     # Zero-GPU W3C WGSL baseline + Rust/WASM FSM audit
+npm run pack:check     # Isolated npm tarball + CLI smoke check
+npm run demo:chat      # Start examples/chat-vinext locally at http://localhost:5173
+```
+
+## Honest Caveats & Browser Limits
+
+- **COOP / COEP Headers Required for Peak Mode**: High-throughput OPFS `SyncAccessHandle` works inside Dedicated Workers regardless, and cross-origin model buckets on Cloudflare R2 require `Access-Control-Allow-Origin: *` plus `Cross-Origin-Resource-Policy: cross-origin` when the app sets `Cross-Origin-Embedder-Policy: credentialless`.
+- **Incognito OPFS Quota**: Chromium caps OPFS storage at `2.00 GB` in Incognito/private windows. Models whose quantized weights + `embd.ignis` + `ple_embd.ignis` exceed 2 GB (such as Gemma-4-E4B-it at `~6.5 GB` total shards) require a normal browser profile (and Playwright tests must use `launchPersistentContext`).
+- **Desktop WebGPU Hardware**: Verified primarily on Chromium 138+ / Edge 157+ desktop GPUs (`shader-f16`). Devices without `shader-f16` or with `< 2 GiB` `maxBufferSize` should load smaller checkpoints (`LFM3-Omni-2B INT3_G64` at `755 MiB` GPU weights) or check `detectDeviceProfile()`.
+- **Pre-Compiled Binary Not Checked In Without Source**: All Rust/WASM tokenizer sources live in `tokenizer/`, with reproducible builds via `npm run build:wasm`.
+
+## License & Attribution
+
+- Ignis engine, kernels, packer, tokenizer, SDK, and demo UI are licensed under the **Apache License 2.0** ([LICENSE](LICENSE)).
+- Model configuration / architecture notes derived from upstream open-source references carry their original notices ([CONTRIBUTING.md](CONTRIBUTING.md), [docs/configuration_spark.py](docs/configuration_spark.py)).
+- Pre-quantized demo weights remain governed by their upstream model licenses (`Apache-2.0` for `XHToken/Spark-X2.6-4B`, `LFM Open License v1.0` for `LiquidAI/LFM3-Omni-2B`, and `Gemma Terms of Use` for `google/gemma-4-E4B-it`).
