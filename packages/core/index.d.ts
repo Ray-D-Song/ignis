@@ -183,6 +183,34 @@ export class IgnisFsm {
 
 export function resolveResponseSchema(responseFormat?: JsonSchemaResponseFormat | null): Record<string, unknown> | null;
 
+export interface SpeculativeGenerateResult {
+  generatedIds: number[];
+  prefillMs: number;
+  decodeMs: number;
+  decodeTokPerSec: number;
+  speculativeProposed: number;
+  speculativeAccepted: number;
+  rounds: number;
+}
+
+export class NgramLookupSpeculator {
+  constructor(options?: { k?: number; minNgram?: number; maxNgram?: number });
+  propose(history: number[], maxCount: number, eosSet?: Set<number>): number[];
+  generate(
+    engine: unknown,
+    promptIds: number[],
+    options?: Record<string, unknown>
+  ): Promise<SpeculativeGenerateResult>;
+}
+
+export class DraftTargetSpeculator {
+  constructor(targetEngine: unknown, draftEngine: unknown, options?: { k?: number });
+  generate(
+    promptIds: number[],
+    options?: Record<string, unknown>
+  ): Promise<SpeculativeGenerateResult>;
+}
+
 export function buildIgnisChatPrompt(
   messages: ChatMessage[],
   blueprint: Record<string, unknown>,

@@ -330,17 +330,22 @@ export class IgnisEngine {
 
     const convStateLen = Math.max(0, (bp.conv_kernel_size || 0) - 1);
     this.convStates = [];
+    this.convBackupBufs = [];
     this.kvCaches = [];
     for (let i = 0; i < bp.num_layers; i++) {
       const spec = this._layerSpec(i);
       if (spec.isConv) {
         this.kvCaches.push(null);
-        this.convStates.push(mkBuf(D * Math.max(1, convStateLen) * 4));
+        const csBytes = D * Math.max(1, convStateLen) * 4;
+        this.convStates.push(mkBuf(csBytes));
+        this.convBackupBufs.push(mkBuf(csBytes));
       } else if (spec.isReuse) {
         this.convStates.push(null);
+        this.convBackupBufs.push(null);
         this.kvCaches.push(this.kvCaches[spec.kvSrc]);
       } else {
         this.convStates.push(null);
+        this.convBackupBufs.push(null);
         const cap = spec.isSwa ? ((bp.sliding_window || 512) + this.maxBatchTokens) : this.maxSeqLen;
         const bytes = bp.num_key_value_heads * cap * spec.hd * 2;
         this.kvCaches.push({
@@ -352,6 +357,7 @@ export class IgnisEngine {
         });
       }
     }
+    this.hasConvLayers = this.convStates.some(Boolean);
   }
 
   _makeStaticUniform(byteLen, setupFn) {
@@ -790,6 +796,32 @@ export class IgnisEngine {
         this.device.queue.writeBuffer(this.convStates[i], 0, snap[i]);
       }
     }
+  }
+
+  snapshotConvStatesGpu() {
+    if (!this.hasConvLayers) return;
+    const enc = this.device.createCommandEncoder();
+    for (let i = 0; i < this.convStates.length; i++) {
+      const src = this.convStates[i];
+      const dst = this.convBackupBufs[i];
+      if (src && dst) {
+        enc.copyBufferToBuffer(src, 0, dst, 0, src.size);
+      }
+    }
+    this.device.queue.submit([enc.finish()]);
+  }
+
+  restoreConvStatesGpu() {
+    if (!this.hasConvLayers) return;
+    const enc = this.device.createCommandEncoder();
+    for (let i = 0; i < this.convStates.length; i++) {
+      const dst = this.convStates[i];
+      const src = this.convBackupBufs[i];
+      if (src && dst) {
+        enc.copyBufferToBuffer(src, 0, dst, 0, src.size);
+      }
+    }
+    this.device.queue.submit([enc.finish()]);
   }
 
   async lookupEmbeddings(tokenIds) {
@@ -1420,6 +1452,9 @@ export class IgnisEngine {
     if (this.verifyLogitsBuf) this.verifyLogitsBuf.destroy();
     for (const cs of this.convStates) {
       if (cs) cs.destroy();
+    }
+    for (const cb of this.convBackupBufs || []) {
+      if (cb) cb.destroy();
     }
     const freedKv = new Set();
     for (const kv of this.kvCaches) {

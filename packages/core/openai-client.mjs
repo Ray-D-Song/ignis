@@ -6,6 +6,7 @@
 import { IgnisClient } from '../../runtime/ignis-client.mjs';
 import { IgnisEngine } from '../../runtime/ignis-engine.mjs';
 import { IgnisTokenizer, resolveResponseSchema } from '../../runtime/wasm-tokenizer.mjs';
+import { NgramLookupSpeculator } from '../../runtime/speculative.mjs';
 import { Lfm3OmniRuntime } from '../../runtime/multimodal/lfm3-omni-runtime.mjs';
 import { Gemma4OmniRuntime } from '../../runtime/multimodal/gemma4-omni-runtime.mjs';
 import { decodeWav, resampleLinear } from '../../runtime/multimodal/audio-dsp.mjs';
@@ -513,6 +514,7 @@ export class IgnisOpenAI {
         };
 
         let audioOut = undefined;
+        let speculativeStats = null;
         const mmKind = this.blueprint.multimodal?.kind;
         if (this._omni && (images.length > 0 || audios.length > 0 || (mmKind === 'lfm3_omni' && (params.generation_mode || 'text') !== 'text'))) {
           const genRes = await this._omni.generateOmni(
@@ -548,6 +550,21 @@ export class IgnisOpenAI {
           if (genRes.wavBytes || genRes.pcm24k?.length) {
             audioOut = { wavBytes: genRes.wavBytes, pcm24k: genRes.pcm24k, sampleRate: 24000 };
           }
+        } else if (params.speculative?.mode === 'ngram' && !fsmSchema) {
+          const ngramSpec = new NgramLookupSpeculator({
+            k: params.speculative.k || 4,
+            maxNgram: params.speculative.ngramN || 4,
+          });
+          const sRes = await ngramSpec.generate(this._engine, promptIds, {
+            maxNewTokens: maxTokens,
+            sampling,
+            onToken: (tokId) => emitToken(tokId),
+            shouldAbort: () => this._aborted,
+          });
+          speculativeStats = {
+            speculativeAccepted: sRes.speculativeAccepted,
+            speculativeProposed: sRes.speculativeProposed,
+          };
         } else {
           this._engine.reset();
           const { sampleToken } = await import('../../runtime/sampler.mjs');
@@ -591,6 +608,7 @@ export class IgnisOpenAI {
               prefillMs: 0,
               decodeMs: totalMs,
               decodeTokPerSec: generatedIds.length / Math.max(0.001, totalMs / 1000),
+              ...(speculativeStats || {}),
             },
             audio: audioOut,
           });

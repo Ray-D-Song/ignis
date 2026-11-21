@@ -3,11 +3,15 @@ import { IgnisTokenizer, resolveResponseSchema } from './wasm-tokenizer.mjs';
 import { sampleToken } from './sampler.mjs';
 import { Lfm3OmniRuntime } from './multimodal/lfm3-omni-runtime.mjs';
 import { Gemma4OmniRuntime } from './multimodal/gemma4-omni-runtime.mjs';
+import { NgramLookupSpeculator, DraftTargetSpeculator } from './speculative.mjs';
 
 let engine = null;
+let draftEngine = null;
+let draftModelUrlCache = null;
 let omni = null;
 let tokenizer = null;
 let modelBaseUrlCache = null;
+let initOptionsCache = null;
 let deviceLostReason = null;
 let abortRequested = false;
 
@@ -50,6 +54,11 @@ self.onmessage = async (ev) => {
         omni.destroy();
         omni = null;
       }
+      if (draftEngine) {
+        draftEngine.destroy();
+        draftEngine = null;
+        draftModelUrlCache = null;
+      }
       if (engine) {
         engine.destroy();
         engine = null;
@@ -60,6 +69,7 @@ self.onmessage = async (ev) => {
       }
       deviceLostReason = null;
       modelBaseUrlCache = null;
+      initOptionsCache = null;
 
       const t0 = performance.now();
       const {
@@ -86,6 +96,12 @@ self.onmessage = async (ev) => {
       );
       engine = eng;
       modelBaseUrlCache = modelBaseUrl;
+      initOptionsCache = {
+        kernelBaseUrl,
+        maxSeqLen,
+        maxBatchTokens,
+        forceNoSubgroups: !!forceNoSubgroups,
+      };
       engine.device.lost.then((info) => {
         deviceLostReason = `${info.reason}: ${info.message}`;
         self.postMessage({ type: 'device_lost', reason: deviceLostReason });
@@ -117,6 +133,7 @@ self.onmessage = async (ev) => {
     } else if (cmd === 'reset') {
       if (!engine) throw new Error('Engine not initialized');
       engine.reset();
+      if (draftEngine) draftEngine.reset();
       reply(true, { curPos: engine.curPos });
     } else if (cmd === 'generate') {
       if (!engine) throw new Error('Engine not initialized');
@@ -214,6 +231,60 @@ self.onmessage = async (ev) => {
         return;
       }
 
+      const fsmSchema = resolveResponseSchema(responseFormat);
+      if (fsmSchema && !tokenizer) {
+        throw new Error('Tokenizer required for responseFormat JSON Schema FSM');
+      }
+
+      if (speculative && !fsmSchema && speculative.mode === 'draft' && speculative.draftModelUrl) {
+        if (!draftEngine || draftModelUrlCache !== speculative.draftModelUrl) {
+          if (draftEngine) {
+            draftEngine.destroy();
+            draftEngine = null;
+          }
+          const dRes = await IgnisEngine.createWithOpfs(
+            speculative.draftModelUrl,
+            speculative.draftModelKey || 'ignis-draft',
+            initOptionsCache?.kernelBaseUrl || '/kernels',
+            {
+              maxSeqLen: initOptionsCache?.maxSeqLen || 4096,
+              maxBatchTokens: initOptionsCache?.maxBatchTokens || 64,
+              forceNoSubgroups: !!initOptionsCache?.forceNoSubgroups,
+            }
+          );
+          draftEngine = dRes.engine;
+          draftModelUrlCache = speculative.draftModelUrl;
+        }
+        const generated = [];
+        const streamState = { committedText: '' };
+        const tDec0 = performance.now();
+        const spec = new DraftTargetSpeculator(engine, draftEngine, { k: speculative.k || 4 });
+        const sRes = await spec.generate(ids, {
+          maxNewTokens,
+          sampling,
+          eosSet: stopOnEos ? eosSet : new Set(),
+          onToken: (tokId, step) => {
+            generated.push(tokId);
+            emitTokenEvent(id, tokenizer, tokId, step, generated, streamState, tDec0);
+          },
+          shouldAbort: () => abortRequested,
+        });
+        reply(true, {
+          promptLen: ids.length,
+          generatedIds: sRes.generatedIds,
+          generatedText: tokenizer ? tokenizer.decode(sRes.generatedIds, true) : null,
+          aborted: abortRequested,
+          prefillMs: sRes.prefillMs,
+          decodeMs: sRes.decodeMs,
+          decodeTokPerSec: sRes.decodeTokPerSec,
+          speculativeAccepted: sRes.speculativeAccepted,
+          speculativeProposed: sRes.speculativeProposed,
+          curPos: engine.curPos,
+          deviceLostReason,
+        });
+        return;
+      }
+
       const tPrefill0 = performance.now();
       let lastLogits = null;
       const stepSize = Math.min(chunkSize, engine.maxBatchTokens);
@@ -235,15 +306,47 @@ self.onmessage = async (ev) => {
       }
       const prefillMs = performance.now() - tPrefill0;
 
+      if (speculative && !fsmSchema && speculative.mode === 'ngram' && !abortRequested && lastLogits) {
+        const generated = [];
+        const streamState = { committedText: '' };
+        const tDec0 = performance.now();
+        const spec = new NgramLookupSpeculator({
+          k: speculative.k || 4,
+          maxNgram: speculative.ngramN || 4,
+        });
+        const sRes = await spec.generate(engine, ids, {
+          maxNewTokens,
+          sampling,
+          eosSet: stopOnEos ? eosSet : new Set(),
+          onToken: (tokId, step) => {
+            generated.push(tokId);
+            emitTokenEvent(id, tokenizer, tokId, step, generated, streamState, tDec0);
+          },
+          shouldAbort: () => abortRequested,
+          skipPrefill: true,
+          initialLogits: lastLogits,
+        });
+        reply(true, {
+          promptLen: ids.length,
+          generatedIds: sRes.generatedIds,
+          generatedText: tokenizer ? tokenizer.decode(sRes.generatedIds, true) : null,
+          aborted: abortRequested,
+          prefillMs,
+          decodeMs: sRes.decodeMs,
+          decodeTokPerSec: sRes.decodeTokPerSec,
+          speculativeAccepted: sRes.speculativeAccepted,
+          speculativeProposed: sRes.speculativeProposed,
+          curPos: engine.curPos,
+          deviceLostReason,
+        });
+        return;
+      }
+
       const generated = [];
       const history = [...ids];
       const tDec0 = performance.now();
       const streamState = { committedText: '' };
 
-      const fsmSchema = resolveResponseSchema(responseFormat);
-      if (fsmSchema && !tokenizer) {
-        throw new Error('Tokenizer required for responseFormat JSON Schema FSM');
-      }
       const fsm = fsmSchema ? tokenizer.createFsm(fsmSchema, [...eosSet]) : null;
       const fsmMaskMsSamples = [];
 
@@ -305,6 +408,11 @@ self.onmessage = async (ev) => {
       if (omni) {
         omni.destroy();
         omni = null;
+      }
+      if (draftEngine) {
+        draftEngine.destroy();
+        draftEngine = null;
+        draftModelUrlCache = null;
       }
       if (engine) {
         engine.destroy();

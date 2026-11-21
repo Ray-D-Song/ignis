@@ -71,17 +71,12 @@ function siftDown(hIdx, hVal, size, root) {
   hVal[i] = val0;
 }
 
-export function sampleToken(
+export function computeSamplingDistribution(
   logits,
   historyIds = [],
-  { temperature = 0.0, topK = 40, topP = 0.95, minP = 0.0, repetitionPenalty = 1.0, rng = Math.random } = {}
+  { temperature = 1.0, topK = 40, topP = 0.95, minP = 0.0, repetitionPenalty = 1.0 } = {}
 ) {
   const V = logits.length;
-  if (temperature <= 0 && repetitionPenalty === 1.0) {
-    return argmax(logits, V);
-  }
-
-  // Apply repetition penalty in-place on a copy only when needed
   let work = logits;
   if (repetitionPenalty !== 1.0 && historyIds.length > 0) {
     work = new Float32Array(logits);
@@ -93,18 +88,17 @@ export function sampleToken(
     }
   }
 
-  if (temperature <= 0) {
-    return argmax(work, V);
-  }
-
+  const temp = Math.max(1e-5, temperature);
   const k = topK > 0 && topK < V ? topK : Math.min(V, 256);
   const topPairs = selectTopK(work, V, k);
 
   const maxLogit = topPairs[0].val;
   let sumExp = 0;
   const probs = new Float32Array(k);
+  const indices = new Int32Array(k);
   for (let i = 0; i < k; i++) {
-    const p = Math.exp((topPairs[i].val - maxLogit) / temperature);
+    indices[i] = topPairs[i].idx;
+    const p = Math.exp((topPairs[i].val - maxLogit) / temp);
     probs[i] = p;
     sumExp += p;
   }
@@ -129,10 +123,44 @@ export function sampleToken(
 
   let finalSum = 0;
   for (let i = 0; i < cutoff; i++) finalSum += probs[i];
-  let r = rng() * finalSum;
+  const inv = finalSum > 0 ? 1.0 / finalSum : 0.0;
+  for (let i = 0; i < cutoff; i++) probs[i] *= inv;
+
+  return { indices, probs, cutoff };
+}
+
+export function sampleToken(
+  logits,
+  historyIds = [],
+  { temperature = 0.0, topK = 40, topP = 0.95, minP = 0.0, repetitionPenalty = 1.0, rng = Math.random } = {}
+) {
+  const V = logits.length;
+  if (temperature <= 0 && repetitionPenalty === 1.0) {
+    return argmax(logits, V);
+  }
+
+  if (temperature <= 0) {
+    const work = new Float32Array(logits);
+    const seen = new Set(historyIds);
+    for (const id of seen) {
+      if (id >= 0 && id < V) {
+        work[id] = work[id] > 0 ? work[id] / repetitionPenalty : work[id] * repetitionPenalty;
+      }
+    }
+    return argmax(work, V);
+  }
+
+  const { indices, probs, cutoff } = computeSamplingDistribution(logits, historyIds, {
+    temperature,
+    topK,
+    topP,
+    minP,
+    repetitionPenalty,
+  });
+  let r = rng();
   for (let i = 0; i < cutoff; i++) {
     r -= probs[i];
-    if (r <= 0) return topPairs[i].idx;
+    if (r <= 0) return indices[i];
   }
-  return topPairs[cutoff - 1].idx;
+  return indices[cutoff - 1];
 }
