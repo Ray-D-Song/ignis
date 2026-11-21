@@ -862,13 +862,12 @@ export class Lfm3OmniRuntime {
       const logitsMap = await this.runDepthDecoderPass(depthBase, codes, masked, pick);
       for (const idx of pick) {
         const cbHist = history.map((f) => f[idx]);
-        codes[idx] = sampleToken(logitsMap.get(idx), {
+        codes[idx] = sampleToken(logitsMap.get(idx), cbHist, {
           temperature: temperature || 0,
           topK: topK || 0,
           topP: 1.0,
           minP: 0.0,
           repetitionPenalty: repetitionPenalty || 1.0,
-          recentTokens: cbHist,
           rng,
         });
         masked[idx] = false;
@@ -1008,6 +1007,7 @@ export class Lfm3OmniRuntime {
     inputIds,
     images = null,          // Array<{ pixelValues, gridThw }> or raw { data, width, height, channels }
     audioMels = null,       // Array<{ features, numFrames }> or Float32Array PCM 16k
+    audios = null,          // Alias for audioMels
     generationMode = 'text', // 'text' | 'audio' | 'interleaved'
     maxNewTokens = 128,
     temperature = 0.0,
@@ -1017,6 +1017,7 @@ export class Lfm3OmniRuntime {
     audioTopK = 0,
     audioRepetitionPenalty = 1.2,
     onTextToken = null,
+    shouldAbort = null,
     rng = Math.random,
   } = {}) {
     const mm = this.mmBp;
@@ -1032,8 +1033,9 @@ export class Lfm3OmniRuntime {
       }
     }
     const audioFeats = [];
-    if (audioMels && audioMels.length > 0) {
-      for (const aud of audioMels) {
+    const audInputs = audioMels || audios;
+    if (audInputs && audInputs.length > 0) {
+      for (const aud of audInputs) {
         const res = aud.features
           ? await this.encodeAudio(aud.features, aud.numFrames)
           : (await this.preprocessAndEncodeAudio(aud)).embeddings;
@@ -1122,6 +1124,7 @@ export class Lfm3OmniRuntime {
     let textDone = false;
 
     for (let step = 0; step < maxNewTokens; step++) {
+      if (shouldAbort && shouldAbort()) break;
       const isInterleaved = mode === 'interleaved';
       const doAudio = mode === 'audio' || (isInterleaved && speaking);
 
@@ -1151,11 +1154,10 @@ export class Lfm3OmniRuntime {
         for (const sid of suppress) {
           if (sid != null && sid >= 0 && sid < logits.length) logits[sid] = -Infinity;
         }
-        const tok = sampleToken(logits, {
+        const tok = sampleToken(logits, textHistory.slice(-32), {
           temperature,
           topK,
           repetitionPenalty,
-          recentTokens: textHistory.slice(-32),
           rng,
         });
         textHistory.push(tok);

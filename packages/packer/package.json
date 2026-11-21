@@ -1,0 +1,21 @@
+{
+  "name": "@ignis/packer",
+  "version": "0.1.0",
+  "description": "Offline safetensors to .ignis WebGPU model packer CLI (Spark2.5, Qwen2/3, LFM3-Omni, Gemma-4)",
+  "type": "module",
+  "bin": {
+    "ignis-pack": "./bin/ignis-pack.mjs"
+  },
+  "files": [
+    "bin/",
+    "pyproject.toml"
+  ],
+  "keywords": [
+    "webgpu",
+    "llm",
+    "multimodal",
+    "quantization",
+    "ignis"
+  ],
+  "license": "Apache-2.0"
+}

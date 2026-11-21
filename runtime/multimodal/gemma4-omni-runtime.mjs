@@ -832,11 +832,21 @@ export class Gemma4OmniRuntime {
           isMultimodalMask.push(0);
         }
       } else if (!preExpandedImg && id === imgTok && imgIdx < imageEmbeds.length) {
+        if (expandedIds[expandedIds.length - 1] !== boiTok) {
+          expandedIds.push(boiTok);
+          lookupIds.push(boiTok);
+          isMultimodalMask.push(0);
+        }
         const cnt = imageEmbeds[imgIdx++].numTokens;
         for (let k = 0; k < cnt; k++) {
           expandedIds.push(imgTok);
           lookupIds.push(padId);
           isMultimodalMask.push(1);
+        }
+        if (promptIds[i + 1] !== eoiTok) {
+          expandedIds.push(eoiTok);
+          lookupIds.push(eoiTok);
+          isMultimodalMask.push(0);
         }
       } else if (!preExpandedAud && id === boaTok && promptIds[i + 1] !== audTok && audIdx < audioEmbeds.length) {
         expandedIds.push(boaTok);
@@ -854,11 +864,21 @@ export class Gemma4OmniRuntime {
           isMultimodalMask.push(0);
         }
       } else if (!preExpandedAud && id === audTok && audIdx < audioEmbeds.length) {
+        if (expandedIds[expandedIds.length - 1] !== boaTok) {
+          expandedIds.push(boaTok);
+          lookupIds.push(boaTok);
+          isMultimodalMask.push(0);
+        }
         const cnt = audioEmbeds[audIdx++].numTokens;
         for (let k = 0; k < cnt; k++) {
           expandedIds.push(audTok);
           lookupIds.push(padId);
           isMultimodalMask.push(1);
+        }
+        if (promptIds[i + 1] !== eoaTok) {
+          expandedIds.push(eoaTok);
+          lookupIds.push(eoaTok);
+          isMultimodalMask.push(0);
         }
       } else {
         const isMm = id === imgTok || id === audTok;
@@ -899,6 +919,7 @@ export class Gemma4OmniRuntime {
     topK = 40,
     repetitionPenalty = 1.0,
     onTextToken = null,
+    shouldAbort = null,
     releaseVisionAfterEncode = false,
     releaseAudioAfterEncode = false,
     rng = Math.random,
@@ -938,15 +959,15 @@ export class Gemma4OmniRuntime {
 
     const outIds = [];
     for (let step = 0; step < maxNewTokens; step++) {
+      if (shouldAbort && shouldAbort()) break;
       const logits = new Float32Array(fwd.logits);
       for (const sid of suppress) {
         if (sid != null && sid >= 0 && sid < logits.length) logits[sid] = -Infinity;
       }
-      const tok = sampleToken(logits, {
+      const tok = sampleToken(logits, outIds.slice(-32), {
         temperature,
         topK,
         repetitionPenalty,
-        recentTokens: outIds.slice(-32),
         rng,
       });
       if (eosSet.has(tok)) break;

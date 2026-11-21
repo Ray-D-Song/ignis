@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ignis-packer"
+version = "0.1.0"
+description = "Offline HuggingFace Safetensors to Ignis (.ignis) quantized shard packer"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "safetensors>=0.4",
+  "torch>=2.3",
+  "transformers>=4.48",
+]
+
+[project.scripts]
+ignis-pack = "ignis_pack:main"

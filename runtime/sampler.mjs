@@ -74,7 +74,7 @@ function siftDown(hIdx, hVal, size, root) {
 export function sampleToken(
   logits,
   historyIds = [],
-  { temperature = 0.0, topK = 40, topP = 0.95, minP = 0.0, repetitionPenalty = 1.0 } = {}
+  { temperature = 0.0, topK = 40, topP = 0.95, minP = 0.0, repetitionPenalty = 1.0, rng = Math.random } = {}
 ) {
   const V = logits.length;
   if (temperature <= 0 && repetitionPenalty === 1.0) {
@@ -129,7 +129,7 @@ export function sampleToken(
 
   let finalSum = 0;
   for (let i = 0; i < cutoff; i++) finalSum += probs[i];
-  let r = Math.random() * finalSum;
+  let r = rng() * finalSum;
   for (let i = 0; i < cutoff; i++) {
     r -= probs[i];
     if (r <= 0) return topPairs[i].idx;

@@ -26,7 +26,14 @@ declare module '../../../runtime/ignis-client.mjs' {
       cacheHits: number;
       cacheMisses: number;
       hasTokenizer: boolean;
-      blueprint: { architecture: string; num_layers: number; eos_token_id: number };
+      blueprint: {
+        architecture: string;
+        top_model_type?: string;
+        num_layers: number;
+        eos_token_id: number;
+        eos_token_ids?: number[];
+        multimodal?: { kind: string };
+      };
     }>;
     encode(text: string): Promise<{ ids: number[] }>;
     decode(ids: number[], skipSpecial?: boolean): Promise<{ text: string }>;
@@ -35,6 +42,8 @@ declare module '../../../runtime/ignis-client.mjs' {
       promptLen: number;
       generatedIds: number[];
       generatedText: string | null;
+      wavBytes?: Uint8Array | null;
+      pcm24k?: Float32Array | null;
       aborted?: boolean;
       prefillMs: number;
       decodeMs: number;
@@ -44,4 +53,9 @@ declare module '../../../runtime/ignis-client.mjs' {
     abort(): Promise<{ aborted: boolean }>;
     destroy(): Promise<void>;
   }
+}
+
+declare module '../../../runtime/multimodal/audio-dsp.mjs' {
+  export function decodeWav(arrayBuffer: ArrayBuffer): { samples: Float32Array; sampleRate: number };
+  export function resampleLinear(samples: Float32Array, fromSr: number, toSr: number): Float32Array;
 }

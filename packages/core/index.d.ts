@@ -1,0 +1,156 @@
+export type IgnisThinkingEffort = 'low' | 'high';
+
+export type ChatContentPart =
+  | { type: 'text'; text: string }
+  | {
+      type: 'image_url';
+      image_url:
+        | string
+        | {
+            url?: string;
+            data?: Uint8Array | Uint8ClampedArray;
+            width?: number;
+            height?: number;
+            channels?: number;
+          };
+    }
+  | {
+      type: 'input_audio';
+      input_audio: {
+        data: Float32Array | number[] | Uint8Array | ArrayBuffer | string;
+        sampleRate?: number;
+        format?: 'pcm_f32' | 'wav';
+      };
+    };
+
+export interface ChatMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string | ChatContentPart[];
+}
+
+export interface JsonSchemaResponseFormat {
+  type: 'text' | 'json_object' | 'json_schema';
+  json_schema?: {
+    name?: string;
+    schema: Record<string, unknown>;
+    strict?: boolean;
+  };
+}
+
+export interface SpeculativeOptions {
+  mode: 'ngram' | 'draft';
+  draftModelUrl?: string;
+  draftModelKey?: string;
+  k?: number;
+  ngramN?: number;
+}
+
+export interface ChatCompletionCreateParams {
+  model?: string;
+  messages: ChatMessage[];
+  stream?: boolean;
+  max_tokens?: number;
+  temperature?: number;
+  top_p?: number;
+  top_k?: number;
+  repetition_penalty?: number;
+  enable_thinking?: boolean;
+  thinking_effort?: IgnisThinkingEffort;
+  thinking_budget?: number;
+  response_format?: JsonSchemaResponseFormat;
+  speculative?: SpeculativeOptions;
+  generation_mode?: 'text' | 'audio' | 'interleaved';
+  stop?: string | string[];
+}
+
+export interface AudioOutput {
+  pcm24k?: Float32Array;
+  wavBytes?: Uint8Array;
+  sampleRate: number;
+}
+
+export interface ChatCompletion {
+  id: string;
+  object: 'chat.completion';
+  created: number;
+  model: string;
+  choices: Array<{
+    index: number;
+    message: {
+      role: 'assistant';
+      content: string;
+      reasoning_content?: string;
+      audio?: AudioOutput;
+    };
+    finish_reason: 'stop' | 'length' | 'abort';
+  }>;
+  usage: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+  };
+  ignis?: {
+    prefillMs: number;
+    decodeMs: number;
+    decodeTokPerSec: number;
+    speculativeAccepted?: number;
+    speculativeProposed?: number;
+    peakGpuMiB?: number;
+  };
+}
+
+export interface ChatCompletionChunk {
+  id: string;
+  object: 'chat.completion.chunk';
+  created: number;
+  model: string;
+  choices: Array<{
+    index: number;
+    delta: {
+      role?: 'assistant';
+      content?: string;
+      reasoning_content?: string;
+      audio?: AudioOutput;
+    };
+    finish_reason: 'stop' | 'length' | 'abort' | null;
+  }>;
+}
+
+export interface IgnisModelConfig {
+  modelUrl: string;
+  modelKey?: string;
+  kernelBaseUrl?: string;
+  wasmUrl?: string;
+  maxSeqLen?: number;
+  maxBatchTokens?: number;
+  forceNoSubgroups?: boolean;
+  opfs?: boolean;
+}
+
+export interface IgnisOpenAIOptions extends Partial<IgnisModelConfig> {
+  workerUrl?: string;
+  models?: Record<string, IgnisModelConfig>;
+  onProgress?: (event: { file: string; loaded: number; total: number; cached: boolean }) => void;
+}
+
+export class IgnisOpenAI {
+  readonly chat: {
+    completions: {
+      create(params: ChatCompletionCreateParams & { stream: true }): AsyncIterable<ChatCompletionChunk>;
+      create(params: ChatCompletionCreateParams & { stream?: false }): Promise<ChatCompletion>;
+      create(params: ChatCompletionCreateParams): Promise<ChatCompletion> | AsyncIterable<ChatCompletionChunk>;
+    };
+  };
+
+  constructor(options?: IgnisOpenAIOptions);
+  loadModel(modelNameOrConfig: string | IgnisModelConfig): Promise<{ blueprint: Record<string, unknown>; cacheHits: number; cacheMisses: number; initMs: number }>;
+  abort(): Promise<void>;
+  reset(): Promise<void>;
+  destroy(): Promise<void>;
+}
+
+export function buildIgnisChatPrompt(
+  messages: ChatMessage[],
+  blueprint: Record<string, unknown>,
+  options?: { enableThinking?: boolean; thinkingEffort?: IgnisThinkingEffort }
+): Promise<{ prompt: string; images: unknown[]; audios: Float32Array[] }>;
