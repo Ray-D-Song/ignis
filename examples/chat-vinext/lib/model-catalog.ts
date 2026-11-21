@@ -1,7 +1,9 @@
 export interface ModelPreset {
   id: string;
+  shortName?: string;
   label: string;
   description: string;
+  sizeLabel?: string;
   dirPath: string;
   modelBaseUrl?: string;
   lmHeadDtype: string;
@@ -26,8 +28,10 @@ export function getPublicCdnModels(cdnBaseRaw: string): ModelPreset[] {
   return [
     {
       id: 'lfm3-omni-2b',
-      label: 'LFM3-Omni-2B · Full Omni (Vision + Audio + 24 kHz Voice)',
-      description: 'ShortConv+SWA 24-layer backbone · INT8_G64 LM Head · Vision/Audio in + 24 kHz LiquidCodec out',
+      shortName: 'LFM3-Omni 2B',
+      label: 'LFM3-Omni 2B · Vision, Audio & Voice',
+      description: 'Multimodal · Vision, Audio & 24 kHz Voice',
+      sizeLabel: '1.8 GB',
       dirPath: `${base}/lfm3-omni-2b-ignis`,
       modelBaseUrl: `${base}/lfm3-omni-2b-ignis`,
       lmHeadDtype: 'u32_q8',
@@ -46,8 +50,10 @@ export function getPublicCdnModels(cdnBaseRaw: string): ModelPreset[] {
     },
     {
       id: 'spark-4b-q8head',
-      label: 'Spark-X2.6-4B · INT8_G64 LM Head (Fast Reasoning)',
-      description: '36-layer Ring SWA+Full INT4_G64 body + INT8_G64 LM Head · 85-134 tok/s on desktop WebGPU',
+      shortName: 'Spark-X2.6 4B',
+      label: 'Spark-X2.6 4B · Fast Reasoning',
+      description: 'Fast local reasoning & tool use',
+      sizeLabel: '2.6 GB',
       dirPath: `${base}/spark-4b-ignis-q8head`,
       modelBaseUrl: `${base}/spark-4b-ignis-q8head`,
       lmHeadDtype: 'u32_q8',
@@ -66,8 +72,10 @@ export function getPublicCdnModels(cdnBaseRaw: string): ModelPreset[] {
     },
     {
       id: 'gemma-4-e4b',
-      label: 'Gemma-4-E4B-it · Full Omni (262K Vocab + Q8 PLE)',
-      description: '42-layer KV-Sharing + OPFS 2.69 GiB PLE streaming + SigLIP2 Vision + Chunked Conformer',
+      shortName: 'Gemma-4 E4B',
+      label: 'Gemma-4 E4B · High-Capacity Omni',
+      description: 'High-capacity multimodal & reasoning',
+      sizeLabel: '6.2 GB',
       dirPath: `${base}/gemma-4-e4b-ignis`,
       modelBaseUrl: `${base}/gemma-4-e4b-ignis`,
       lmHeadDtype: 'u32_q8',

@@ -88,14 +88,16 @@ async function main() {
 
     await page.goto(baseUrl, { waitUntil: 'networkidle' });
 
-    // Verify COOP/COEP + WebGPU capabilities detected
-    const capsText = await page.locator('.topbar').innerText();
-    console.log('[topbar]', capsText.replace(/\s+/g, ' '));
-    if (!capsText.includes('f16:✓') || !capsText.includes('subgroups:✓') || !capsText.includes('COOP/COEP')) {
-      throw new Error(`Missing expected WebGPU/COOP/COEP caps in topbar: ${capsText}`);
+    // Verify COOP/COEP + WebGPU capabilities detected inside Runtime tab
+    await page.click('#btn-toggle-workspace');
+    await page.click('#tab-btn-runtime');
+    const capsText = await page.locator('#hardware-card').innerText();
+    console.log('[hardware-card]', capsText.replace(/\s+/g, ' '));
+    if (!capsText.includes('f16:✓') || !capsText.includes('sg:✓') || !capsText.includes('COOP/COEP')) {
+      throw new Error(`Missing expected WebGPU/COOP/COEP caps in Runtime card: ${capsText}`);
     }
 
-    // Verify default selected model is INT8_G64 LM Head
+    // Verify default selected model is Spark-4B Q8Head
     const selectedVal = await page.locator('select').first().inputValue();
     if (selectedVal !== 'spark-4b-q8head') {
       throw new Error(`Expected default model spark-4b-q8head, got ${selectedVal}`);
@@ -104,17 +106,45 @@ async function main() {
     // Click Load Model and wait until ready
     await page.click('#btn-load-model');
     await page.waitForFunction(
-      () => document.getElementById('status-text')?.textContent?.includes('就绪 · INT8_G64 LM Head'),
+      () => document.getElementById('status-text')?.textContent?.includes('就绪 · Spark'),
       null,
       { timeout: 60000 }
     );
     console.log('[status]', await page.locator('#status-text').innerText());
 
+    // Agent Harness turn on Spark-X2.6-4B
+    await page.click('#btn-mode-agent');
+    await page.fill('#chat-input', '请先用 read_file 读取工作区中的 revenue_q4.csv，再用 run_js 计算全部 revenue_usd 的总和，最后简要回答总营收数字。');
+    await page.click('#btn-send');
+    await page.waitForFunction(
+      () =>
+        document.querySelectorAll('.msg.assistant').length >= 1 &&
+        document.getElementById('status-text')?.textContent?.includes('就绪 · Spark'),
+      null,
+      { timeout: 120000 }
+    );
+    const sparkTools = await page.locator('.tool-call-card').count();
+    const agentOut = await page.locator('.msg.assistant .answer-body').last().innerText();
+    console.log('[spark-agent] tools=', sparkTools, 'answer=', agentOut.trim().slice(0, 180));
+    if (sparkTools < 1) {
+      throw new Error(`Expected >= 1 tool call on Spark Agent run, got ${sparkTools}`);
+    }
+
+    // Reset session & switch to Direct Chat mode to verify incremental KV throughput
+    await page.click('#btn-new-session');
+    await page.click('#btn-mode-chat');
+    if (!(await page.locator('#workspace-pane').isVisible())) {
+      await page.click('#btn-toggle-workspace');
+    }
+    await page.click('#tab-btn-runtime');
+
     // Turn 1: send Chinese reasoning prompt
     await page.fill('#chat-input', '请用一句话解释什么是第一性原理。');
     await page.click('#btn-send');
     await page.waitForFunction(
-      () => document.getElementById('status-text')?.textContent?.includes('就绪 · INT8_G64 LM Head'),
+      () =>
+        document.querySelectorAll('.msg.assistant').length >= 1 &&
+        document.getElementById('status-text')?.textContent?.includes('就绪 · Spark'),
       null,
       { timeout: 60000 }
     );
@@ -131,7 +161,9 @@ async function main() {
     await page.fill('#chat-input', '比较 WebGPU 与 WebAssembly 在纯浏览器端运行大语言模型时的本质瓶颈差异。');
     await page.click('#btn-send');
     await page.waitForFunction(
-      () => document.getElementById('status-text')?.textContent?.includes('就绪 · INT8_G64 LM Head'),
+      () =>
+        document.querySelectorAll('.msg.assistant').length >= 2 &&
+        document.getElementById('status-text')?.textContent?.includes('就绪 · Spark'),
       null,
       { timeout: 90000 }
     );
@@ -153,7 +185,7 @@ async function main() {
     if (errors.length > 0) {
       throw new Error(`Browser console/page errors: ${errors.join(' | ')}`);
     }
-    console.log('[PASS] vinext Chat Demo (Spark-X2.6-4B INT8_G64 LM Head) multi-turn WebGPU E2E verified!');
+    console.log('[PASS] vinext Studio (Spark-X2.6-4B Agent Harness + Multi-Turn Direct Chat) verified!');
   } catch (err) {
     failed = true;
     throw err;

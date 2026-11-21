@@ -1,14 +1,16 @@
 import type { Metadata } from 'next';
+import '@fontsource-variable/inter';
+import '@fontsource-variable/jetbrains-mono';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'Ignis · Browser-Native WebGPU LLM & Full-Omni Playground',
+  title: 'Ignis — Browser Agent Runtime',
   description:
-    'Zero-dependency WebGPU inference engine built from first principles: OPFS streaming, strict W3C WGSL kernels, Rust/WASM JSON Schema FSM, and Full-Omni vision/audio/24 kHz voice.',
+    'Run an autonomous local agent with schema-locked tool calls, a sandboxed workspace, and live artifact previews directly inside your browser via WebGPU.',
   openGraph: {
-    title: 'Ignis · Browser-Native WebGPU LLM & Full-Omni Playground',
+    title: 'Ignis — Browser Agent Runtime',
     description:
-      'Run Spark-X2.6-4B (85-134 tok/s), LFM3-Omni-2B (Vision+Audio+24 kHz Voice), and Gemma-4-E4B purely inside your browser via WebGPU + OPFS.',
+      'Autonomous pure-browser WebGPU agent harness with sandboxed JS execution, structured tool calls, and multimodal perception.',
     type: 'website',
   },
 };
@@ -19,7 +21,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <head>
         <link
           rel="icon"
-          href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%23f97316'/><text x='50%25' y='54%25' dominant-baseline='middle' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold' font-size='18'>I</text></svg>"
+          href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%2309090b'/><path d='M16 5L22 14L17.5 14L20 27L10 17L14.5 17L16 5Z' fill='%23f97316'/></svg>"
         />
       </head>
       <body>{children}</body>

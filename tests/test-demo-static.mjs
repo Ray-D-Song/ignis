@@ -23,6 +23,8 @@ const MIME_TYPES = {
   '.wav': 'audio/wav',
   '.svg': 'image/svg+xml',
   '.txt': 'text/plain; charset=utf-8',
+  '.woff2': 'font/woff2',
+  '.woff': 'font/woff',
   '.ignis': 'application/octet-stream',
 };
 
@@ -203,17 +205,25 @@ async function main() {
 
     await page.goto(pagesSrv.origin, { waitUntil: 'networkidle' });
 
-    // Assert crossOriginIsolated + COOP/COEP + Hardware Readiness card + Show HN Hero
+    // Assert crossOriginIsolated + COOP/COEP + clean Agent Hero + Hardware Readiness card
     const isolated = await page.evaluate(() => window.crossOriginIsolated === true);
     if (!isolated) {
       throw new Error('Expected window.crossOriginIsolated === true under COOP: same-origin + COEP: credentialless');
     }
 
     const heroVisible = await page.locator('#hero-banner').isVisible();
-    const hwText = await page.locator('#hardware-card').innerText();
-    if (!heroVisible || !hwText.includes('tier') || hwText.includes('WebGPU Unavailable')) {
-      throw new Error(`Hero/Hardware check failed: hero=${heroVisible}, hwText="${hwText}"`);
+    const heroText = heroVisible ? await page.locator('#hero-banner').innerText() : '';
+    if (!heroVisible || /256B|ONNX|SyncAccessHandle/i.test(heroText)) {
+      throw new Error(`Hero check failed: visible=${heroVisible}, text="${heroText}"`);
     }
+
+    await page.click('#btn-toggle-workspace');
+    await page.click('#tab-btn-runtime');
+    const hwText = await page.locator('#hardware-card').innerText();
+    if (!hwText.includes('tier') || hwText.includes('WebGPU Unavailable')) {
+      throw new Error(`Hardware check failed: hwText="${hwText}"`);
+    }
+    await page.click('#btn-close-workspace');
 
     const selectedModel = await page.locator('select').first().inputValue();
     if (selectedModel !== 'lfm3-omni-2b') {
@@ -223,18 +233,55 @@ async function main() {
     // 4. Load LFM3-Omni-2B cross-origin from Server B into OPFS + WebGPU
     await page.click('#btn-load-model');
     await page.waitForFunction(
-      () => document.getElementById('status-text')?.textContent?.includes('Ready · INT8_G64 LM Head · Full Omni'),
+      () => document.getElementById('status-text')?.textContent?.includes('Ready ·'),
       null,
       { timeout: 120000 },
     );
     console.log('[status]', await page.locator('#status-text').innerText());
 
-    // 5. Showcase 1: 1-Click Omni VQA (demo-shapes.png)
-    await page.click('#showcase-vqa');
+    // 5. Pure-Browser Agent Harness E2E (FSM tool calls + workspace + artifact/js + trace)
+    await page.fill(
+      '#chat-input',
+      'Read revenue_q4.csv from the workspace, run JavaScript to calculate total Q4 revenue, render an SVG chart dashboard artifact, and summarize.',
+    );
+    await page.click('#btn-send');
     await page.waitForFunction(
       () =>
         document.querySelectorAll('.msg.assistant').length >= 1 &&
-        document.getElementById('status-text')?.textContent?.includes('Ready · INT8_G64 LM Head · Full Omni'),
+        document.getElementById('status-text')?.textContent?.includes('Ready ·'),
+      null,
+      { timeout: 150000 },
+    );
+
+    const toolCount = await page.locator('.tool-call-card').count();
+    const toolSummaries = await page.locator('.tool-call-summary').allInnerTexts();
+    const agentAnswer = await page.locator('.msg.assistant .answer-body').last().innerText();
+    console.log('[agent-harness] tools=', toolCount, toolSummaries.map((s) => s.replace(/\s+/g, ' ')));
+    console.log('[agent-answer]', agentAnswer.trim().slice(0, 220));
+    if (toolCount < 1) {
+      throw new Error(`Expected at least 1 real FSM tool call in Agent mode, got ${toolCount}`);
+    }
+    if (agentAnswer.trim().length < 15) {
+      throw new Error(`Expected substantive Agent answer, got "${agentAnswer}"`);
+    }
+
+    if (!(await page.locator('#workspace-pane').isVisible())) {
+      await page.click('#btn-toggle-workspace');
+    }
+    await page.click('#tab-btn-trace');
+    const traceCount = await page.locator('[data-testid="trace-entry"]').count();
+    console.log('[trace] entries=', traceCount);
+    if (traceCount < 2) {
+      throw new Error(`Expected >= 2 trace entries after Agent run, got ${traceCount}`);
+    }
+
+    // 6. Showcase 1: Direct Omni VQA (demo-shapes.png) from Runtime tab
+    await page.click('#tab-btn-runtime');
+    await page.click('#showcase-vqa');
+    await page.waitForFunction(
+      () =>
+        document.querySelectorAll('.msg.assistant').length >= 2 &&
+        document.getElementById('status-text')?.textContent?.includes('Ready ·'),
       null,
       { timeout: 90000 },
     );
@@ -244,12 +291,12 @@ async function main() {
       throw new Error(`Expected Omni VQA answer to describe red/blue/square, got: "${vqaAnswer}"`);
     }
 
-    // 6. Showcase 2: 1-Click JSON Schema FSM
+    // 7. Showcase 2: Direct JSON Schema FSM
     await page.click('#showcase-fsm');
     await page.waitForFunction(
       () =>
-        document.querySelectorAll('.msg.assistant').length >= 2 &&
-        document.getElementById('status-text')?.textContent?.includes('Ready · INT8_G64 LM Head · Full Omni'),
+        document.querySelectorAll('.msg.assistant').length >= 3 &&
+        document.getElementById('status-text')?.textContent?.includes('Ready ·'),
       null,
       { timeout: 90000 },
     );
@@ -264,12 +311,12 @@ async function main() {
       throw new Error(`Unexpected FSM badge text: "${fsmBadge}"`);
     }
 
-    // 7. Showcase 3: 1-Click N-gram Speculative
+    // 8. Showcase 3: Direct N-gram Speculative
     await page.click('#showcase-ngram');
     await page.waitForFunction(
       () =>
-        document.querySelectorAll('.msg.assistant').length >= 3 &&
-        document.getElementById('status-text')?.textContent?.includes('Ready · INT8_G64 LM Head · Full Omni'),
+        document.querySelectorAll('.msg.assistant').length >= 4 &&
+        document.getElementById('status-text')?.textContent?.includes('Ready ·'),
       null,
       { timeout: 90000 },
     );
@@ -280,7 +327,7 @@ async function main() {
       throw new Error(`Unexpected N-gram badge text: "${ngramBadge}"`);
     }
 
-    // 8. Clear OPFS Cache
+    // 9. Clear OPFS Cache
     await page.click('#btn-clear-opfs');
     await page.waitForFunction(
       () => document.getElementById('status-text')?.textContent?.includes('OPFS cache cleared'),
@@ -292,7 +339,7 @@ async function main() {
       throw new Error(`Console/page errors detected: ${errors.join(' | ')}`);
     }
 
-    console.log('[PASS] Static Cloudflare Pages + Cross-Origin R2 Showcase E2E verified (COEP credentialless + LFM3 VQA + JSON FSM + N-gram + Clear OPFS)!');
+    console.log('[PASS] Static Cloudflare Pages + Cross-Origin R2 Showcase E2E verified (COEP credentialless + Agent Harness + LFM3 VQA + JSON FSM + N-gram + Clear OPFS)!');
   } finally {
     if (context) await context.close();
     pagesSrv.server.closeAllConnections?.();
