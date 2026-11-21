@@ -13,6 +13,7 @@ import numpy as np
 from safetensors import safe_open
 
 from blueprints import build_blueprint
+from pack_multimodal import pack_multimodal_shards
 from quant import (
     PAYLOAD_OFFSET,
     TENSOR_ALIGN,
@@ -465,7 +466,12 @@ def pack_model(
             register_body(f"{opfx}.ffn_down", hf_tensors.get(f"{pfx}.mlp.down_proj.weight"))
 
     gpu_shards = writer.finalize()
-    shards_meta = [*extra_opfs_shards, *gpu_shards]
+    mm_shards, mm_tensors = ([], {})
+    if pack_multimodal and blueprint.get("multimodal"):
+        mm_shards, mm_tensors = pack_multimodal_shards(
+            model_dir, out_dir, cfg, blueprint, hf_tensors, quant_errors, verify=verify
+        )
+    shards_meta = [*extra_opfs_shards, *gpu_shards, *mm_shards]
 
     # Copy tokenizer.json if present
     tok_src = model_dir / "tokenizer.json"
@@ -478,6 +484,7 @@ def pack_model(
         "blueprint": blueprint,
         "shards": shards_meta,
         "tensors": tensors_meta,
+        **({"multimodal_tensors": mm_tensors} if mm_tensors else {}),
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 

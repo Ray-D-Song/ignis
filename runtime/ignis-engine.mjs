@@ -837,14 +837,14 @@ export class IgnisEngine {
     return buf;
   }
 
-  async _readBufferFloat32(buf, count) {
+  async _readBufferFloat32(buf, count, offsetBytes = 0) {
     const bytes = count * 4;
     const rb = this.device.createBuffer({
       size: bytes,
       usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     });
     const enc = this.device.createCommandEncoder();
-    enc.copyBufferToBuffer(buf, 0, rb, 0, bytes);
+    enc.copyBufferToBuffer(buf, offsetBytes, rb, 0, bytes);
     this.device.queue.submit([enc.finish()]);
     await rb.mapAsync(GPUMapMode.READ);
     const res = new Float32Array(rb.getMappedRange().slice(0));
@@ -853,7 +853,7 @@ export class IgnisEngine {
     return res;
   }
 
-  async _forwardDecodeFast(tokenId, { profileGpu = false } = {}) {
+  async _forwardDecodeFast(tokenId, { profileGpu = false, returnLastHidden = false } = {}) {
     const emb = await this.lookupEmbeddings([tokenId]);
     this.device.queue.writeBuffer(this.bufs.x, 0, emb);
     if (this.bp.has_ple && this.pleEmbdSource) {
@@ -892,6 +892,9 @@ export class IgnisEngine {
     this.device.queue.submit([enc.finish()]);
 
     const logits = await this._readBufferFloat32(this.bufs.logits, this.bp.vocab_size);
+    const lastHidden = returnLastHidden
+      ? await this._readBufferFloat32(this.bufs.norm, this.bp.hidden_size)
+      : null;
     let gpuMs = null;
     if (useTs) {
       await this.tsReadBuf.mapAsync(GPUMapMode.READ);
@@ -900,7 +903,7 @@ export class IgnisEngine {
       gpuMs = Number(ts[1] - ts[0]) / 1e6;
     }
     this.curPos += 1;
-    return { logits, traces: {}, gpuMs };
+    return { logits, lastHidden, traces: {}, gpuMs };
   }
 
   _encodeMatmulQ(enc, tempUniforms, weightBaseName, xBuf, xOffsetBytes, outBuf, T, addResidual = false) {
@@ -1007,10 +1010,10 @@ export class IgnisEngine {
 
   async forward(tokenIds, options = {}) {
     const T = tokenIds.length;
-    if (T > this.maxBatchTokens) {
+    if (T > this.maxBatchTokens && (options.captureTraces || options.returnAllLogits)) {
       throw new Error(`Batch ${T} exceeds maxBatchTokens ${this.maxBatchTokens}`);
     }
-    if (T === 1 && !options.captureTraces && !options.returnAllLogits) {
+    if (T === 1 && !options.captureTraces && !options.returnAllLogits && !options.skipLogits) {
       return this._forwardDecodeFast(tokenIds[0], options);
     }
     const emb = await this.lookupEmbeddings(tokenIds);
@@ -1021,11 +1024,57 @@ export class IgnisEngine {
     return this.forward(tokenIds, { ...options, returnAllLogits: true });
   }
 
-  async forwardEmbeds(embFloat32, {
+  async forwardEmbeds(embFloat32, options = {}) {
+    const {
+      tokenIds = null,
+      isMultimodalMask = null,
+      returnAllLogits = false,
+      captureTraces = false,
+      returnLastHidden = false,
+      skipLogits = false,
+    } = options;
+    const bp = this.bp;
+    const D = bp.hidden_size;
+    const T = embFloat32.length / D;
+    if (!Number.isInteger(T) || T <= 0) {
+      throw new Error(`Invalid embed length ${embFloat32.length} for hidden_size=${D}`);
+    }
+    if (T > this.maxBatchTokens) {
+      if (returnAllLogits || captureTraces) {
+        throw new Error(`Batch ${T} exceeds maxBatchTokens ${this.maxBatchTokens} for returnAllLogits/captureTraces`);
+      }
+      let finalRes = null;
+      for (let off = 0; off < T; off += this.maxBatchTokens) {
+        const end = Math.min(T, off + this.maxBatchTokens);
+        const isLast = end === T;
+        finalRes = await this._forwardEmbedsChunk(embFloat32.subarray(off * D, end * D), {
+          tokenIds: tokenIds ? tokenIds.slice(off, end) : null,
+          isMultimodalMask: isMultimodalMask ? isMultimodalMask.slice(off, end) : null,
+          returnAllLogits: false,
+          captureTraces: false,
+          returnLastHidden: isLast ? returnLastHidden : false,
+          skipLogits: isLast ? skipLogits : true,
+        });
+      }
+      return finalRes;
+    }
+    return this._forwardEmbedsChunk(embFloat32, {
+      tokenIds,
+      isMultimodalMask,
+      returnAllLogits,
+      captureTraces,
+      returnLastHidden,
+      skipLogits,
+    });
+  }
+
+  async _forwardEmbedsChunk(embFloat32, {
     tokenIds = null,
     isMultimodalMask = null,
     returnAllLogits = false,
     captureTraces = false,
+    returnLastHidden = false,
+    skipLogits = false,
   } = {}) {
     const bp = this.bp;
     const D = bp.hidden_size;
@@ -1290,40 +1339,42 @@ export class IgnisEngine {
 
     let outLogitBuf = this.bufs.logits;
     let outLogitCount = bp.vocab_size;
-    if (returnAllLogits) {
-      outLogitCount = T * bp.vocab_size;
-      if (!this.verifyLogitsBuf || this.verifyLogitsCap < outLogitCount) {
-        if (this.verifyLogitsBuf) this.verifyLogitsBuf.destroy();
-        this.verifyLogitsBuf = this.device.createBuffer({
-          size: alignUp(outLogitCount * 4, 16),
-          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-        });
-        this.verifyLogitsCap = outLogitCount;
+    if (!skipLogits) {
+      if (returnAllLogits) {
+        outLogitCount = T * bp.vocab_size;
+        if (!this.verifyLogitsBuf || this.verifyLogitsCap < outLogitCount) {
+          if (this.verifyLogitsBuf) this.verifyLogitsBuf.destroy();
+          this.verifyLogitsBuf = this.device.createBuffer({
+            size: alignUp(outLogitCount * 4, 16),
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+          });
+          this.verifyLogitsCap = outLogitCount;
+        }
+        outLogitBuf = this.verifyLogitsBuf;
+        this._encodeMatmulQ(enc, tempUniforms, 'output', this.bufs.norm, 0, outLogitBuf, T, false);
+      } else {
+        this._encodeMatmulQ(enc, tempUniforms, 'output', this.bufs.norm, (T - 1) * D * 4, outLogitBuf, 1, false);
       }
-      outLogitBuf = this.verifyLogitsBuf;
-      this._encodeMatmulQ(enc, tempUniforms, 'output', this.bufs.norm, 0, outLogitBuf, T, false);
-    } else {
-      this._encodeMatmulQ(enc, tempUniforms, 'output', this.bufs.norm, (T - 1) * D * 4, outLogitBuf, 1, false);
-    }
 
-    if (bp.final_logit_softcapping && bp.final_logit_softcapping > 0) {
-      const uCap = this._makeUniform((u32, f32) => {
-        u32[0] = bp.num_layers; u32[1] = outLogitCount; u32[2] = 1; u32[3] = 1;
-        f32[4] = bp.final_logit_softcapping;
-      });
-      tempUniforms.push(uCap);
-      const bgCap = this.device.createBindGroup({
-        layout: this.pipelines.softcapLogits.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: { buffer: uCap, size: 32 } },
-          { binding: 4, resource: { buffer: outLogitBuf } },
-        ],
-      });
-      const passCap = enc.beginComputePass();
-      passCap.setPipeline(this.pipelines.softcapLogits);
-      passCap.setBindGroup(0, bgCap);
-      passCap.dispatchWorkgroups(Math.ceil(outLogitCount / 256), 1, 1);
-      passCap.end();
+      if (bp.final_logit_softcapping && bp.final_logit_softcapping > 0) {
+        const uCap = this._makeUniform((u32, f32) => {
+          u32[0] = bp.num_layers; u32[1] = outLogitCount; u32[2] = 1; u32[3] = 1;
+          f32[4] = bp.final_logit_softcapping;
+        });
+        tempUniforms.push(uCap);
+        const bgCap = this.device.createBindGroup({
+          layout: this.pipelines.softcapLogits.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: uCap, size: 32 } },
+            { binding: 4, resource: { buffer: outLogitBuf } },
+          ],
+        });
+        const passCap = enc.beginComputePass();
+        passCap.setPipeline(this.pipelines.softcapLogits);
+        passCap.setBindGroup(0, bgCap);
+        passCap.dispatchWorkgroups(Math.ceil(outLogitCount / 256), 1, 1);
+        passCap.end();
+      }
     }
 
     this.device.queue.submit([enc.finish()]);
@@ -1333,10 +1384,13 @@ export class IgnisEngine {
       traces.final_norm = Array.from(fnData.slice((T - 1) * D, T * D));
     }
 
-    const logits = await this._readBufferFloat32(outLogitBuf, outLogitCount);
+    const logits = skipLogits ? null : await this._readBufferFloat32(outLogitBuf, outLogitCount);
+    const lastHidden = returnLastHidden
+      ? await this._readBufferFloat32(this.bufs.norm, D, (T - 1) * D * 4)
+      : null;
     this.curPos += T;
     for (const ub of tempUniforms) ub.destroy();
-    return { logits, traces, gpuMs: null };
+    return { logits, lastHidden, traces, gpuMs: null };
   }
 
   destroy() {
