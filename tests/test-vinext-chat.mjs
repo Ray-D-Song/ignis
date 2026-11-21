@@ -5,7 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { chromium } from 'playwright-core';
 
+const THORIUM_PATH = 'C:\\Users\\ray\\AppData\\Local\\Thorium\\Application\\thorium.exe';
 const EDGE_PATH = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
+const BROWSER_PATH = fs.existsSync(THORIUM_PATH) ? THORIUM_PATH : EDGE_PATH;
 const ROOT_DIR = path.resolve(import.meta.dirname, '..');
 const APP_DIR = path.join(ROOT_DIR, 'examples', 'chat-vinext');
 
@@ -72,10 +74,10 @@ async function main() {
 
   try {
     await waitForServer(baseUrl);
-    console.log(`[vinext] testing against ${baseUrl}`);
+    console.log(`[vinext] testing against ${baseUrl} using ${BROWSER_PATH}`);
 
     context = await chromium.launchPersistentContext(userDataDir, {
-      executablePath: EDGE_PATH,
+      executablePath: BROWSER_PATH,
       headless: true,
       args: [
         '--headless=new',

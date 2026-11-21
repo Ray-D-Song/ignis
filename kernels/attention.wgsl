@@ -34,9 +34,9 @@ fn main(
   @builtin(workgroup_id) wid: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,
   @builtin(subgroup_invocation_id) sg_lid: u32,
-  @builtin(subgroup_id) sg_id: u32,
   @builtin(subgroup_size) sg_size: u32,
 ) {
+  let sg_id = lid.x / sg_size;
   let num_sg = (256u + sg_size - 1u) / sg_size;
   let tok = wid.y;
   let qh = wid.x;

@@ -5,7 +5,35 @@ import { execFileSync } from 'node:child_process';
 import { chromium } from 'playwright-core';
 
 const EDGE_PATH = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
+const THORIUM_PATH = 'C:\\Users\\ray\\AppData\\Local\\Thorium\\Application\\thorium.exe';
 const ROOT_DIR = path.resolve(import.meta.dirname, '..');
+
+// Static WGSL W3C-Baseline Specification Compliance Check:
+// Ensures no kernel uses non-baseline subgroup builtins (such as subgroup_id or num_subgroups)
+// that fail on Chromium 134..14x without experimental flags.
+const ALLOWED_COMPUTE_BUILTINS = new Set([
+  'workgroup_id',
+  'local_invocation_id',
+  'local_invocation_index',
+  'global_invocation_id',
+  'num_workgroups',
+  'subgroup_invocation_id',
+  'subgroup_size',
+]);
+const kernelsDir = path.join(ROOT_DIR, 'kernels');
+for (const fname of fs.readdirSync(kernelsDir)) {
+  if (!fname.endsWith('.wgsl') && !fname.endsWith('.mjs')) continue;
+  const content = fs.readFileSync(path.join(kernelsDir, fname), 'utf-8');
+  for (const m of content.matchAll(/@builtin\(\s*([a-zA-Z0-9_]+)\s*\)/g)) {
+    const builtinName = m[1];
+    if (!ALLOWED_COMPUTE_BUILTINS.has(builtinName)) {
+      throw new Error(
+        `Non-baseline WGSL @builtin(${builtinName}) in kernels/${fname}. ` +
+        `Only W3C baseline compute/subgroups builtins are allowed: ${[...ALLOWED_COMPUTE_BUILTINS].join(', ')}`
+      );
+    }
+  }
+}
 
 function maxAbsErr(a, b) {
   let m = 0;
@@ -97,23 +125,31 @@ const server = http.createServer((req, res) => {
 
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const port = server.address().port;
-const browser = await chromium.launch({
-  executablePath: EDGE_PATH,
-  headless: true,
-  args: ['--headless=new'],
-});
+const candidateBrowsers = [THORIUM_PATH, EDGE_PATH].filter((p) => fs.existsSync(p));
 try {
-  const page = await browser.newPage();
-  await page.goto(`http://127.0.0.1:${port}/tests/test-kernels.html`);
-  const out = await page.evaluate((g) => window.__runKernelTests(g), golden);
-  console.log('RMSNorm maxAbsErr:', maxAbsErr(out.rmsOut, golden.rms.expected));
-  console.log('GEMV    maxAbsErr:', maxAbsErr(out.gemvOut, golden.qmm.expected_gemv));
-  console.log('GEMV_Q8 maxAbsErr:', maxAbsErr(out.gemvQ8Out, golden.q8.expected));
-  console.log('GEMM4   maxAbsErr:', maxAbsErr(out.gemmOut, golden.qmm.expected_gemm));
-  console.log('GeGLU   maxAbsErr:', maxAbsErr(out.gegluOut, golden.geglu.expected));
-  console.log('QRot    maxAbsErr:', maxAbsErr(out.qRotOut, golden.attn.expected_qrot));
-  console.log('Attn    maxAbsErr:', maxAbsErr(out.attnOut, golden.attn.expected_attn));
+  for (const executablePath of candidateBrowsers) {
+    const browser = await chromium.launch({
+      executablePath,
+      headless: true,
+      args: ['--headless=new'],
+    });
+    try {
+      const page = await browser.newPage();
+      await page.goto(`http://127.0.0.1:${port}/tests/test-kernels.html`);
+      const ua = await page.evaluate(() => navigator.userAgent);
+      console.log(`[test-kernels] Browser: ${path.basename(executablePath)} (${ua})`);
+      const out = await page.evaluate((g) => window.__runKernelTests(g), golden);
+      console.log('RMSNorm maxAbsErr:', maxAbsErr(out.rmsOut, golden.rms.expected));
+      console.log('GEMV    maxAbsErr:', maxAbsErr(out.gemvOut, golden.qmm.expected_gemv));
+      console.log('GEMV_Q8 maxAbsErr:', maxAbsErr(out.gemvQ8Out, golden.q8.expected));
+      console.log('GEMM4   maxAbsErr:', maxAbsErr(out.gemmOut, golden.qmm.expected_gemm));
+      console.log('GeGLU   maxAbsErr:', maxAbsErr(out.gegluOut, golden.geglu.expected));
+      console.log('QRot    maxAbsErr:', maxAbsErr(out.qRotOut, golden.attn.expected_qrot));
+      console.log('Attn    maxAbsErr:', maxAbsErr(out.attnOut, golden.attn.expected_attn));
+    } finally {
+      await browser.close();
+    }
+  }
 } finally {
-  await browser.close();
   server.close();
 }

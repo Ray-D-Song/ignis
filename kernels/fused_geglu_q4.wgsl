@@ -38,9 +38,9 @@ fn gemv_geglu_q4_g64(
   @builtin(workgroup_id) wid: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,
   @builtin(subgroup_invocation_id) sg_lid: u32,
-  @builtin(subgroup_id) sg_id: u32,
   @builtin(subgroup_size) sg_size: u32,
 ) {
+  let sg_id = lid.x / sg_size;
   let tok = wid.y;
   if (tok >= params.T) { return; }
   let local_row = lid.x / THREADS_PER_ROW;
@@ -101,9 +101,9 @@ fn gemm4_geglu_q4_g64(
   @builtin(workgroup_id) wid: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,
   @builtin(subgroup_invocation_id) sg_lid: u32,
-  @builtin(subgroup_id) sg_id: u32,
   @builtin(subgroup_size) sg_size: u32,
 ) {
+  let sg_id = lid.x / sg_size;
   let t0 = wid.y * 4u;
   if (t0 >= params.T) { return; }
   let local_row = lid.x / THREADS_PER_ROW;
