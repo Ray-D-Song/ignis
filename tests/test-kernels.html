@@ -234,7 +234,186 @@ window.__runKernelTests = async (golden) => {
   const attnOut = await readF32(bAttnOut, T * qDim);
 
   device.destroy();
-  return { rmsOut, gemvOut, gemmOut, gemvQ8Out, gegluOut, qRotOut, attnOut };
+
+  // Test 5: Codegen v2 Kernels (Subgroup=true AND Subgroup=false fallback):
+  // INT3_G64, ShortConv K=7 (prefill+decode), QK+V-Norm + Proportional RoPE + head_dim=512 Attn + GeLU_PyTorch_Tanh
+  const cg = await import('/kernels/codegen.mjs');
+  const runCodegenSuite = async (useSubgroups) => {
+    const adp2 = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    const dev2 = await adp2.requestDevice({
+      requiredFeatures: useSubgroups ? ['shader-f16', 'subgroups'] : ['shader-f16'],
+    });
+    const compileCg = async (code, label) => {
+      const m = dev2.createShaderModule({ code, label });
+      const info = await m.getCompilationInfo();
+      const errs = info.messages.filter((x) => x.type === 'error');
+      if (errs.length) throw new Error(`${label} (sg=${useSubgroups}): ${errs.map((e) => `L${e.lineNum}:${e.message}`).join('; ')}`);
+      return m;
+    };
+    const mk = (data, usage) => {
+      const b = dev2.createBuffer({ size: Math.max(16, Math.ceil(data.byteLength / 16) * 16), usage: usage | GPUBufferUsage.COPY_DST });
+      dev2.queue.writeBuffer(b, 0, data);
+      return b;
+    };
+    const rd = async (buf, n) => {
+      const rb = dev2.createBuffer({ size: n * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+      const e = dev2.createCommandEncoder();
+      e.copyBufferToBuffer(buf, 0, rb, 0, n * 4);
+      dev2.queue.submit([e.finish()]);
+      await rb.mapAsync(GPUMapMode.READ);
+      const out = Array.from(new Float32Array(rb.getMappedRange().slice(0)));
+      rb.unmap(); rb.destroy();
+      return out;
+    };
+
+    // Compile all codegen modules to guarantee zero WGSL syntax errors in both modes
+    const mRms = await compileCg(cg.buildRmsNormWgsl({ useSubgroups }), 'cg_rmsnorm');
+    const mQmm = await compileCg(cg.buildQuantMatmulWgsl({ useSubgroups }), 'cg_qmm');
+    const mLin = await compileCg(cg.buildLinearF32Wgsl({ useSubgroups }), 'cg_lin');
+    const mQk = await compileCg(cg.buildQkNormWgsl({ useSubgroups }), 'cg_qk');
+    const mRp = await compileCg(cg.buildRopeKvWgsl(), 'cg_rope');
+    const mAt = await compileCg(cg.buildAttentionWgsl({ useSubgroups }), 'cg_attn');
+    const mAtD = await compileCg(cg.buildAttentionDecodeWgsl({ useSubgroups }), 'cg_attn_dec');
+    const mSc = await compileCg(cg.buildShortConvWgsl(), 'cg_sconv');
+    const mPle = await compileCg(cg.buildPleWgsl({ useSubgroups }), 'cg_ple');
+    const mGluT = await compileCg(cg.buildFusedGluWgsl('gelu_pytorch_tanh', { useSubgroups, weightBits: 4 }), 'cg_glu_gt');
+    await compileCg(cg.buildFusedGluWgsl('silu', { useSubgroups, weightBits: 3 }), 'cg_glu_q3_silu');
+
+    // A) INT3_G64 GEMV & GEMM4
+    const pQ3v = dev2.createComputePipeline({ layout: 'auto', compute: { module: mQmm, entryPoint: 'gemv_q3_g64' } });
+    const pQ3m = dev2.createComputePipeline({ layout: 'auto', compute: { module: mQmm, entryPoint: 'gemm4_q3_g64' } });
+    const bQ3 = mk(new Uint32Array(golden.q3.quants), GPUBufferUsage.STORAGE);
+    const bS3 = mk(new Uint32Array(golden.q3.scales), GPUBufferUsage.STORAGE);
+    const bX3 = mk(new Float32Array(golden.qmm.x), GPUBufferUsage.STORAGE);
+    const bO3v = dev2.createBuffer({ size: golden.qmm.M * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const bO3m = dev2.createBuffer({ size: golden.qmm.T * golden.qmm.M * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const bU3v = mk(new Uint32Array([golden.qmm.M, golden.qmm.K, 1, golden.qmm.K_pad]), GPUBufferUsage.UNIFORM);
+    const bU3m = mk(new Uint32Array([golden.qmm.M, golden.qmm.K, golden.qmm.T, golden.qmm.K_pad]), GPUBufferUsage.UNIFORM);
+
+    let e2 = dev2.createCommandEncoder();
+    let p2 = e2.beginComputePass();
+    p2.setPipeline(pQ3v);
+    p2.setBindGroup(0, dev2.createBindGroup({ layout: pQ3v.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: bU3v } }, { binding: 1, resource: { buffer: bQ3 } },
+      { binding: 2, resource: { buffer: bS3 } }, { binding: 3, resource: { buffer: bX3 } },
+      { binding: 4, resource: { buffer: bO3v } },
+    ]}));
+    p2.dispatchWorkgroups(Math.ceil(golden.qmm.M / 4), 1, 1); p2.end();
+
+    p2 = e2.beginComputePass();
+    p2.setPipeline(pQ3m);
+    p2.setBindGroup(0, dev2.createBindGroup({ layout: pQ3m.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: bU3m } }, { binding: 1, resource: { buffer: bQ3 } },
+      { binding: 2, resource: { buffer: bS3 } }, { binding: 3, resource: { buffer: bX3 } },
+      { binding: 4, resource: { buffer: bO3m } },
+    ]}));
+    p2.dispatchWorkgroups(Math.ceil(golden.qmm.M / 4), Math.ceil(golden.qmm.T / 4), 1); p2.end();
+    dev2.queue.submit([e2.finish()]);
+
+    // B) ShortConv K=7: T=4 prefill then T=1 decode
+    const pSc = dev2.createComputePipeline({ layout: 'auto', compute: { module: mSc, entryPoint: 'main' } });
+    const Dsc = golden.sconv.dim;
+    const bBcx1 = mk(new Float32Array(golden.sconv.bcx_prefill), GPUBufferUsage.STORAGE);
+    const bBcx2 = mk(new Float32Array(golden.sconv.bcx_decode), GPUBufferUsage.STORAGE);
+    const bCw = mk(new Float32Array(golden.sconv.w), GPUBufferUsage.STORAGE);
+    const bCst = mk(new Float32Array(Dsc * 6), GPUBufferUsage.STORAGE);
+    const bCout = dev2.createBuffer({ size: 4 * Dsc * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const bUsc1 = mk(new Uint32Array([Dsc, 4, 7, 6]), GPUBufferUsage.UNIFORM);
+    const bUsc2 = mk(new Uint32Array([Dsc, 1, 7, 6]), GPUBufferUsage.UNIFORM);
+    e2 = dev2.createCommandEncoder();
+    p2 = e2.beginComputePass(); p2.setPipeline(pSc);
+    p2.setBindGroup(0, dev2.createBindGroup({ layout: pSc.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: bUsc1 } }, { binding: 1, resource: { buffer: bBcx1 } },
+      { binding: 2, resource: { buffer: bCw } }, { binding: 3, resource: { buffer: bCst } },
+      { binding: 4, resource: { buffer: bCout } },
+    ]}));
+    p2.dispatchWorkgroups(Math.ceil(Dsc / 256), 1, 1); p2.end();
+    dev2.queue.submit([e2.finish()]);
+    const sconvPreOut = await rd(bCout, 4 * Dsc);
+
+    e2 = dev2.createCommandEncoder();
+    p2 = e2.beginComputePass(); p2.setPipeline(pSc);
+    p2.setBindGroup(0, dev2.createBindGroup({ layout: pSc.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: bUsc2 } }, { binding: 1, resource: { buffer: bBcx2 } },
+      { binding: 2, resource: { buffer: bCw } }, { binding: 3, resource: { buffer: bCst } },
+      { binding: 4, resource: { buffer: bCout } },
+    ]}));
+    p2.dispatchWorkgroups(Math.ceil(Dsc / 256), 1, 1); p2.end();
+    dev2.queue.submit([e2.finish()]);
+    const sconvDecOut = await rd(bCout, Dsc);
+
+    // C) head_dim=512 QK+V-Norm + Proportional RoPE + Attention (prefill T=3 & decode T=1 SplitKV)
+    const pQk = dev2.createComputePipeline({ layout: 'auto', compute: { module: mQk, entryPoint: 'main' } });
+    const pRp5 = dev2.createComputePipeline({ layout: 'auto', compute: { module: mRp, entryPoint: 'main' } });
+    const pAt5 = dev2.createComputePipeline({ layout: 'auto', compute: { module: mAt, entryPoint: 'main' } });
+    const g5 = golden.hd512;
+    const bQkv5 = mk(new Float32Array(g5.qkv), GPUBufferUsage.STORAGE);
+    const bQn5 = mk(new Float32Array(g5.q_norm), GPUBufferUsage.STORAGE);
+    const bKn5 = mk(new Float32Array(g5.k_norm), GPUBufferUsage.STORAGE);
+    const bQr5 = dev2.createBuffer({ size: g5.T * g5.q_heads * 512 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const bKc5 = dev2.createBuffer({ size: g5.kv_heads * 16 * 512 * 2, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const bVc5 = dev2.createBuffer({ size: g5.kv_heads * 16 * 512 * 2, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const bDum = mk(new Float32Array(16), GPUBufferUsage.STORAGE);
+    const bAo5 = dev2.createBuffer({ size: g5.T * g5.q_heads * 512 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+
+    const abQk = new ArrayBuffer(32);
+    new Uint32Array(abQk).set([g5.q_heads, g5.kv_heads, 512, g5.T]);
+    new Float32Array(abQk)[4] = 1e-6;
+    new Uint32Array(abQk)[5] = 1; // norm_v=1
+    new Uint32Array(abQk)[6] = 0; // skip_kv=0
+
+    const abRp5 = new ArrayBuffer(48);
+    new Uint32Array(abRp5).set([g5.T, 0, g5.q_heads, g5.kv_heads, 512, 128, 16, 0]);
+    new Float32Array(abRp5)[8] = 1000000.0;
+    new Uint32Array(abRp5)[9] = 1; // proportional
+    new Uint32Array(abRp5)[10] = 0; // skip_kv_write=0
+
+    const abAt5 = new ArrayBuffer(48);
+    new Uint32Array(abAt5).set([g5.T, 0, g5.q_heads, g5.kv_heads, 512, 16, 0, 0, 0]);
+    new Float32Array(abAt5)[9] = 1.0; // Gemma 4 scaling = 1.0
+
+    e2 = dev2.createCommandEncoder();
+    p2 = e2.beginComputePass(); p2.setPipeline(pQk);
+    p2.setBindGroup(0, dev2.createBindGroup({ layout: pQk.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: mk(new Uint8Array(abQk), GPUBufferUsage.UNIFORM) } },
+      { binding: 1, resource: { buffer: bQkv5 } },
+      { binding: 2, resource: { buffer: bQn5 } },
+      { binding: 3, resource: { buffer: bKn5 } },
+    ]}));
+    p2.dispatchWorkgroups(g5.q_heads + 2 * g5.kv_heads, g5.T, 1); p2.end();
+
+    p2 = e2.beginComputePass(); p2.setPipeline(pRp5);
+    p2.setBindGroup(0, dev2.createBindGroup({ layout: pRp5.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: mk(new Uint8Array(abRp5), GPUBufferUsage.UNIFORM) } },
+      { binding: 1, resource: { buffer: bQkv5 } },
+      { binding: 2, resource: { buffer: bQr5 } },
+      { binding: 3, resource: { buffer: bKc5 } },
+      { binding: 4, resource: { buffer: bVc5 } },
+    ]}));
+    p2.dispatchWorkgroups(Math.ceil((g5.q_heads * 512) / 128), g5.T, 1); p2.end();
+
+    p2 = e2.beginComputePass(); p2.setPipeline(pAt5);
+    p2.setBindGroup(0, dev2.createBindGroup({ layout: pAt5.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: mk(new Uint8Array(abAt5), GPUBufferUsage.UNIFORM) } },
+      { binding: 1, resource: { buffer: bQr5 } },
+      { binding: 2, resource: { buffer: bKc5 } },
+      { binding: 3, resource: { buffer: bVc5 } },
+      { binding: 4, resource: { buffer: bDum } },
+      { binding: 5, resource: { buffer: bAo5 } },
+    ]}));
+    p2.dispatchWorkgroups(g5.q_heads, g5.T, 1); p2.end();
+    dev2.queue.submit([e2.finish()]);
+
+    const q3vOut = await rd(bO3v, golden.qmm.M);
+    const q3mOut = await rd(bO3m, golden.qmm.T * golden.qmm.M);
+    const hd512Out = await rd(bAo5, g5.T * g5.q_heads * 512);
+    dev2.destroy();
+    return { q3vOut, q3mOut, sconvPreOut, sconvDecOut, hd512Out };
+  };
+
+  const cgSg = await runCodegenSuite(true);
+  const cgNoSg = await runCodegenSuite(false);
+  return { rmsOut, gemvOut, gemmOut, gemvQ8Out, gegluOut, qRotOut, attnOut, cgSg, cgNoSg };
 };
 </script>
 </body>

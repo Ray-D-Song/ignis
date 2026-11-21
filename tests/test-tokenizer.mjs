@@ -50,6 +50,45 @@ async function main() {
   }
   tok.free();
   console.log('[PASS] Rust-WASM Tokenizer matches llama-tokenize 100% across all 131K vocab test cases!');
+
+  // Multi-arch tokenizer regression checks (LFM3 ByteLevel 128K + Gemma 4 SentencePiece ByteFallback 262K)
+  const extraModels = [
+    ['LFM3-Omni-2B', path.join(ROOT_DIR, 'tests/fixtures/lfm3-omni-2b-hf/tokenizer.json')],
+    ['Gemma-4-E4B-it', path.join(ROOT_DIR, 'tests/fixtures/gemma-4-e4b-it-hf/tokenizer.json')],
+  ];
+  for (const [label, tokPath] of extraModels) {
+    if (!fs.existsSync(tokPath)) continue;
+    const py = path.join(ROOT_DIR, 'packer/.venv/Scripts/python.exe');
+    const spCases = [
+      ...cases.slice(0, 2),
+      '  leading and  multiple   spaces\n\tand tabs 🚀🔥 \u00a0nbsp',
+    ];
+    const expIds = JSON.parse(
+      execFileSync(
+        py,
+        [
+          '-c',
+          'import json,sys; from tokenizers import Tokenizer; tk=Tokenizer.from_file(sys.argv[1]); print(json.dumps([tk.encode(c, add_special_tokens=False).ids for c in json.loads(sys.argv[2])]))',
+          tokPath,
+          JSON.stringify(spCases),
+        ],
+        { encoding: 'utf-8' }
+      )
+    );
+    const mt = await IgnisTokenizer.fromBuffers(wasmBytes, fs.readFileSync(tokPath));
+    for (let i = 0; i < spCases.length; i++) {
+      const got = mt.encode(spCases[i]);
+      const dec = mt.decode(got, false);
+      if (JSON.stringify(got) !== JSON.stringify(expIds[i])) {
+        throw new Error(`${label} encode mismatch on case ${i}: expected=${expIds[i].slice(0, 12)}, got=${got.slice(0, 12)}`);
+      }
+      if (dec !== spCases[i]) {
+        throw new Error(`${label} roundtrip mismatch on case ${i}`);
+      }
+    }
+    mt.free();
+    console.log(`[PASS] Rust-WASM Tokenizer matches HuggingFace oracle 100% on ${label}!`);
+  }
 }
 
 main().catch((err) => {

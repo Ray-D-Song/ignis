@@ -169,7 +169,7 @@ export async function readOpfsFileBytes(dirHandle, filename) {
 
 export async function uploadOpfsShardsToGpu(device, dirHandle, manifest, stagingBytes = DEFAULT_STAGING_BYTES) {
   const gpuShards = new Map();
-  const gpuShardsInfo = manifest.shards.filter((s) => s.id !== 'embd');
+  const gpuShardsInfo = manifest.shards.filter((s) => typeof s.id === 'number');
   const staging = device.createBuffer({
     size: stagingBytes,
     usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
@@ -257,8 +257,8 @@ export class OpfsEmbeddingTable {
     this.scratchView = new DataView(this.scratch.buffer);
   }
 
-  static async open(dirHandle, embdMeta, maxCacheRows = 4096) {
-    const fh = await dirHandle.getFileHandle('embd.ignis');
+  static async open(dirHandle, embdMeta, maxCacheRows = 4096, filename = 'embd.ignis') {
+    const fh = await dirHandle.getFileHandle(filename);
     if (typeof fh.createSyncAccessHandle === 'function') {
       const access = await fh.createSyncAccessHandle();
       return new OpfsEmbeddingTable(access, null, embdMeta.offset, embdMeta.row_stride, embdMeta.shape[1], maxCacheRows);

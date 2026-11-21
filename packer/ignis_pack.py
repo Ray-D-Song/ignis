@@ -12,17 +12,19 @@ from typing import Any
 import numpy as np
 from safetensors import safe_open
 
+from blueprints import build_blueprint
 from quant import (
     PAYLOAD_OFFSET,
     TENSOR_ALIGN,
     align_up,
+    dequantize_int3_g64_asym,
     dequantize_int4_g64_asym,
     dequantize_int8_g64_sym,
-    dequantize_int8_row,
     make_shard_header,
+    quantize_int3_g64_asym,
     quantize_int4_g64_asym,
     quantize_int8_g64_sym,
-    quantize_int8_row,
+    stream_write_int8_row_shard,
 )
 
 
@@ -74,39 +76,6 @@ class ShardWriter:
         return self.shards_meta
 
 
-def build_blueprint(cfg: dict[str, Any]) -> dict[str, Any]:
-    layer_types_raw = cfg.get("layer_types") or ["full_attention"] * cfg["num_hidden_layers"]
-    layer_types = ["swa" if lt == "sliding_attention" else "full" for lt in layer_types_raw]
-    rope_params = cfg.get("rope_parameters") or {}
-    full_rope = rope_params.get("full_attention", {})
-    swa_rope = rope_params.get("sliding_attention", {})
-    head_dim = cfg.get("head_dim") or (cfg["hidden_size"] // cfg["num_attention_heads"])
-    return {
-        "architecture": cfg.get("model_type", "spark2_5"),
-        "num_layers": cfg["num_hidden_layers"],
-        "hidden_size": cfg["hidden_size"],
-        "intermediate_size": cfg["intermediate_size"],
-        "vocab_size": cfg["vocab_size"],
-        "num_attention_heads": cfg["num_attention_heads"],
-        "num_key_value_heads": cfg["num_key_value_heads"],
-        "head_dim": head_dim,
-        "rms_norm_eps": cfg.get("rms_norm_eps", 1e-6),
-        "hidden_act": cfg.get("hidden_act", "gelu"),
-        "sliding_window": cfg.get("sliding_window"),
-        "rope_theta_full": float(full_rope.get("rope_theta", cfg.get("rope_theta", 5000000.0))),
-        "rope_dim_full": int(round(head_dim * float(full_rope.get("partial_rotary_factor", 1.0)))),
-        "rope_theta_swa": float(swa_rope.get("rope_theta", 10000.0)),
-        "rope_dim_swa": int(round(head_dim * float(swa_rope.get("partial_rotary_factor", 1.0)))),
-        "layer_types": layer_types,
-        "has_attn_gate": bool(cfg.get("headwise_attn_output_gate", False)),
-        "gate_attn_act_mode": cfg.get("gate_attn_act_mode", "sigmoid"),
-        "tie_word_embeddings": bool(cfg.get("tie_word_embeddings", False)),
-        "bos_token_id": cfg.get("bos_token_id", 0),
-        "eos_token_id": cfg.get("eos_token_id", 1),
-        "pad_token_id": cfg.get("pad_token_id", 2),
-    }
-
-
 def load_hf_tensor_reader(model_dir: Path):
     """Returns a lazy tensor accessor supporting BF16/FP16/FP32 safetensors via PyTorch."""
     index_file = model_dir / "model.safetensors.index.json"
@@ -131,11 +100,39 @@ def load_hf_tensor_reader(model_dir: Path):
         def __contains__(self, key: str) -> bool:
             return key in weight_map
 
+        def get_shape(self, key: str) -> list[int]:
+            fname = weight_map[key]
+            return list(handles[fname].get_slice(key).get_shape())
+
+        def get_slice(self, key: str):
+            fname = weight_map[key]
+            return handles[fname].get_slice(key)
+
         def get(self, key: str) -> np.ndarray:
             fname = weight_map[key]
             return handles[fname].get_tensor(key).float().numpy()
 
     return Reader()
+
+
+def _quantize_chunked_2d(tensor_slice, shape: list[int], fn, chunk_rows: int = 16384):
+    """Quantize large 2D tensors chunk-by-chunk to avoid full float32 RAM allocation."""
+    m, k = shape
+    if m <= chunk_rows:
+        arr = tensor_slice[:]
+        np_arr = arr.float().numpy() if hasattr(arr, "float") else np.asarray(arr, dtype=np.float32)
+        return fn(np_arr)
+    q_parts, s_parts = [], []
+    padded = None
+    for s in range(0, m, chunk_rows):
+        e = min(m, s + chunk_rows)
+        arr = tensor_slice[s:e]
+        np_arr = arr.float().numpy() if hasattr(arr, "float") else np.asarray(arr, dtype=np.float32)
+        q_c, s_c, ps = fn(np_arr)
+        q_parts.append(q_c)
+        s_parts.append(s_c)
+        padded = (m, ps[1])
+    return np.ascontiguousarray(np.concatenate(q_parts, axis=0)), np.ascontiguousarray(np.concatenate(s_parts, axis=0)), padded
 
 
 def pack_model(
@@ -144,10 +141,13 @@ def pack_model(
     max_shard_mb: int = 512,
     verify: bool = True,
     lm_head_dtype: str = "int4",
+    weight_bits: int = 4,
+    pack_multimodal: bool = True,
 ) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     cfg = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     blueprint = build_blueprint(cfg)
+    blueprint["weight_bits"] = weight_bits
     hf_tensors = load_hf_tensor_reader(model_dir)
 
     writer = ShardWriter(out_dir, max_shard_bytes=max_shard_mb * 1024 * 1024)
@@ -166,8 +166,23 @@ def pack_model(
             "layout": "row_major",
         }
 
-    def register_q4(ignis_name: str, arr: np.ndarray) -> None:
-        quants_u32, scales_u32, padded_shape = quantize_int4_g64_asym(arr)
+    def _cosine_verify(ignis_name: str, q_u32: np.ndarray, s_u32: np.ndarray, deq_fn, src_slice_or_arr, orig_shape: list[int]) -> None:
+        if not verify:
+            return
+        rows = min(orig_shape[0], 4096)
+        raw_sub = src_slice_or_arr[:rows] if not isinstance(src_slice_or_arr, np.ndarray) else src_slice_or_arr[:rows]
+        orig_f32 = raw_sub.float().numpy() if hasattr(raw_sub, "float") else np.asarray(raw_sub, dtype=np.float32)
+        deq = deq_fn(q_u32[:rows], s_u32[:rows], orig_shape[1])
+        cos = float(np.sum(orig_f32 * deq) / (np.linalg.norm(orig_f32) * np.linalg.norm(deq) + 1e-12))
+        quant_errors.append((ignis_name, cos))
+
+    def register_q3(ignis_name: str, src, shape: list[int] | None = None) -> None:
+        if isinstance(src, np.ndarray):
+            quants_u32, scales_u32, padded_shape = quantize_int3_g64_asym(src)
+            orig_shape = list(src.shape)
+        else:
+            orig_shape = shape
+            quants_u32, scales_u32, padded_shape = _quantize_chunked_2d(src, orig_shape, quantize_int3_g64_asym)
         q_shard, q_off, q_bytes = writer.add_tensor(quants_u32.tobytes())
         s_shard, s_off, s_bytes = writer.add_tensor(scales_u32.tobytes())
         tensors_meta[f"{ignis_name}.quants"] = {
@@ -175,7 +190,37 @@ def pack_model(
             "offset": q_off,
             "bytes": q_bytes,
             "shape": list(quants_u32.shape),
-            "orig_shape": list(arr.shape),
+            "orig_shape": orig_shape,
+            "padded_shape": list(padded_shape),
+            "dtype": "u32_q3",
+            "layout": "row_major",
+        }
+        tensors_meta[f"{ignis_name}.scales"] = {
+            "shard": s_shard,
+            "offset": s_off,
+            "bytes": s_bytes,
+            "shape": list(scales_u32.shape),
+            "dtype": "u32_f16x2",
+            "group_size": 64,
+            "layout": "row_major",
+        }
+        _cosine_verify(ignis_name, quants_u32, scales_u32, dequantize_int3_g64_asym, src, orig_shape)
+
+    def register_q4(ignis_name: str, src, shape: list[int] | None = None) -> None:
+        if isinstance(src, np.ndarray):
+            quants_u32, scales_u32, padded_shape = quantize_int4_g64_asym(src)
+            orig_shape = list(src.shape)
+        else:
+            orig_shape = shape
+            quants_u32, scales_u32, padded_shape = _quantize_chunked_2d(src, orig_shape, quantize_int4_g64_asym)
+        q_shard, q_off, q_bytes = writer.add_tensor(quants_u32.tobytes())
+        s_shard, s_off, s_bytes = writer.add_tensor(scales_u32.tobytes())
+        tensors_meta[f"{ignis_name}.quants"] = {
+            "shard": q_shard,
+            "offset": q_off,
+            "bytes": q_bytes,
+            "shape": list(quants_u32.shape),
+            "orig_shape": orig_shape,
             "padded_shape": list(padded_shape),
             "dtype": "u32_q4",
             "layout": "row_major",
@@ -189,14 +234,15 @@ def pack_model(
             "group_size": 64,
             "layout": "row_major",
         }
-        if verify:
-            orig_f32 = arr.astype(np.float32)
-            deq = dequantize_int4_g64_asym(quants_u32, scales_u32, arr.shape[1])
-            cos = float(np.sum(orig_f32 * deq) / (np.linalg.norm(orig_f32) * np.linalg.norm(deq) + 1e-12))
-            quant_errors.append((ignis_name, cos))
+        _cosine_verify(ignis_name, quants_u32, scales_u32, dequantize_int4_g64_asym, src, orig_shape)
 
-    def register_q8(ignis_name: str, arr: np.ndarray) -> None:
-        quants_u32, scales_u32, padded_shape = quantize_int8_g64_sym(arr)
+    def register_q8(ignis_name: str, src, shape: list[int] | None = None) -> None:
+        if isinstance(src, np.ndarray):
+            quants_u32, scales_u32, padded_shape = quantize_int8_g64_sym(src)
+            orig_shape = list(src.shape)
+        else:
+            orig_shape = shape
+            quants_u32, scales_u32, padded_shape = _quantize_chunked_2d(src, orig_shape, quantize_int8_g64_sym)
         q_shard, q_off, q_bytes = writer.add_tensor(quants_u32.tobytes())
         s_shard, s_off, s_bytes = writer.add_tensor(scales_u32.tobytes())
         tensors_meta[f"{ignis_name}.quants"] = {
@@ -204,7 +250,7 @@ def pack_model(
             "offset": q_off,
             "bytes": q_bytes,
             "shape": list(quants_u32.shape),
-            "orig_shape": list(arr.shape),
+            "orig_shape": orig_shape,
             "padded_shape": list(padded_shape),
             "dtype": "u32_q8",
             "layout": "row_major",
@@ -218,87 +264,208 @@ def pack_model(
             "group_size": 64,
             "layout": "row_major",
         }
-        if verify:
-            orig_f32 = arr.astype(np.float32)
-            deq = dequantize_int8_g64_sym(quants_u32, scales_u32, arr.shape[1])
-            cos = float(np.sum(orig_f32 * deq) / (np.linalg.norm(orig_f32) * np.linalg.norm(deq) + 1e-12))
-            quant_errors.append((ignis_name, cos))
+        _cosine_verify(ignis_name, quants_u32, scales_u32, dequantize_int8_g64_sym, src, orig_shape)
 
-    # 1. Externalized Embedding -> embd.ignis
-    embd_key = "model.embedding.weight" if "model.embedding.weight" in hf_tensors else "model.embed_tokens.weight"
-    embd_w = hf_tensors.get(embd_key)
-    embd_raw, row_stride = quantize_int8_row(embd_w)
-    embd_header = make_shard_header(0xFFFFFFFF, len(embd_raw))
-    embd_bytes = embd_header + embd_raw
+    register_body = register_q3 if weight_bits == 3 else register_q4
+
+    # Detect HF weight key prefix & family
+    arch = blueprint["architecture"]
+    if "model.language_model.embed_tokens.weight" in hf_tensors:
+        tp = "model.language_model."
+        embd_key = f"{tp}embed_tokens.weight"
+    elif "model.embedding.weight" in hf_tensors:
+        tp = "model."
+        embd_key = "model.embedding.weight"
+    else:
+        tp = "model."
+        embd_key = "model.embed_tokens.weight"
+
+    # 1. Externalized Embedding -> embd.ignis (streamed cleanly with low RAM)
+    embd_shape = hf_tensors.get_shape(embd_key)
     embd_path = out_dir / "embd.ignis"
-    embd_path.write_bytes(embd_bytes)
-    embd_sha = hashlib.sha256(embd_bytes).hexdigest()
-
+    row_stride, embd_payload_bytes, embd_sha, cos_e = stream_write_int8_row_shard(
+        hf_tensors.get_slice(embd_key), embd_shape[0], embd_shape[1], embd_path, shard_id=0xFFFFFFFF, verify=verify
+    )
     if verify:
-        deq_embd = dequantize_int8_row(embd_raw, embd_w.shape[0], embd_w.shape[1], row_stride)
-        orig_e = embd_w.astype(np.float32)
-        cos_e = float(np.sum(orig_e * deq_embd) / (np.linalg.norm(orig_e) * np.linalg.norm(deq_embd) + 1e-12))
         quant_errors.append(("token_embd", cos_e))
 
     tensors_meta["token_embd"] = {
         "shard": "embd",
         "offset": PAYLOAD_OFFSET,
-        "bytes": len(embd_raw),
-        "shape": list(embd_w.shape),
+        "bytes": embd_payload_bytes,
+        "shape": embd_shape,
         "row_stride": row_stride,
         "dtype": "i8_row",
     }
-
-    # 2. LM Head (either explicit or tied to embedding)
-    lm_head_w = embd_w if blueprint["tie_word_embeddings"] or "lm_head.weight" not in hf_tensors else hf_tensors.get("lm_head.weight")
-    del embd_w
-    if lm_head_dtype == "int8":
-        register_q8("output", lm_head_w)
-    elif lm_head_dtype == "int4":
-        register_q4("output", lm_head_w)
-    else:
-        raise ValueError(f"Unsupported lm_head_dtype: {lm_head_dtype}")
-    del lm_head_w
-    register_f32("output_norm", hf_tensors.get("model.norm.weight"))
-
-    # 3. Transformer layers
-    for i in range(blueprint["num_layers"]):
-        pfx = f"model.layers.{i}"
-        opfx = f"blk.{i}"
-        register_f32(f"{opfx}.attn_norm", hf_tensors.get(f"{pfx}.input_layernorm.weight"))
-        register_f32(f"{opfx}.ffn_norm", hf_tensors.get(f"{pfx}.post_attention_layernorm.weight"))
-
-        if f"{pfx}.self_attn.q_k_v_proj.weight" in hf_tensors:
-            qkv_w = hf_tensors.get(f"{pfx}.self_attn.q_k_v_proj.weight")
-        else:
-            qkv_w = np.concatenate([
-                hf_tensors.get(f"{pfx}.self_attn.q_proj.weight"),
-                hf_tensors.get(f"{pfx}.self_attn.k_proj.weight"),
-                hf_tensors.get(f"{pfx}.self_attn.v_proj.weight"),
-            ], axis=0)
-        register_q4(f"{opfx}.attn_qkv", qkv_w)
-
-        o_key = f"{pfx}.self_attn.out_proj.weight" if f"{pfx}.self_attn.out_proj.weight" in hf_tensors else f"{pfx}.self_attn.o_proj.weight"
-        register_q4(f"{opfx}.attn_output", hf_tensors.get(o_key))
-
-        if blueprint["has_attn_gate"]:
-            register_f32(f"{opfx}.attn_gate", hf_tensors.get(f"{pfx}.self_attn.g_proj.weight"))
-
-        register_q4(f"{opfx}.ffn_gate", hf_tensors.get(f"{pfx}.mlp.gate_proj.weight"))
-        register_q4(f"{opfx}.ffn_up", hf_tensors.get(f"{pfx}.mlp.up_proj.weight"))
-        register_q4(f"{opfx}.ffn_down", hf_tensors.get(f"{pfx}.mlp.down_proj.weight"))
-
-    gpu_shards = writer.finalize()
-    shards_meta = [
+    extra_opfs_shards = [
         {
             "id": "embd",
             "file": "embd.ignis",
-            "bytes": len(embd_bytes),
-            "payload_bytes": len(embd_raw),
+            "bytes": PAYLOAD_OFFSET + embd_payload_bytes,
+            "payload_bytes": embd_payload_bytes,
             "sha256": embd_sha,
-        },
-        *gpu_shards,
+        }
     ]
+
+    # Optional Gemma 4 Per-Layer Embeddings (PLE) -> ple_embd.ignis (0 MiB VRAM!)
+    if blueprint["has_ple"]:
+        ple_key = f"{tp}embed_tokens_per_layer.weight"
+        ple_shape = hf_tensors.get_shape(ple_key)
+        ple_path = out_dir / "ple_embd.ignis"
+        ple_stride, ple_payload_bytes, ple_sha, cos_ple = stream_write_int8_row_shard(
+            hf_tensors.get_slice(ple_key), ple_shape[0], ple_shape[1], ple_path, shard_id=0xFFFFFFFE, verify=verify
+        )
+        if verify:
+            quant_errors.append(("token_embd_ple", cos_ple))
+        tensors_meta["token_embd_ple"] = {
+            "shard": "ple_embd",
+            "offset": PAYLOAD_OFFSET,
+            "bytes": ple_payload_bytes,
+            "shape": ple_shape,
+            "row_stride": ple_stride,
+            "dtype": "i8_row",
+        }
+        extra_opfs_shards.append({
+            "id": "ple_embd",
+            "file": "ple_embd.ignis",
+            "bytes": PAYLOAD_OFFSET + ple_payload_bytes,
+            "payload_bytes": ple_payload_bytes,
+            "sha256": ple_sha,
+        })
+        register_body("ple_model_proj", hf_tensors.get(f"{tp}per_layer_model_projection.weight"))
+        register_f32("ple_proj_norm", hf_tensors.get(f"{tp}per_layer_projection_norm.weight"))
+
+    # 2. LM Head (either explicit or tied to embedding)
+    lm_head_key = embd_key if blueprint["tie_word_embeddings"] or "lm_head.weight" not in hf_tensors else "lm_head.weight"
+    lm_head_shape = hf_tensors.get_shape(lm_head_key)
+    lm_head_slice = hf_tensors.get_slice(lm_head_key)
+    if lm_head_dtype == "int8":
+        register_q8("output", lm_head_slice, lm_head_shape)
+    elif lm_head_dtype == "int4":
+        register_q4("output", lm_head_slice, lm_head_shape)
+    elif lm_head_dtype == "int3":
+        register_q3("output", lm_head_slice, lm_head_shape)
+    else:
+        raise ValueError(f"Unsupported lm_head_dtype: {lm_head_dtype}")
+
+    final_norm_key = f"{tp}embedding_norm.weight" if f"{tp}embedding_norm.weight" in hf_tensors else f"{tp}norm.weight"
+    register_f32("output_norm", hf_tensors.get(final_norm_key))
+
+    # 3. Transformer / Hybrid Layers
+    is_lfm = arch in ("lfm3", "lfm2") or blueprint["top_model_type"] == "lfm3_omni"
+    is_gemma4 = arch in ("gemma4", "gemma4_text") or blueprint["top_model_type"] == "gemma4"
+
+    for i in range(blueprint["num_layers"]):
+        pfx = f"{tp}layers.{i}"
+        opfx = f"blk.{i}"
+        lt = blueprint["layer_types"][i]
+
+        if is_lfm:
+            register_f32(f"{opfx}.attn_norm", hf_tensors.get(f"{pfx}.operator_norm.weight"))
+            register_f32(f"{opfx}.ffn_norm", hf_tensors.get(f"{pfx}.ffn_norm.weight"))
+            if blueprint["use_sandwich_norm"]:
+                register_f32(f"{opfx}.post_attn_norm", hf_tensors.get(f"{pfx}.post_operator_norm.weight"))
+                register_f32(f"{opfx}.post_ffn_norm", hf_tensors.get(f"{pfx}.post_ffn_norm.weight"))
+
+            if lt == "conv":
+                register_body(f"{opfx}.conv_in_proj", hf_tensors.get(f"{pfx}.conv.in_proj.weight"))
+                conv_w = hf_tensors.get(f"{pfx}.conv.conv.weight")
+                register_f32(f"{opfx}.conv_kernel", conv_w.reshape(conv_w.shape[0], -1))
+                register_body(f"{opfx}.conv_out_proj", hf_tensors.get(f"{pfx}.conv.out_proj.weight"))
+            else:
+                qkv_w = np.concatenate([
+                    hf_tensors.get(f"{pfx}.self_attn.q_proj.weight"),
+                    hf_tensors.get(f"{pfx}.self_attn.k_proj.weight"),
+                    hf_tensors.get(f"{pfx}.self_attn.v_proj.weight"),
+                ], axis=0)
+                register_body(f"{opfx}.attn_qkv", qkv_w)
+                register_body(f"{opfx}.attn_output", hf_tensors.get(f"{pfx}.self_attn.o_proj.weight"))
+                register_f32(f"{opfx}.q_norm", hf_tensors.get(f"{pfx}.self_attn.q_norm.weight"))
+                register_f32(f"{opfx}.k_norm", hf_tensors.get(f"{pfx}.self_attn.k_norm.weight"))
+                register_f32(f"{opfx}.attn_gate", hf_tensors.get(f"{pfx}.self_attn.gate_proj.weight"))
+
+            register_body(f"{opfx}.ffn_gate", hf_tensors.get(f"{pfx}.feed_forward.w1.weight"))
+            register_body(f"{opfx}.ffn_up", hf_tensors.get(f"{pfx}.feed_forward.w3.weight"))
+            register_body(f"{opfx}.ffn_down", hf_tensors.get(f"{pfx}.feed_forward.w2.weight"))
+
+        elif is_gemma4:
+            if f"{pfx}.layer_scalar" in hf_tensors:
+                blueprint["layer_scalars"][i] = float(hf_tensors.get(f"{pfx}.layer_scalar").reshape(-1)[0])
+            register_f32(f"{opfx}.attn_norm", hf_tensors.get(f"{pfx}.input_layernorm.weight"))
+            register_f32(f"{opfx}.post_attn_norm", hf_tensors.get(f"{pfx}.post_attention_layernorm.weight"))
+            register_f32(f"{opfx}.ffn_norm", hf_tensors.get(f"{pfx}.pre_feedforward_layernorm.weight"))
+            register_f32(f"{opfx}.post_ffn_norm", hf_tensors.get(f"{pfx}.post_feedforward_layernorm.weight"))
+
+            is_reuse = blueprint["kv_source_layers"][i] != i
+            q_w = hf_tensors.get(f"{pfx}.self_attn.q_proj.weight")
+            register_f32(f"{opfx}.q_norm", hf_tensors.get(f"{pfx}.self_attn.q_norm.weight"))
+            if is_reuse:
+                register_body(f"{opfx}.attn_qkv", q_w)
+            else:
+                k_w = hf_tensors.get(f"{pfx}.self_attn.k_proj.weight")
+                v_w = hf_tensors.get(f"{pfx}.self_attn.v_proj.weight") if f"{pfx}.self_attn.v_proj.weight" in hf_tensors else k_w
+                register_body(f"{opfx}.attn_qkv", np.concatenate([q_w, k_w, v_w], axis=0))
+                register_f32(f"{opfx}.k_norm", hf_tensors.get(f"{pfx}.self_attn.k_norm.weight"))
+            register_body(f"{opfx}.attn_output", hf_tensors.get(f"{pfx}.self_attn.o_proj.weight"))
+
+            register_body(f"{opfx}.ffn_gate", hf_tensors.get(f"{pfx}.mlp.gate_proj.weight"))
+            register_body(f"{opfx}.ffn_up", hf_tensors.get(f"{pfx}.mlp.up_proj.weight"))
+            register_body(f"{opfx}.ffn_down", hf_tensors.get(f"{pfx}.mlp.down_proj.weight"))
+
+            if blueprint["has_ple"]:
+                register_body(f"{opfx}.ple_gate", hf_tensors.get(f"{pfx}.per_layer_input_gate.weight"))
+                register_body(f"{opfx}.ple_proj", hf_tensors.get(f"{pfx}.per_layer_projection.weight"))
+                register_f32(f"{opfx}.post_ple_norm", hf_tensors.get(f"{pfx}.post_per_layer_input_norm.weight"))
+
+        else:
+            # Spark2_5 / Llama / Qwen2 / Qwen3 / Phi3
+            register_f32(f"{opfx}.attn_norm", hf_tensors.get(f"{pfx}.input_layernorm.weight"))
+            register_f32(f"{opfx}.ffn_norm", hf_tensors.get(f"{pfx}.post_attention_layernorm.weight"))
+
+            if f"{pfx}.self_attn.q_k_v_proj.weight" in hf_tensors:
+                qkv_w = hf_tensors.get(f"{pfx}.self_attn.q_k_v_proj.weight")
+            elif f"{pfx}.self_attn.qkv_proj.weight" in hf_tensors:
+                qkv_w = hf_tensors.get(f"{pfx}.self_attn.qkv_proj.weight")
+            else:
+                qkv_w = np.concatenate([
+                    hf_tensors.get(f"{pfx}.self_attn.q_proj.weight"),
+                    hf_tensors.get(f"{pfx}.self_attn.k_proj.weight"),
+                    hf_tensors.get(f"{pfx}.self_attn.v_proj.weight"),
+                ], axis=0)
+            register_body(f"{opfx}.attn_qkv", qkv_w)
+
+            if f"{pfx}.self_attn.q_proj.bias" in hf_tensors:
+                blueprint["has_qkv_bias"] = True
+                qkv_b = np.concatenate([
+                    hf_tensors.get(f"{pfx}.self_attn.q_proj.bias"),
+                    hf_tensors.get(f"{pfx}.self_attn.k_proj.bias"),
+                    hf_tensors.get(f"{pfx}.self_attn.v_proj.bias"),
+                ], axis=0)
+                register_f32(f"{opfx}.attn_qkv_bias", qkv_b)
+
+            if blueprint["has_qk_norm"] or f"{pfx}.self_attn.q_norm.weight" in hf_tensors:
+                blueprint["has_qk_norm"] = True
+                register_f32(f"{opfx}.q_norm", hf_tensors.get(f"{pfx}.self_attn.q_norm.weight"))
+                register_f32(f"{opfx}.k_norm", hf_tensors.get(f"{pfx}.self_attn.k_norm.weight"))
+
+            o_key = f"{pfx}.self_attn.out_proj.weight" if f"{pfx}.self_attn.out_proj.weight" in hf_tensors else f"{pfx}.self_attn.o_proj.weight"
+            register_body(f"{opfx}.attn_output", hf_tensors.get(o_key))
+
+            if blueprint["has_attn_gate"]:
+                register_f32(f"{opfx}.attn_gate", hf_tensors.get(f"{pfx}.self_attn.g_proj.weight"))
+
+            if f"{pfx}.mlp.gate_up_proj.weight" in hf_tensors:
+                gu = hf_tensors.get(f"{pfx}.mlp.gate_up_proj.weight")
+                half = gu.shape[0] // 2
+                register_body(f"{opfx}.ffn_gate", gu[:half])
+                register_body(f"{opfx}.ffn_up", gu[half:])
+            else:
+                register_body(f"{opfx}.ffn_gate", hf_tensors.get(f"{pfx}.mlp.gate_proj.weight"))
+                register_body(f"{opfx}.ffn_up", hf_tensors.get(f"{pfx}.mlp.up_proj.weight"))
+            register_body(f"{opfx}.ffn_down", hf_tensors.get(f"{pfx}.mlp.down_proj.weight"))
+
+    gpu_shards = writer.finalize()
+    shards_meta = [*extra_opfs_shards, *gpu_shards]
 
     # Copy tokenizer.json if present
     tok_src = model_dir / "tokenizer.json"
@@ -320,7 +487,7 @@ def pack_model(
         print(f"[packer verify] checked={len(quant_errors)} tensors | avg_cos={avg_cos:.6f} | min_cos={min_cos:.6f} ({min_name})")
 
     total_gpu_bytes = sum(s["bytes"] for s in gpu_shards)
-    print(f"[packer] wrote {len(gpu_shards)} GPU shard(s) ({total_gpu_bytes / (1024**2):.2f} MiB) + embd.ignis ({len(embd_bytes) / (1024**2):.2f} MiB) -> {out_dir}")
+    print(f"[packer] wrote {len(gpu_shards)} GPU shard(s) ({total_gpu_bytes / (1024**2):.2f} MiB) + embd.ignis ({(PAYLOAD_OFFSET + embd_payload_bytes) / (1024**2):.2f} MiB) -> {out_dir}")
     return manifest
 
 
@@ -329,10 +496,20 @@ def main() -> None:
     parser.add_argument("--input", type=Path, required=True, help="HF model directory containing config.json & *.safetensors")
     parser.add_argument("--output", type=Path, required=True, help="Output directory for .ignis package")
     parser.add_argument("--max-shard-mb", type=int, default=512, help="Max GPU shard size in MiB")
-    parser.add_argument("--lm-head-dtype", choices=["int4", "int8"], default="int4", help="Quantization dtype for LM head")
+    parser.add_argument("--lm-head-dtype", choices=["int4", "int8", "int3"], default="int4", help="Quantization dtype for LM head")
+    parser.add_argument("--weight-bits", type=int, choices=[4, 3], default=4, help="Quantization bit-width for transformer body weights")
+    parser.add_argument("--no-multimodal", action="store_true", help="Skip packing vision/audio components")
     parser.add_argument("--no-verify", action="store_true", help="Skip dequantization cosine verification")
     args = parser.parse_args()
-    pack_model(args.input, args.output, max_shard_mb=args.max_shard_mb, verify=not args.no_verify, lm_head_dtype=args.lm_head_dtype)
+    pack_model(
+        args.input,
+        args.output,
+        max_shard_mb=args.max_shard_mb,
+        verify=not args.no_verify,
+        lm_head_dtype=args.lm_head_dtype,
+        weight_bits=args.weight_bits,
+        pack_multimodal=not args.no_multimodal,
+    )
 
 
 if __name__ == "__main__":

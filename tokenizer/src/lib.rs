@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::slice;
 
 use fancy_regex::Regex;
@@ -8,8 +9,40 @@ use serde::Deserialize;
 struct TokenizerJson {
     #[serde(default)]
     added_tokens: Vec<AddedTokenJson>,
+    normalizer: Option<NormalizerJson>,
     pre_tokenizer: Option<PreTokenizerJson>,
+    decoder: Option<DecoderJson>,
     model: ModelJson,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum NormalizerJson {
+    Sequence {
+        normalizers: Vec<NormalizerJson>,
+    },
+    Replace {
+        pattern: PatternJson,
+        content: String,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum DecoderJson {
+    Sequence {
+        decoders: Vec<DecoderJson>,
+    },
+    Replace {
+        pattern: PatternJson,
+        content: String,
+    },
+    ByteFallback {},
+    ByteLevel {},
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Deserialize)]
@@ -72,11 +105,20 @@ enum MergeEntry {
 struct ModelJson {
     vocab: HashMap<String, u32>,
     merges: Vec<MergeEntry>,
+    #[serde(default)]
+    byte_fallback: bool,
+    #[serde(default)]
+    unk_token: Option<String>,
+}
+
+enum NormStep {
+    ReplaceLiteral { from: String, to: String },
+    ReplaceRegex { regex: Regex, to: String },
 }
 
 enum PreStep {
     SplitRegex { regex: Regex, #[allow(dead_code)] invert: bool },
-    SplitLiteral { literal: String, #[allow(dead_code)] invert: bool },
+    SplitLiteral { literal: String, behavior: String, #[allow(dead_code)] invert: bool },
     IndividualDigits,
     ByteLevel { add_prefix_space: bool, use_regex: bool },
 }
@@ -95,10 +137,18 @@ pub struct Tokenizer {
     byte_to_char: [char; 256],
     byte_tok_ids: [u32; 256],
     char_to_byte: HashMap<char, u8>,
+    single_char_ids: HashMap<char, u32>,
+    sp_byte_fallback_ids: [u32; 256],
+    sp_byte_rev: HashMap<u32, u8>,
+    unk_id: u32,
+    byte_fallback: bool,
+    use_byte_level: bool,
     merges: HashMap<(u32, u32), (u32, u32)>, // (a, b) -> (rank, merged_id)
     added_tokens: Vec<AddedTokenEntry>,
     added_set: HashMap<u32, (String, bool)>,
+    norm_steps: Vec<NormStep>,
     pre_steps: Vec<PreStep>,
+    dec_replaces: Vec<(String, String)>,
     gpt2_default_re: Option<Regex>,
 }
 
@@ -126,21 +176,63 @@ fn build_byte_tables() -> ([char; 256], HashMap<char, u8>) {
     (b2c, c2b)
 }
 
-fn compile_pre_steps(pt: &PreTokenizerJson, out: &mut Vec<PreStep>) -> Result<(), String> {
+fn compile_norm_steps(n: &NormalizerJson, out: &mut Vec<NormStep>) {
+    match n {
+        NormalizerJson::Sequence { normalizers } => {
+            for item in normalizers {
+                compile_norm_steps(item, out);
+            }
+        }
+        NormalizerJson::Replace { pattern, content } => match pattern {
+            PatternJson::String { literal } => {
+                out.push(NormStep::ReplaceLiteral { from: literal.clone(), to: content.clone() });
+            }
+            PatternJson::Regex { regex } => {
+                if let Ok(re) = Regex::new(regex) {
+                    out.push(NormStep::ReplaceRegex { regex: re, to: content.clone() });
+                }
+            }
+        },
+        NormalizerJson::Unknown => {}
+    }
+}
+
+fn inspect_decoder(d: &DecoderJson, replaces: &mut Vec<(String, String)>, has_byte_level: &mut bool) {
+    match d {
+        DecoderJson::Sequence { decoders } => {
+            for item in decoders {
+                inspect_decoder(item, replaces, has_byte_level);
+            }
+        }
+        DecoderJson::Replace { pattern, content } => {
+            if let PatternJson::String { literal } = pattern {
+                replaces.push((literal.clone(), content.clone()));
+            }
+        }
+        DecoderJson::ByteLevel {} => *has_byte_level = true,
+        DecoderJson::ByteFallback {} | DecoderJson::Unknown => {}
+    }
+}
+
+fn compile_pre_steps(pt: &PreTokenizerJson, out: &mut Vec<PreStep>, has_byte_level: &mut bool) -> Result<(), String> {
     match pt {
         PreTokenizerJson::Sequence { pretokenizers } => {
             for p in pretokenizers {
-                compile_pre_steps(p, out)?;
+                compile_pre_steps(p, out, has_byte_level)?;
             }
         }
-        PreTokenizerJson::Split { pattern, behavior: _, invert } => {
+        PreTokenizerJson::Split { pattern, behavior, invert } => {
             match pattern {
                 PatternJson::Regex { regex } => {
                     let re = Regex::new(regex).map_err(|e| format!("Regex compile error ({regex}): {e}"))?;
                     out.push(PreStep::SplitRegex { regex: re, invert: *invert });
                 }
                 PatternJson::String { literal } => {
-                    out.push(PreStep::SplitLiteral { literal: literal.clone(), invert: *invert });
+                    out.push(PreStep::SplitLiteral {
+                        literal: literal.clone(),
+                        behavior: behavior.clone(),
+                        invert: *invert,
+                    });
                 }
             }
         }
@@ -150,6 +242,7 @@ fn compile_pre_steps(pt: &PreTokenizerJson, out: &mut Vec<PreStep>) -> Result<()
             }
         }
         PreTokenizerJson::ByteLevel { add_prefix_space, use_regex } => {
+            *has_byte_level = true;
             out.push(PreStep::ByteLevel {
                 add_prefix_space: *add_prefix_space,
                 use_regex: *use_regex,
@@ -196,12 +289,34 @@ impl Tokenizer {
         // Longest match first
         added_tokens.sort_by(|a, b| b.content.len().cmp(&a.content.len()));
 
+        let unk_id = parsed
+            .model
+            .unk_token
+            .as_ref()
+            .and_then(|u| parsed.model.vocab.get(u).copied())
+            .unwrap_or(0);
+
+        let mut single_char_ids = HashMap::new();
+        for (tok, &id) in &parsed.model.vocab {
+            let mut it = tok.chars();
+            if let (Some(ch), None) = (it.next(), it.next()) {
+                single_char_ids.insert(ch, id);
+            }
+        }
+
         let mut byte_tok_ids = [0u32; 256];
+        let mut sp_byte_fallback_ids = [unk_id; 256];
+        let mut sp_byte_rev = HashMap::new();
         for b in 0..256 {
             let mut s = String::new();
             s.push(byte_to_char[b]);
             if let Some(&id) = parsed.model.vocab.get(&s) {
                 byte_tok_ids[b] = id;
+            }
+            let hex_tok = format!("<0x{:02X}>", b);
+            if let Some(&id) = parsed.model.vocab.get(&hex_tok) {
+                sp_byte_fallback_ids[b] = id;
+                sp_byte_rev.insert(id, b as u8);
             }
         }
 
@@ -226,10 +341,24 @@ impl Tokenizer {
             }
         }
 
-        let mut pre_steps = Vec::new();
-        if let Some(pt) = &parsed.pre_tokenizer {
-            compile_pre_steps(pt, &mut pre_steps)?;
+        let mut norm_steps = Vec::new();
+        if let Some(norm) = &parsed.normalizer {
+            compile_norm_steps(norm, &mut norm_steps);
         }
+
+        let mut pre_steps = Vec::new();
+        let mut pre_has_bl = false;
+        if let Some(pt) = &parsed.pre_tokenizer {
+            compile_pre_steps(pt, &mut pre_steps, &mut pre_has_bl)?;
+        }
+
+        let mut dec_replaces = Vec::new();
+        let mut dec_has_bl = false;
+        if let Some(dec) = &parsed.decoder {
+            inspect_decoder(dec, &mut dec_replaces, &mut dec_has_bl);
+        }
+
+        let use_byte_level = pre_has_bl || (!parsed.model.byte_fallback && dec_has_bl) || (!parsed.model.byte_fallback && dec_replaces.is_empty());
 
         let gpt2_default_re = Regex::new(
             r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
@@ -240,10 +369,18 @@ impl Tokenizer {
             byte_to_char,
             byte_tok_ids,
             char_to_byte,
+            single_char_ids,
+            sp_byte_fallback_ids,
+            sp_byte_rev,
+            unk_id,
+            byte_fallback: parsed.model.byte_fallback,
+            use_byte_level,
             merges,
             added_tokens,
             added_set,
+            norm_steps,
             pre_steps,
+            dec_replaces,
             gpt2_default_re,
         })
     }
@@ -278,8 +415,28 @@ impl Tokenizer {
         }
     }
 
+    fn normalize(&self, text: &str) -> String {
+        if self.norm_steps.is_empty() {
+            return text.to_string();
+        }
+        let mut cur = text.to_string();
+        for step in &self.norm_steps {
+            match step {
+                NormStep::ReplaceLiteral { from, to } => {
+                    if !from.is_empty() && cur.contains(from.as_str()) {
+                        cur = cur.replace(from.as_str(), to.as_str());
+                    }
+                }
+                NormStep::ReplaceRegex { regex, to } => {
+                    cur = regex.replace_all(&cur, to.as_str()).into_owned();
+                }
+            }
+        }
+        cur
+    }
+
     fn pretokenize(&self, text: &str) -> Vec<String> {
-        let mut pieces = vec![text.to_string()];
+        let mut pieces = vec![self.normalize(text)];
         for step in &self.pre_steps {
             let mut next = Vec::with_capacity(pieces.len() * 2);
             match step {
@@ -288,18 +445,27 @@ impl Tokenizer {
                         Self::apply_regex_isolated(regex, p, &mut next);
                     }
                 }
-                PreStep::SplitLiteral { literal, invert: _ } => {
+                PreStep::SplitLiteral { literal, behavior, invert: _ } => {
                     for p in &pieces {
                         if literal.is_empty() {
                             next.push(p.clone());
                             continue;
                         }
+                        if !p.contains(literal.as_str()) {
+                            next.push(p.clone());
+                            continue;
+                        }
                         let mut last = 0;
+                        let merged_prev = behavior == "MergedWithPrevious";
                         for (idx, _) in p.match_indices(literal.as_str()) {
-                            if idx > last {
-                                next.push(p[last..idx].to_string());
+                            if merged_prev {
+                                next.push(p[last..idx + literal.len()].to_string());
+                            } else {
+                                if idx > last {
+                                    next.push(p[last..idx].to_string());
+                                }
+                                next.push(literal.clone());
                             }
-                            next.push(literal.clone());
                             last = idx + literal.len();
                         }
                         if last < p.len() {
@@ -350,38 +516,121 @@ impl Tokenizer {
     }
 
     fn bpe_encode_piece(&self, piece: &str, out: &mut Vec<u32>) {
-        let bytes = piece.as_bytes();
-        if bytes.is_empty() {
+        if piece.is_empty() {
             return;
         }
-        if bytes.len() == 1 {
-            out.push(self.byte_tok_ids[bytes[0] as usize]);
-            return;
-        }
-        let mut ids: Vec<u32> = bytes.iter().map(|&b| self.byte_tok_ids[b as usize]).collect();
-        loop {
-            if ids.len() < 2 {
-                break;
+        let mut ids: Vec<u32> = if self.use_byte_level {
+            let bytes = piece.as_bytes();
+            if bytes.len() == 1 {
+                out.push(self.byte_tok_ids[bytes[0] as usize]);
+                return;
             }
-            let mut best_rank = u32::MAX;
-            let mut best_idx = 0usize;
-            let mut best_merged = 0u32;
-            for i in 0..(ids.len() - 1) {
-                if let Some(&(rank, merged_id)) = self.merges.get(&(ids[i], ids[i + 1])) {
-                    if rank < best_rank {
-                        best_rank = rank;
-                        best_idx = i;
-                        best_merged = merged_id;
+            bytes.iter().map(|&b| self.byte_tok_ids[b as usize]).collect()
+        } else {
+            let mut v = Vec::with_capacity(piece.chars().count());
+            for ch in piece.chars() {
+                if let Some(&id) = self.single_char_ids.get(&ch) {
+                    v.push(id);
+                } else if self.byte_fallback {
+                    let mut buf = [0u8; 4];
+                    for &b in ch.encode_utf8(&mut buf).as_bytes() {
+                        v.push(self.sp_byte_fallback_ids[b as usize]);
                     }
+                } else {
+                    v.push(self.unk_id);
                 }
             }
-            if best_rank == u32::MAX {
-                break;
-            }
-            ids[best_idx] = best_merged;
-            ids.remove(best_idx + 1);
+            v
+        };
+
+        if ids.len() < 2 {
+            out.extend_from_slice(&ids);
+            return;
         }
-        out.extend_from_slice(&ids);
+        if ids.len() <= 64 {
+            loop {
+                if ids.len() < 2 {
+                    break;
+                }
+                let mut best_rank = u32::MAX;
+                let mut best_idx = 0usize;
+                let mut best_merged = 0u32;
+                for i in 0..(ids.len() - 1) {
+                    if let Some(&(rank, merged_id)) = self.merges.get(&(ids[i], ids[i + 1])) {
+                        if rank < best_rank {
+                            best_rank = rank;
+                            best_idx = i;
+                            best_merged = merged_id;
+                        }
+                    }
+                }
+                if best_rank == u32::MAX {
+                    break;
+                }
+                ids[best_idx] = best_merged;
+                ids.remove(best_idx + 1);
+            }
+            out.extend_from_slice(&ids);
+            return;
+        }
+
+        // O(N log N) linked-list + min-heap BPE for unsplit pieces
+        let n = ids.len();
+        let mut prev: Vec<isize> = (0..n).map(|i| i as isize - 1).collect();
+        let mut next: Vec<isize> = (0..n).map(|i| if i + 1 < n { (i + 1) as isize } else { -1 }).collect();
+        let mut alive = vec![true; n];
+        let mut gen = vec![0u32; n];
+        let mut heap: BinaryHeap<Reverse<(u32, usize, u32, u32)>> = BinaryHeap::with_capacity(n);
+
+        for i in 0..(n - 1) {
+            if let Some(&(rank, _)) = self.merges.get(&(ids[i], ids[i + 1])) {
+                heap.push(Reverse((rank, i, 0, 0)));
+            }
+        }
+        while let Some(Reverse((_, li, lg, rg))) = heap.pop() {
+            if !alive[li] || gen[li] != lg {
+                continue;
+            }
+            let ri = next[li];
+            if ri < 0 {
+                continue;
+            }
+            let ri = ri as usize;
+            if !alive[ri] || gen[ri] != rg {
+                continue;
+            }
+            let Some(&(_, merged_id)) = self.merges.get(&(ids[li], ids[ri])) else {
+                continue;
+            };
+            ids[li] = merged_id;
+            gen[li] += 1;
+            alive[ri] = false;
+            let nri = next[ri];
+            next[li] = nri;
+            if nri >= 0 {
+                prev[nri as usize] = li as isize;
+            }
+            if prev[li] >= 0 {
+                let pi = prev[li] as usize;
+                if let Some(&(r, _)) = self.merges.get(&(ids[pi], ids[li])) {
+                    heap.push(Reverse((r, pi, gen[pi], gen[li])));
+                }
+            }
+            if next[li] >= 0 {
+                let ni = next[li] as usize;
+                if let Some(&(r, _)) = self.merges.get(&(ids[li], ids[ni])) {
+                    heap.push(Reverse((r, li, gen[li], gen[ni])));
+                }
+            }
+        }
+        let mut cur = 0isize;
+        while cur >= 0 {
+            let idx = cur as usize;
+            if alive[idx] {
+                out.push(ids[idx]);
+            }
+            cur = next[idx];
+        }
     }
 
     pub fn encode(&self, text: &str) -> Vec<u32> {
@@ -457,6 +706,28 @@ impl Tokenizer {
             if let Some((s, is_special)) = self.added_set.get(&id) {
                 if !skip_special || !*is_special {
                     raw_bytes.extend_from_slice(s.as_bytes());
+                }
+                continue;
+            }
+            if !self.use_byte_level {
+                if self.byte_fallback {
+                    if let Some(&b) = self.sp_byte_rev.get(&id) {
+                        raw_bytes.push(b);
+                        continue;
+                    }
+                }
+                if let Some(tok) = self.id_to_token.get(id as usize) {
+                    if self.dec_replaces.is_empty() {
+                        raw_bytes.extend_from_slice(tok.as_bytes());
+                    } else {
+                        let mut s = tok.clone();
+                        for (from, to) in &self.dec_replaces {
+                            if !from.is_empty() && s.contains(from.as_str()) {
+                                s = s.replace(from.as_str(), to.as_str());
+                            }
+                        }
+                        raw_bytes.extend_from_slice(s.as_bytes());
+                    }
                 }
                 continue;
             }

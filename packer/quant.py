@@ -165,3 +165,143 @@ def dequantize_int8_g64_sym(quants_u32: np.ndarray, scales_u32: np.ndarray, orig
     if orig_k is not None and orig_k < k_pad:
         w = w[:, :orig_k]
     return w
+
+
+def quantize_int3_g64_asym(weight: np.ndarray) -> tuple[np.ndarray, np.ndarray, tuple[int, int]]:
+    """
+    Quantize a 2D float weight [M, K] into INT3_G64_ASYM (packed 32x3-bit = 3 uint32 words).
+    Returns:
+      quants_u32: uint32 array of shape [M, (K_pad // 32) * 3]
+      scales_u32: uint32 array of shape [M, K_pad // 64] (f16 scale low16, f16 min high16)
+      padded_shape: (M, K_pad)
+    """
+    if weight.ndim != 2:
+        raise ValueError(f"Expected 2D weight, got shape {weight.shape}")
+    w = np.asarray(weight, dtype=np.float32)
+    m, k = w.shape
+    k_pad = align_up(k, 64)
+    if k_pad != k:
+        w = np.pad(w, ((0, 0), (0, k_pad - k)), mode="constant", constant_values=0.0)
+
+    groups = k_pad // 64
+    wg = w.reshape(m, groups, 64)
+
+    w_min = wg.min(axis=-1)
+    w_max = wg.max(axis=-1)
+    span = w_max - w_min
+
+    scale_f16 = np.where(span > 0.0, span / 7.0, 0.0).astype(np.float16)
+    min_f16 = w_min.astype(np.float16)
+
+    scale_f32 = scale_f16.astype(np.float32)[..., None]
+    min_f32 = min_f16.astype(np.float32)[..., None]
+
+    inv_scale = np.where(scale_f32 > 0.0, 1.0 / scale_f32, 0.0)
+    q = np.clip(np.round((wg - min_f32) * inv_scale), 0, 7).astype(np.uint32)
+
+    chunks = k_pad // 32
+    qc = q.reshape(m, chunks, 32)
+    w0 = np.zeros((m, chunks), dtype=np.uint32)
+    w1 = np.zeros((m, chunks), dtype=np.uint32)
+    w2 = np.zeros((m, chunks), dtype=np.uint32)
+
+    for i in range(10):
+        w0 |= qc[:, :, i] << (3 * i)
+    w0 |= (qc[:, :, 10] & 0x3) << 30
+    w1 |= (qc[:, :, 10] >> 2) & 0x1
+    for i in range(11, 21):
+        w1 |= qc[:, :, i] << (3 * i - 32)
+    w1 |= (qc[:, :, 21] & 0x1) << 31
+    w2 |= (qc[:, :, 21] >> 1) & 0x3
+    for i in range(22, 32):
+        w2 |= qc[:, :, i] << (3 * i - 64)
+
+    quants_u32 = np.stack([w0, w1, w2], axis=-1).reshape(m, chunks * 3)
+
+    scale_bits = scale_f16.view(np.uint16).astype(np.uint32)
+    min_bits = min_f16.view(np.uint16).astype(np.uint32)
+    scales_u32 = (scale_bits | (min_bits << 16)).astype(np.uint32)
+
+    return np.ascontiguousarray(quants_u32), np.ascontiguousarray(scales_u32), (m, k_pad)
+
+
+def dequantize_int3_g64_asym(quants_u32: np.ndarray, scales_u32: np.ndarray, orig_k: int | None = None) -> np.ndarray:
+    """Dequantize INT3_G64_ASYM back to float32 for verification."""
+    m, words = quants_u32.shape
+    chunks = words // 3
+    k_pad = chunks * 32
+    groups = k_pad // 64
+
+    qw = quants_u32.reshape(m, chunks, 3)
+    w0, w1, w2 = qw[:, :, 0], qw[:, :, 1], qw[:, :, 2]
+
+    qc = np.zeros((m, chunks, 32), dtype=np.uint32)
+    for i in range(10):
+        qc[:, :, i] = (w0 >> (3 * i)) & 0x7
+    qc[:, :, 10] = ((w0 >> 30) & 0x3) | ((w1 & 0x1) << 2)
+    for i in range(11, 21):
+        qc[:, :, i] = (w1 >> (3 * i - 32)) & 0x7
+    qc[:, :, 21] = ((w1 >> 31) & 0x1) | ((w2 & 0x3) << 1)
+    for i in range(22, 32):
+        qc[:, :, i] = (w2 >> (3 * i - 64)) & 0x7
+
+    q = qc.reshape(m, groups, 64).astype(np.float32)
+    scale_bits = (scales_u32 & 0xFFFF).astype(np.uint16)
+    min_bits = ((scales_u32 >> 16) & 0xFFFF).astype(np.uint16)
+    scale = scale_bits.view(np.float16).astype(np.float32)[..., None]
+    min_val = min_bits.view(np.float16).astype(np.float32)[..., None]
+
+    w = (q * scale + min_val).reshape(m, k_pad)
+    if orig_k is not None and orig_k < k_pad:
+        w = w[:, :orig_k]
+    return w
+
+
+def stream_write_int8_row_shard(
+    tensor_slice,
+    vocab: int,
+    dim: int,
+    out_path,
+    shard_id: int = 0xFFFFFFFF,
+    chunk_rows: int = 8192,
+    verify: bool = True,
+) -> tuple[int, int, str, float]:
+    """Stream-quantize a huge 2D embedding slice [vocab, dim] into an OPFS .ignis shard without high RAM."""
+    import hashlib
+    row_stride = align_up(4 + dim, 16)
+    payload_bytes = vocab * row_stride
+    header = make_shard_header(shard_id, payload_bytes)
+    sha = hashlib.sha256()
+    sha.update(header)
+
+    dot = 0.0
+    n_orig = 0.0
+    n_deq = 0.0
+
+    with open(out_path, "wb") as f:
+        f.write(header)
+        for start in range(0, vocab, chunk_rows):
+            end = min(vocab, start + chunk_rows)
+            raw_t = tensor_slice[start:end]
+            w = raw_t.float().numpy() if hasattr(raw_t, "float") else np.asarray(raw_t, dtype=np.float32)
+            rows = end - start
+            max_abs = np.max(np.abs(w), axis=-1)
+            scales = np.where(max_abs > 0.0, max_abs / 127.0, 0.0).astype(np.float32)
+            inv_scales = np.where(scales > 0.0, 1.0 / scales, 0.0)[:, None]
+            q = np.clip(np.round(w * inv_scales), -127, 127).astype(np.int8)
+
+            buf = np.zeros((rows, row_stride), dtype=np.uint8)
+            buf[:, :4] = scales.view(np.uint8).reshape(rows, 4)
+            buf[:, 4 : 4 + dim] = q.view(np.uint8)
+            chunk_bytes = buf.tobytes()
+            f.write(chunk_bytes)
+            sha.update(chunk_bytes)
+
+            if verify:
+                deq = q.astype(np.float32) * scales[:, None]
+                dot += float(np.sum(w * deq))
+                n_orig += float(np.sum(w * w))
+                n_deq += float(np.sum(deq * deq))
+
+    cos = dot / ((n_orig ** 0.5) * (n_deq ** 0.5) + 1e-12) if verify else 1.0
+    return row_stride, payload_bytes, sha.hexdigest(), cos
