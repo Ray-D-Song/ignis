@@ -226,3 +226,84 @@ export function computeVisionPositionIds(gridH, gridW, mergeSize = 2) {
   }
   return pos;
 }
+
+export function smartResizeGemma4(height, width, {
+  patchSize = 16,
+  maxSoftTokens = 280,
+  poolingKernelSize = 3,
+} = {}) {
+  const maxPatches = maxSoftTokens * poolingKernelSize * poolingKernelSize;
+  const totalPx = height * width;
+  const targetPx = maxPatches * (patchSize * patchSize);
+  const factor = Math.sqrt(targetPx / totalPx);
+  const sideMult = poolingKernelSize * patchSize;
+
+  let targetHeight = Math.floor((factor * height) / sideMult) * sideMult;
+  let targetWidth = Math.floor((factor * width) / sideMult) * sideMult;
+  if (targetHeight === 0 && targetWidth === 0) {
+    throw new Error(`Cannot resize ${height}x${width} for Gemma 4 sideMult=${sideMult}`);
+  }
+  const maxSideLength = Math.floor(maxPatches / (poolingKernelSize * poolingKernelSize)) * sideMult;
+  if (targetHeight === 0) {
+    targetHeight = sideMult;
+    targetWidth = Math.min(Math.floor(width / height) * sideMult, maxSideLength);
+  } else if (targetWidth === 0) {
+    targetWidth = sideMult;
+    targetHeight = Math.min(Math.floor(height / width) * sideMult, maxSideLength);
+  }
+  return { height: targetHeight, width: targetWidth };
+}
+
+/**
+ * Exact port of Gemma4ImageProcessor + Gemma4VisionPatchEmbedder pixel transform `2 * (x/255 - 0.5)`:
+ * Outputs unpadded real patches `[H_p * W_p, 3 * patchSize^2]` in `(py, px, c)` layout and `positionIds` `[x, y]`.
+ */
+export function preprocessGemma4Image(image, {
+  patchSize = 16,
+  maxSoftTokens = 280,
+  poolingKernelSize = 3,
+} = {}) {
+  const { data, width, height, channels = 3 } = image;
+  const resized = smartResizeGemma4(height, width, { patchSize, maxSoftTokens, poolingKernelSize });
+  const rgb255 = resizeRgbBicubic(data, width, height, resized.width, resized.height, channels);
+
+  const W = resized.width;
+  const H = resized.height;
+  const gridH = H / patchSize;
+  const gridW = W / patchSize;
+  const numPatches = gridH * gridW;
+  const patchDim = 3 * patchSize * patchSize;
+  const pixelValues = new Float32Array(numPatches * patchDim);
+  const positionIds = new Int32Array(numPatches * 2);
+  const rescale = 1.0 / 255.0;
+
+  for (let by = 0; by < gridH; by++) {
+    for (let bx = 0; bx < gridW; bx++) {
+      const pIdx = by * gridW + bx;
+      positionIds[pIdx * 2] = bx;
+      positionIds[pIdx * 2 + 1] = by;
+      let dst = pIdx * patchDim;
+      for (let py = 0; py < patchSize; py++) {
+        const y = by * patchSize + py;
+        for (let px = 0; px < patchSize; px++) {
+          const x = bx * patchSize + px;
+          const src = (y * W + x) * 3;
+          pixelValues[dst++] = 2.0 * (rgb255[src] * rescale - 0.5);
+          pixelValues[dst++] = 2.0 * (rgb255[src + 1] * rescale - 0.5);
+          pixelValues[dst++] = 2.0 * (rgb255[src + 2] * rescale - 0.5);
+        }
+      }
+    }
+  }
+
+  return {
+    pixelValues,
+    positionIds,
+    patchH: gridH,
+    patchW: gridW,
+    numPatches,
+    numVisionTokens: numPatches / (poolingKernelSize * poolingKernelSize),
+    resizedHeight: H,
+    resizedWidth: W,
+  };
+}

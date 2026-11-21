@@ -333,7 +333,7 @@ def pack_model(
             "payload_bytes": ple_payload_bytes,
             "sha256": ple_sha,
         })
-        register_body("ple_model_proj", hf_tensors.get(f"{tp}per_layer_model_projection.weight"))
+        register_q8("ple_model_proj", hf_tensors.get(f"{tp}per_layer_model_projection.weight"))
         register_f32("ple_proj_norm", hf_tensors.get(f"{tp}per_layer_projection_norm.weight"))
 
     # 2. LM Head (either explicit or tied to embedding)
@@ -414,8 +414,8 @@ def pack_model(
             register_body(f"{opfx}.ffn_down", hf_tensors.get(f"{pfx}.mlp.down_proj.weight"))
 
             if blueprint["has_ple"]:
-                register_body(f"{opfx}.ple_gate", hf_tensors.get(f"{pfx}.per_layer_input_gate.weight"))
-                register_body(f"{opfx}.ple_proj", hf_tensors.get(f"{pfx}.per_layer_projection.weight"))
+                register_q8(f"{opfx}.ple_gate", hf_tensors.get(f"{pfx}.per_layer_input_gate.weight"))
+                register_q8(f"{opfx}.ple_proj", hf_tensors.get(f"{pfx}.per_layer_projection.weight"))
                 register_f32(f"{opfx}.post_ple_norm", hf_tensors.get(f"{pfx}.post_per_layer_input_norm.weight"))
 
         else:

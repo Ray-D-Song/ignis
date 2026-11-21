@@ -128,6 +128,146 @@ fn glu_silu_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 @compute @workgroup_size(256)
+fn rmsnorm_f32(${sgParams({ useSubgroups })}) {
+  let tok = wid.x;
+  if (tok >= params.b) { return; }
+  let dim = params.a;
+  let base = tok * dim;
+  var sum_sq: f32 = 0.0;
+  for (var i: u32 = lid.x; i < dim; i += 256u) {
+    let v = x[base + i];
+    sum_sq += v * v;
+  }
+${reduceSum('sum_sq', 's_inv_std = inverseSqrt(tot / f32(dim) + params.eps);')}
+  let inv_rms = s_inv_std;
+  for (var i: u32 = lid.x; i < dim; i += 256u) {
+    out[base + i] = x[base + i] * inv_rms * weight[i];
+  }
+}
+
+@compute @workgroup_size(256)
+fn rmsnorm_noscale_f32(${sgParams({ useSubgroups })}) {
+  let tok = wid.x;
+  if (tok >= params.b) { return; }
+  let dim = params.a;
+  let base = tok * dim;
+  var sum_sq: f32 = 0.0;
+  for (var i: u32 = lid.x; i < dim; i += 256u) {
+    let v = x[base + i];
+    sum_sq += v * v;
+  }
+${reduceSum('sum_sq', 's_inv_std = inverseSqrt(tot / f32(dim) + params.eps);')}
+  let inv_rms = s_inv_std;
+  for (var i: u32 = lid.x; i < dim; i += 256u) {
+    out[base + i] = x[base + i] * inv_rms;
+  }
+}
+
+@compute @workgroup_size(256)
+fn layernorm_nobias_f32(${sgParams({ useSubgroups })}) {
+  let tok = wid.x;
+  if (tok >= params.b) { return; }
+  let dim = params.a;
+  let base = tok * dim;
+
+  var sum_x: f32 = 0.0;
+  for (var i: u32 = lid.x; i < dim; i += 256u) {
+    sum_x += x[base + i];
+  }
+${reduceSum('sum_x', 's_mean = tot / f32(dim);')}
+
+  let mean = s_mean;
+  var sum_sq: f32 = 0.0;
+  for (var i: u32 = lid.x; i < dim; i += 256u) {
+    let df = x[base + i] - mean;
+    sum_sq += df * df;
+  }
+${reduceSum('sum_sq', 's_inv_std = inverseSqrt(tot / f32(dim) + params.eps);')}
+
+  let inv_std = s_inv_std;
+  for (var i: u32 = lid.x; i < dim; i += 256u) {
+    out[base + i] = ((x[base + i] - mean) * inv_std) * weight[i];
+  }
+}
+
+@compute @workgroup_size(256)
+fn clamp_f32(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= params.a) { return; }
+  out[i] = clamp(out[i], params.f0, params.f1);
+}
+
+@compute @workgroup_size(256)
+fn copy_clamp_f32(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= params.a) { return; }
+  out[i] = clamp(x[i], params.f0, params.f1);
+}
+
+@compute @workgroup_size(256)
+fn relu_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= params.a) { return; }
+  out[i] = max(out[i], 0.0);
+}
+
+@compute @workgroup_size(256)
+fn silu_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= params.a) { return; }
+  let v = out[i];
+  out[i] = v / (1.0 + exp(-clamp(v, -30.0, 30.0)));
+}
+
+@compute @workgroup_size(256)
+fn gelu_tanh_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= params.a) { return; }
+  let v = out[i];
+  let u = clamp(0.7978845608028654 * (v + 0.044715 * v * v * v), -15.0, 15.0);
+  out[i] = 0.5 * v * (1.0 + tanh(u));
+}
+
+@compute @workgroup_size(256)
+fn glu_sigmoid_half(@builtin(global_invocation_id) gid: vec3<u32>) {
+  // x: [T, 2 * D], out: [T, D]; a = D, b = T
+  let idx = gid.x;
+  let D = params.a;
+  let total = D * params.b;
+  if (idx >= total) { return; }
+  let t = idx / D;
+  let d = idx % D;
+  let in_base = t * (2u * D);
+  let v0 = x[in_base + d];
+  let v1 = x[in_base + D + d];
+  out[idx] = v0 / (1.0 + exp(-clamp(v1, -30.0, 30.0)));
+}
+
+@compute @workgroup_size(256)
+fn g4_vision_pool_3x3(@builtin(global_invocation_id) gid: vec3<u32>) {
+  // x: [H_p * W_p, D], out: [out_len, D]; a=D, b=W_p, c=k(3), d=out_len, f0=sqrt(D)
+  let idx = gid.x;
+  let D = params.a;
+  let total = params.d * D;
+  if (idx >= total) { return; }
+  let out_tok = idx / D;
+  let dim = idx % D;
+  let k = params.c;
+  let bw = params.b / k;
+  let oy = out_tok / bw;
+  let ox = out_tok % bw;
+  var acc: f32 = 0.0;
+  for (var ky: u32 = 0u; ky < k; ky += 1u) {
+    let py = oy * k + ky;
+    for (var kx: u32 = 0u; kx < k; kx += 1u) {
+      let px = ox * k + kx;
+      acc += x[(py * params.b + px) * D + dim];
+    }
+  }
+  out[idx] = (acc / f32(k * k)) * params.f0;
+}
+
+@compute @workgroup_size(256)
 fn add_bias_f32(@builtin(global_invocation_id) gid: vec3<u32>) {
   // out[t * M + m] += bias[m]; a = M, b = T
   let idx = gid.x;
@@ -387,7 +527,7 @@ export function buildFlexRopeWgsl() {
   q_heads: u32,
   kv_heads: u32,
   head_dim: u32,
-  rope_mode: u32, // 0=none, 1=1D, 2=2D axial (spatial_dim=head_dim/2)
+  rope_mode: u32, // 0=none, 1=1D, 2=2D axial, 3=Gemma4 H-H-W-W 2D RoPE
   theta: f32,
   _pad0: u32,
   _pad1: u32,
@@ -400,13 +540,23 @@ export function buildFlexRopeWgsl() {
 @group(0) @binding(4) var<storage, read_write> k_rot: array<f32>;
 
 fn rot_angle(tok: u32, d: u32) -> vec2<f32> {
-  // Returns (cos, sin) and mate_sign implicitly via caller
   let hd = params.head_dim;
   let half_hd = hd >> 1u;
   if (params.rope_mode == 1u) {
     let pair = d % half_hd;
     let inv_freq = pow(params.theta, -f32(pair * 2u) / f32(hd));
     let ang = f32(tok) * inv_freq;
+    return vec2<f32>(cos(ang), sin(ang));
+  }
+  if (params.rope_mode == 3u) {
+    // Gemma 4 Vision: H-H-W-W split into [0..half_hd) and [half_hd..hd)
+    let sub_half = half_hd >> 1u;
+    let seg = d / half_hd;
+    let within = d % half_hd;
+    let pair = within % sub_half;
+    let coord = f32(pos_hw[tok * 2u + seg]);
+    let inv_freq = pow(params.theta, -f32(pair * 2u) / f32(half_hd));
+    let ang = coord * inv_freq;
     return vec2<f32>(cos(ang), sin(ang));
   }
   // 2D axial: spatial_dim = half_hd; freq_h[0..qhd-1], freq_w[0..qhd-1]
@@ -420,6 +570,23 @@ fn rot_angle(tok: u32, d: u32) -> vec2<f32> {
   return vec2<f32>(cos(ang), sin(ang));
 }
 
+fn rotate_elem(tok: u32, d: u32, val: f32, mate_pos_base: u32) -> f32 {
+  let cs = rot_angle(tok, d);
+  let half_hd = params.head_dim >> 1u;
+  if (params.rope_mode == 3u) {
+    let sub_half = half_hd >> 1u;
+    let within = d % half_hd;
+    let is_hi = within >= sub_half;
+    let mate_d = select(d + sub_half, d - sub_half, is_hi);
+    let mate = qkv[mate_pos_base + mate_d];
+    return select(val * cs.x - mate * cs.y, val * cs.x + mate * cs.y, is_hi);
+  }
+  let is_hi = d >= half_hd;
+  let mate_d = select(d + half_hd, d - half_hd, is_hi);
+  let mate = qkv[mate_pos_base + mate_d];
+  return select(val * cs.x - mate * cs.y, val * cs.x + mate * cs.y, is_hi);
+}
+
 @compute @workgroup_size(128)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let q_dim = params.q_heads * params.head_dim;
@@ -429,7 +596,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let idx = gid.x;
   if (tok >= params.T) { return; }
 
-  let half_hd = params.head_dim >> 1u;
   let qkv_base = tok * total_qkv;
 
   if (idx < q_dim) {
@@ -437,11 +603,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let d = idx % params.head_dim;
     var val = qkv[qkv_base + idx];
     if (params.rope_mode != 0u) {
-      let cs = rot_angle(tok, d);
-      let is_hi = d >= half_hd;
-      let mate_d = select(d + half_hd, d - half_hd, is_hi);
-      let mate = qkv[qkv_base + h * params.head_dim + mate_d];
-      val = select(val * cs.x - mate * cs.y, val * cs.x + mate * cs.y, is_hi);
+      val = rotate_elem(tok, d, val, qkv_base + h * params.head_dim);
     }
     q_rot[tok * q_dim + idx] = val;
   }
@@ -451,11 +613,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let d = idx % params.head_dim;
     var val = qkv[qkv_base + q_dim + idx];
     if (params.rope_mode != 0u) {
-      let cs = rot_angle(tok, d);
-      let is_hi = d >= half_hd;
-      let mate_d = select(d + half_hd, d - half_hd, is_hi);
-      let mate = qkv[qkv_base + q_dim + h * params.head_dim + mate_d];
-      val = select(val * cs.x - mate * cs.y, val * cs.x + mate * cs.y, is_hi);
+      val = rotate_elem(tok, d, val, qkv_base + q_dim + h * params.head_dim);
     }
     k_rot[tok * kv_dim + idx] = val;
   }
@@ -566,6 +724,245 @@ ${redScore}
   }
   if (act0) {
     out[q_off + d0] = (acc0 / l_i) * g_scale;
+  }
+}
+`;
+}
+
+export function buildInterleaveQkvWgsl() {
+  return `struct QkvPackParams {
+  T: u32,
+  q_dim: u32,
+  kv_dim: u32,
+  _pad: u32,
+};
+
+@group(0) @binding(0) var<uniform> params: QkvPackParams;
+@group(0) @binding(1) var<storage, read> q_buf: array<f32>;
+@group(0) @binding(2) var<storage, read> k_buf: array<f32>;
+@group(0) @binding(3) var<storage, read> v_buf: array<f32>;
+@group(0) @binding(4) var<storage, read_write> qkv_out: array<f32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let stride = params.q_dim + 2u * params.kv_dim;
+  let total = params.T * stride;
+  let idx = gid.x;
+  if (idx >= total) { return; }
+  let tok = idx / stride;
+  let off = idx % stride;
+  var val: f32;
+  if (off < params.q_dim) {
+    val = q_buf[tok * params.q_dim + off];
+  } else if (off < params.q_dim + params.kv_dim) {
+    val = k_buf[tok * params.kv_dim + (off - params.q_dim)];
+  } else {
+    val = v_buf[tok * params.kv_dim + (off - params.q_dim - params.kv_dim)];
+  }
+  qkv_out[idx] = val;
+}
+`;
+}
+
+export function buildGemma4PatchPosAddWgsl() {
+  return `struct G4PosParams {
+  T: u32,
+  dim: u32,
+  table_stride: u32, // 10240
+  _pad: u32,
+};
+
+@group(0) @binding(0) var<uniform> params: G4PosParams;
+@group(0) @binding(1) var<storage, read> pos_table_u32: array<u32>;
+@group(0) @binding(2) var<storage, read> pos_hw: array<i32>;
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  let D = params.dim;
+  let total = params.T * D;
+  if (idx >= total) { return; }
+  let t = idx / D;
+  let d = idx % D;
+  let x_id = pos_hw[t * 2u];
+  let y_id = pos_hw[t * 2u + 1u];
+  if (x_id < 0 || y_id < 0) {
+    out[idx] = 0.0;
+    return;
+  }
+  let words_per_row = D >> 1u;
+  let wi = d >> 1u;
+  let row_x = u32(x_id);
+  let row_y = params.table_stride + u32(y_id);
+  let fx = unpack2x16float(pos_table_u32[row_x * words_per_row + wi]);
+  let fy = unpack2x16float(pos_table_u32[row_y * words_per_row + wi]);
+  let is_odd = (d & 1u) != 0u;
+  out[idx] += select(fx.x, fx.y, is_odd) + select(fy.x, fy.y, is_odd);
+}
+`;
+}
+
+export function buildGemma4AudioConvWgsl() {
+  return `struct G4AudioConvParams {
+  t_in: u32,
+  f_in: u32,
+  c_in: u32,
+  t_out: u32,
+  f_out: u32,
+  c_out: u32,
+  valid_t_in: u32,
+  _pad: u32,
+};
+
+@group(0) @binding(0) var<uniform> cparams: G4AudioConvParams;
+@group(0) @binding(1) var<storage, read> conv_in: array<f32>;
+@group(0) @binding(2) var<storage, read> conv_w: array<f32>;
+@group(0) @binding(3) var<storage, read_write> conv_out: array<f32>;
+
+@compute @workgroup_size(256)
+fn g4_sub_conv2d(@builtin(global_invocation_id) gid: vec3<u32>) {
+  // Input: [t_in, f_in, c_in], Weight: [c_out, c_in, 3, 3], Output: [t_out, f_out, c_out]
+  let idx = gid.x;
+  let total = cparams.t_out * cparams.f_out * cparams.c_out;
+  if (idx >= total) { return; }
+  let oc = idx % cparams.c_out;
+  let rem = idx / cparams.c_out;
+  let out_f = rem % cparams.f_out;
+  let out_t = rem / cparams.f_out;
+
+  var acc: f32 = 0.0;
+  for (var kt: i32 = 0; kt < 3; kt += 1) {
+    let it = i32(out_t * 2u) + kt - 1;
+    if (it < 0 || u32(it) >= cparams.valid_t_in || u32(it) >= cparams.t_in) { continue; }
+    for (var kf: i32 = 0; kf < 3; kf += 1) {
+      let ix = i32(out_f * 2u) + kf - 1;
+      if (ix < 0 || u32(ix) >= cparams.f_in) { continue; }
+      let in_base = (u32(it) * cparams.f_in + u32(ix)) * cparams.c_in;
+      let k_off = u32(kt * 3 + kf);
+      for (var ic: u32 = 0u; ic < cparams.c_in; ic += 1u) {
+        let w = conv_w[(oc * cparams.c_in + ic) * 9u + k_off];
+        acc += conv_in[in_base + ic] * w;
+      }
+    }
+  }
+  conv_out[idx] = acc;
+}
+
+@compute @workgroup_size(256)
+fn g4_causal_dw_conv1d(@builtin(global_invocation_id) gid: vec3<u32>) {
+  // x: [T, C], weight: [C, 5], out: [T, C]; t_in=T, f_in=C, c_in=kernel(5)
+  let idx = gid.x;
+  let T = cparams.t_in;
+  let C = cparams.f_in;
+  let K = cparams.c_in;
+  if (idx >= T * C) { return; }
+  let t = idx / C;
+  let c = idx % C;
+  let left_pad = K - 1u;
+  var acc: f32 = 0.0;
+  for (var k: u32 = 0u; k < K; k += 1u) {
+    if (t + k >= left_pad) {
+      let it = t + k - left_pad;
+      acc += conv_in[it * C + c] * conv_w[c * K + k];
+    }
+  }
+  conv_out[idx] = acc;
+}
+`;
+}
+
+export function buildGemma4AudioAttnWgsl({ useSubgroups = true } = {}) {
+  const smem = useSubgroups
+    ? `var<workgroup> sg_sum_buf: array<f32, 64>;\nvar<workgroup> shared_score: f32;`
+    : `var<workgroup> wg_red: array<f32, 128>;\nvar<workgroup> shared_score: f32;`;
+
+  const redScore = useSubgroups
+    ? `      let sg_id = lid.x / sg_size;
+      let num_sg = (128u + sg_size - 1u) / sg_size;
+      let sg_dot = subgroupAdd(prod);
+      if (sg_lid == 0u) { sg_sum_buf[sg_id] = sg_dot; }
+      workgroupBarrier();
+      if (lid.x == 0u) {
+        var dot_sum: f32 = 0.0;
+        for (var s: u32 = 0u; s < num_sg; s += 1u) { dot_sum += sg_sum_buf[s]; }
+        shared_score = 50.0 * tanh(dot_sum / 50.0);
+      }
+      workgroupBarrier();`
+    : `      wg_red[lid.x] = prod;
+      workgroupBarrier();
+      for (var stride: u32 = 64u; stride > 0u; stride >>= 1u) {
+        if (lid.x < stride) { wg_red[lid.x] += wg_red[lid.x + stride]; }
+        workgroupBarrier();
+      }
+      if (lid.x == 0u) { shared_score = 50.0 * tanh(wg_red[0] / 50.0); }
+      workgroupBarrier();`;
+
+  return `${wgslHeader({ useSubgroups })}struct G4AudioAttnParams {
+  valid_t: u32,
+  num_heads: u32,
+  head_dim: u32,
+  left_ctx: u32, // 12 (max_past_horizon = 13 - 1)
+  q_scale: f32,
+  k_scale: f32,
+  _pad0: u32,
+  _pad1: u32,
+};
+
+@group(0) @binding(0) var<uniform> aparams: G4AudioAttnParams;
+@group(0) @binding(1) var<storage, read> q_buf: array<f32>;
+@group(0) @binding(2) var<storage, read> k_buf: array<f32>;
+@group(0) @binding(3) var<storage, read> v_buf: array<f32>;
+@group(0) @binding(4) var<storage, read> rel_k: array<f32>;       // [13, H, D]
+@group(0) @binding(5) var<storage, read> per_dim_scale: array<f32>; // [D]
+@group(0) @binding(6) var<storage, read_write> attn_out: array<f32>;
+
+${smem}
+
+@compute @workgroup_size(128)
+fn g4_chunked_rel_attn(${sgParams({ useSubgroups })}) {
+  let qi = wid.y;
+  let h = wid.x;
+  if (qi >= aparams.valid_t || h >= aparams.num_heads) { return; }
+
+  let d = lid.x;
+  let hd = aparams.head_dim;
+  let H = aparams.num_heads;
+  let D = H * hd;
+  let is_active = d < hd;
+  let safe_d = select(0u, d, is_active);
+
+  let s_raw = per_dim_scale[safe_d];
+  let sp = select(log(1.0 + exp(clamp(s_raw, -30.0, 20.0))), s_raw, s_raw > 20.0);
+  let q_scaled = select(0.0, q_buf[qi * D + h * hd + safe_d] * aparams.q_scale * sp, is_active);
+
+  let max_past = aparams.left_ctx - 1u;
+  let k_start = select(0u, qi - max_past, qi > max_past);
+  var m_i: f32 = -3.402823e38;
+  var l_i: f32 = 0.0;
+  var acc: f32 = 0.0;
+
+  for (var ki: u32 = k_start; ki <= qi; ki += 1u) {
+    let rel_idx = aparams.left_ctx - (qi - ki);
+    let k_val = select(0.0, k_buf[ki * D + h * hd + safe_d] * aparams.k_scale, is_active);
+    let rk_val = select(0.0, rel_k[rel_idx * D + h * hd + safe_d], is_active);
+    let prod = q_scaled * (k_val + rk_val);
+
+${redScore}
+
+    let score = shared_score;
+    let m_new = max(m_i, score);
+    let alpha = exp(m_i - m_new);
+    let beta = exp(score - m_new);
+    l_i = l_i * alpha + beta;
+    if (is_active) {
+      acc = acc * alpha + beta * v_buf[ki * D + h * hd + safe_d];
+    }
+    m_i = m_new;
+  }
+
+  if (is_active) {
+    attn_out[qi * D + h * hd + safe_d] = acc / l_i;
   }
 }
 `;

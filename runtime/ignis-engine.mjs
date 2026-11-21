@@ -494,7 +494,10 @@ export class IgnisEngine {
           { binding: 4, resource: { buffer: outBuf } },
         ],
       });
-      return { pipe, bg, wgX: Math.ceil(M / 4), wgY: 1 };
+      const totWgX = Math.ceil(M / 4);
+      const wgZ = totWgX > 65535 ? Math.ceil(totWgX / 32768) : 1;
+      const wgX = totWgX > 65535 ? 32768 : totWgX;
+      return { pipe, bg, wgX, wgY: 1, wgZ };
     };
 
     const mkNormStep = (weightName, inBuf = this.bufs.x, outBuf = this.bufs.norm) => {
@@ -882,7 +885,7 @@ export class IgnisEngine {
       const pass = enc.beginComputePass(passDesc);
       pass.setPipeline(step.pipe);
       pass.setBindGroup(0, step.bg);
-      pass.dispatchWorkgroups(step.wgX, step.wgY, 1);
+      pass.dispatchWorkgroups(step.wgX, step.wgY, step.wgZ || 1);
       pass.end();
     }
     if (useTs) {
@@ -929,7 +932,10 @@ export class IgnisEngine {
     const pass = enc.beginComputePass();
     pass.setPipeline(pipe);
     pass.setBindGroup(0, bg);
-    pass.dispatchWorkgroups(Math.ceil(M / 4), isGemv ? 1 : Math.ceil(T / 4), 1);
+    const totWgX = Math.ceil(M / 4);
+    const wgZ = totWgX > 65535 ? Math.ceil(totWgX / 32768) : 1;
+    const wgX = totWgX > 65535 ? 32768 : totWgX;
+    pass.dispatchWorkgroups(wgX, isGemv ? 1 : Math.ceil(T / 4), wgZ);
     pass.end();
   }
 
@@ -960,7 +966,10 @@ export class IgnisEngine {
     const pass = enc.beginComputePass();
     pass.setPipeline(pipe);
     pass.setBindGroup(0, bg);
-    pass.dispatchWorkgroups(Math.ceil(M / 4), isGemv ? 1 : Math.ceil(T / 4), 1);
+    const totWgX = Math.ceil(M / 4);
+    const wgZ = totWgX > 65535 ? Math.ceil(totWgX / 32768) : 1;
+    const wgX = totWgX > 65535 ? 32768 : totWgX;
+    pass.dispatchWorkgroups(wgX, isGemv ? 1 : Math.ceil(T / 4), wgZ);
     pass.end();
   }
 
@@ -1028,6 +1037,7 @@ export class IgnisEngine {
     const {
       tokenIds = null,
       isMultimodalMask = null,
+      bidirSpan = null,
       returnAllLogits = false,
       captureTraces = false,
       returnLastHidden = false,
@@ -1050,6 +1060,7 @@ export class IgnisEngine {
         finalRes = await this._forwardEmbedsChunk(embFloat32.subarray(off * D, end * D), {
           tokenIds: tokenIds ? tokenIds.slice(off, end) : null,
           isMultimodalMask: isMultimodalMask ? isMultimodalMask.slice(off, end) : null,
+          bidirSpan,
           returnAllLogits: false,
           captureTraces: false,
           returnLastHidden: isLast ? returnLastHidden : false,
@@ -1061,6 +1072,7 @@ export class IgnisEngine {
     return this._forwardEmbedsChunk(embFloat32, {
       tokenIds,
       isMultimodalMask,
+      bidirSpan,
       returnAllLogits,
       captureTraces,
       returnLastHidden,
@@ -1071,6 +1083,7 @@ export class IgnisEngine {
   async _forwardEmbedsChunk(embFloat32, {
     tokenIds = null,
     isMultimodalMask = null,
+    bidirSpan = null,
     returnAllLogits = false,
     captureTraces = false,
     returnLastHidden = false,
@@ -1263,6 +1276,7 @@ export class IgnisEngine {
           u32[0] = T; u32[1] = startPos; u32[2] = bp.num_attention_heads; u32[3] = bp.num_key_value_heads;
           u32[4] = spec.hd; u32[5] = kv.capacity; u32[6] = bp.sliding_window || 0; u32[7] = spec.isSwa ? 1 : 0;
           u32[8] = bp.has_attn_gate ? 1 : 0; f32[9] = spec.attnScale;
+          u32[10] = bidirSpan ? bidirSpan[0] : 0; u32[11] = bidirSpan ? bidirSpan[1] : 0;
         });
         tempUniforms.push(uAttn);
         const bgAttn = this.device.createBindGroup({

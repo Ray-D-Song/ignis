@@ -305,6 +305,104 @@ export function extractLfm3LogMel(pcm16k, {
   };
 }
 
+let GEMMA4_MEL_BANK = null;
+let GEMMA4_HANN = null;
+
+/**
+ * Exact Gemma4AudioFeatureExtractor log-mel frontend:
+ * - 16 kHz mono, padded to multiple of 128 samples, semicausal left-pad 160 samples
+ * - 320-sample (20ms) periodic Hann window, 160-sample hop (unfold size=321 -> drop last sample)
+ * - 512-pt RFFT magnitude |stft|, 128-bin HTK mel (norm=None, 0..8000 Hz), ln(mel + 0.001)
+ * - Masked by sampleMask[t*hop + 320] === 1; returns row-major [numFrames, 128] + subsample valid counts
+ */
+export function extractGemma4LogMel(pcm16k, {
+  featureSize = 128,
+  samplingRate = 16000,
+  frameLength = 320,
+  hopLength = 160,
+  fftLength = 512,
+  melFloor = 0.001,
+  padToMultipleOf = 128,
+  maxLength = 480000,
+} = {}) {
+  if (!GEMMA4_MEL_BANK || fftLength !== 512 || featureSize !== 128) {
+    GEMMA4_MEL_BANK = buildMelFilterBank({
+      numFreqBins: (fftLength >> 1) + 1,
+      numMelFilters: featureSize,
+      minFreq: 0.0,
+      maxFreq: samplingRate / 2,
+      samplingRate,
+      norm: null,
+      melScale: 'htk',
+    });
+  }
+  if (!GEMMA4_HANN || GEMMA4_HANN.length !== frameLength) {
+    GEMMA4_HANN = hannWindowPeriodic(frameLength);
+  }
+
+  const rawLen = Math.min(pcm16k.length, maxLength);
+  const paddedLen = Math.max(padToMultipleOf, Math.ceil(rawLen / padToMultipleOf) * padToMultipleOf);
+  const padLeft = frameLength >> 1; // 160
+  const totalWaveLen = padLeft + paddedLen;
+  const wave = new Float64Array(totalWaveLen);
+  const sampleMask = new Uint8Array(totalWaveLen);
+  for (let i = 0; i < rawLen; i++) {
+    wave[padLeft + i] = pcm16k[i];
+    sampleMask[padLeft + i] = 1;
+  }
+
+  const unfoldSize = frameLength + 1; // 321
+  const numFrames = totalWaveLen < unfoldSize ? 0 : Math.floor((totalWaveLen - unfoldSize) / hopLength) + 1;
+  const numBins = (fftLength >> 1) + 1;
+  const features = new Float32Array(numFrames * featureSize);
+  const frameMask = new Uint8Array(numFrames);
+  const frameBuf = new Float64Array(fftLength);
+  const magBuf = new Float64Array(numBins);
+
+  let validMelFrames = 0;
+  let validSub1 = 0;
+  let validAudioTokens = 0;
+
+  for (let t = 0; t < numFrames; t++) {
+    const start = t * hopLength;
+    const isValid = sampleMask[start + unfoldSize - 1] === 1;
+    frameMask[t] = isValid ? 1 : 0;
+    if (!isValid) continue;
+    validMelFrames++;
+    if (t % 2 === 0) validSub1++;
+    if (t % 4 === 0) validAudioTokens++;
+
+    for (let j = 0; j < frameLength; j++) {
+      frameBuf[j] = wave[start + j] * GEMMA4_HANN[j];
+    }
+    for (let j = frameLength; j < fftLength; j++) frameBuf[j] = 0;
+
+    const { re, im } = rfft(frameBuf, fftLength);
+    for (let b = 0; b < numBins; b++) {
+      magBuf[b] = Math.hypot(re[b], im[b]);
+    }
+    const rowOff = t * featureSize;
+    for (let m = 0; m < featureSize; m++) {
+      const mOff = m * numBins;
+      let acc = 0.0;
+      for (let b = 0; b < numBins; b++) {
+        acc += GEMMA4_MEL_BANK[mOff + b] * magBuf[b];
+      }
+      features[rowOff + m] = Math.log(acc + melFloor);
+    }
+  }
+
+  return {
+    features,
+    frameMask,
+    numMelBins: featureSize,
+    numFrames,
+    validMelFrames,
+    validSub1,
+    validAudioTokens,
+  };
+}
+
 /**
  * LiquidCodecISTFT: converts decoder output [numStftFrames, 2 * 641] -> 24 kHz float32 PCM.
  */

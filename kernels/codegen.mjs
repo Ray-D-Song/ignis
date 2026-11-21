@@ -185,7 +185,7 @@ ${sgParams({ useSubgroups })}
   if (tok >= params.T) { return; }
   let local_row = lid.x / THREADS_PER_ROW;
   let lane = lid.x % THREADS_PER_ROW;
-  let row = wid.x * ROWS_PER_WG + local_row;
+  let row = (wid.x + wid.z * 32768u) * ROWS_PER_WG + local_row;
   let safe_row = min(row, params.M - 1u);
 
   let w_off = safe_row * params.K;
@@ -371,7 +371,7 @@ fn gemv_q4_g64(${sgParams({ useSubgroups })}) {
   if (tok >= params.T) { return; }
   let local_row = lid.x / THREADS_PER_ROW;
   let lane = lid.x % THREADS_PER_ROW;
-  let row = wid.x * ROWS_PER_WG + local_row;
+  let row = (wid.x + wid.z * 32768u) * ROWS_PER_WG + local_row;
   let acc = q4_gemv_dot(row, lane, tok);
 ${red1(false)}
 }
@@ -382,7 +382,7 @@ fn gemv_q4_g64_add(${sgParams({ useSubgroups })}) {
   if (tok >= params.T) { return; }
   let local_row = lid.x / THREADS_PER_ROW;
   let lane = lid.x % THREADS_PER_ROW;
-  let row = wid.x * ROWS_PER_WG + local_row;
+  let row = (wid.x + wid.z * 32768u) * ROWS_PER_WG + local_row;
   let acc = q4_gemv_dot(row, lane, tok);
 ${red1(true)}
 }
@@ -393,7 +393,7 @@ fn gemm4_q4_g64(${sgParams({ useSubgroups })}) {
   if (t0 >= params.T) { return; }
   let local_row = lid.x / THREADS_PER_ROW;
   let lane = lid.x % THREADS_PER_ROW;
-  let row = wid.x * ROWS_PER_WG + local_row;
+  let row = (wid.x + wid.z * 32768u) * ROWS_PER_WG + local_row;
   let acc = q4_gemm4_dot(row, lane, t0);
 ${red4(false)}
 }
@@ -404,7 +404,7 @@ fn gemm4_q4_g64_add(${sgParams({ useSubgroups })}) {
   if (t0 >= params.T) { return; }
   let local_row = lid.x / THREADS_PER_ROW;
   let lane = lid.x % THREADS_PER_ROW;
-  let row = wid.x * ROWS_PER_WG + local_row;
+  let row = (wid.x + wid.z * 32768u) * ROWS_PER_WG + local_row;
   let acc = q4_gemm4_dot(row, lane, t0);
 ${red4(true)}
 }
@@ -510,7 +510,7 @@ fn gemv_q3_g64(${sgParams({ useSubgroups })}) {
   if (tok >= params.T) { return; }
   let local_row = lid.x / THREADS_PER_ROW;
   let lane = lid.x % THREADS_PER_ROW;
-  let row = wid.x * ROWS_PER_WG + local_row;
+  let row = (wid.x + wid.z * 32768u) * ROWS_PER_WG + local_row;
   let acc = q3_gemv_dot(row, lane, tok);
 ${red1(false)}
 }
@@ -521,7 +521,7 @@ fn gemv_q3_g64_add(${sgParams({ useSubgroups })}) {
   if (tok >= params.T) { return; }
   let local_row = lid.x / THREADS_PER_ROW;
   let lane = lid.x % THREADS_PER_ROW;
-  let row = wid.x * ROWS_PER_WG + local_row;
+  let row = (wid.x + wid.z * 32768u) * ROWS_PER_WG + local_row;
   let acc = q3_gemv_dot(row, lane, tok);
 ${red1(true)}
 }
@@ -532,7 +532,7 @@ fn gemm4_q3_g64(${sgParams({ useSubgroups })}) {
   if (t0 >= params.T) { return; }
   let local_row = lid.x / THREADS_PER_ROW;
   let lane = lid.x % THREADS_PER_ROW;
-  let row = wid.x * ROWS_PER_WG + local_row;
+  let row = (wid.x + wid.z * 32768u) * ROWS_PER_WG + local_row;
   let acc = q3_gemm4_dot(row, lane, t0);
 ${red4(false)}
 }
@@ -543,7 +543,7 @@ fn gemm4_q3_g64_add(${sgParams({ useSubgroups })}) {
   if (t0 >= params.T) { return; }
   let local_row = lid.x / THREADS_PER_ROW;
   let lane = lid.x % THREADS_PER_ROW;
-  let row = wid.x * ROWS_PER_WG + local_row;
+  let row = (wid.x + wid.z * 32768u) * ROWS_PER_WG + local_row;
   let acc = q3_gemm4_dot(row, lane, t0);
 ${red4(true)}
 }
@@ -554,7 +554,7 @@ fn gemv_q8_g64(${sgParams({ useSubgroups })}) {
   if (tok >= params.T) { return; }
   let local_row = lid.x / THREADS_PER_ROW;
   let lane = lid.x % THREADS_PER_ROW;
-  let row = wid.x * ROWS_PER_WG + local_row;
+  let row = (wid.x + wid.z * 32768u) * ROWS_PER_WG + local_row;
   let safe_row = min(row, params.M - 1u);
 
   let k_words = params.K_pad >> 2u;
@@ -594,7 +594,7 @@ fn gemm4_q8_g64(${sgParams({ useSubgroups })}) {
   if (t0 >= params.T) { return; }
   let local_row = lid.x / THREADS_PER_ROW;
   let lane = lid.x % THREADS_PER_ROW;
-  let row = wid.x * ROWS_PER_WG + local_row;
+  let row = (wid.x + wid.z * 32768u) * ROWS_PER_WG + local_row;
   let safe_row = min(row, params.M - 1u);
 
   let k_words = params.K_pad >> 2u;
@@ -785,7 +785,7 @@ fn gemv_glu_q3_g64(${sgParams({ useSubgroups })}) {
   if (tok >= params.T) { return; }
   let local_row = lid.x / THREADS_PER_ROW;
   let lane = lid.x % THREADS_PER_ROW;
-  let row = wid.x * ROWS_PER_WG + local_row;
+  let row = (wid.x + wid.z * 32768u) * ROWS_PER_WG + local_row;
   let safe_row = min(row, params.M - 1u);
 
   let n_chunks = params.K_pad >> 5u;
@@ -834,7 +834,7 @@ fn gemm4_glu_q3_g64(${sgParams({ useSubgroups })}) {
   if (t0 >= params.T) { return; }
   let local_row = lid.x / THREADS_PER_ROW;
   let lane = lid.x % THREADS_PER_ROW;
-  let row = wid.x * ROWS_PER_WG + local_row;
+  let row = (wid.x + wid.z * 32768u) * ROWS_PER_WG + local_row;
   let safe_row = min(row, params.M - 1u);
 
   let n_chunks = params.K_pad >> 5u;
@@ -922,7 +922,7 @@ fn gemv_glu_q4_g64(${sgParams({ useSubgroups })}) {
   if (tok >= params.T) { return; }
   let local_row = lid.x / THREADS_PER_ROW;
   let lane = lid.x % THREADS_PER_ROW;
-  let row = wid.x * ROWS_PER_WG + local_row;
+  let row = (wid.x + wid.z * 32768u) * ROWS_PER_WG + local_row;
   let safe_row = min(row, params.M - 1u);
 
   let k_words = params.K_pad >> 3u;
@@ -968,7 +968,7 @@ fn gemm4_glu_q4_g64(${sgParams({ useSubgroups })}) {
   if (t0 >= params.T) { return; }
   let local_row = lid.x / THREADS_PER_ROW;
   let lane = lid.x % THREADS_PER_ROW;
-  let row = wid.x * ROWS_PER_WG + local_row;
+  let row = (wid.x + wid.z * 32768u) * ROWS_PER_WG + local_row;
   let safe_row = min(row, params.M - 1u);
 
   let k_words = params.K_pad >> 3u;
@@ -1295,8 +1295,8 @@ export function buildAttentionWgsl({ useSubgroups = true } = {}) {
   is_swa: u32,
   has_gate: u32,
   scale: f32,
-  _pad0: u32,
-  _pad1: u32,
+  bidir_start: u32,
+  bidir_end: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: AttnParams;
@@ -1329,7 +1329,10 @@ fn main(${sgParams({ useSubgroups })}) {
   if (params.is_swa != 0u && q_pos + 1u > params.sliding_window) {
     kv_start = q_pos + 1u - params.sliding_window;
   }
-  let kv_end = q_pos + 1u;
+  var kv_end: u32 = q_pos + 1u;
+  if (params.is_swa != 0u && params.bidir_end > params.bidir_start && q_pos >= params.bidir_start && q_pos < params.bidir_end) {
+    kv_end = max(kv_end, params.bidir_end);
+  }
 
   var m_i: f32 = -3.402823e38;
   var l_i: f32 = 0.0;
@@ -1406,8 +1409,8 @@ export function buildAttentionDecodeWgsl({ useSubgroups = true } = {}) {
   is_swa: u32,
   has_gate: u32,
   scale: f32,
-  _pad0: u32,
-  _pad1: u32,
+  bidir_start: u32,
+  bidir_end: u32,
 };
 
 const K_SPLITS: u32 = 16u;
@@ -1439,7 +1442,10 @@ fn split_kv_gqa(${sgParams({ useSubgroups })}) {
   if (params.is_swa != 0u && q_pos + 1u > params.sliding_window) {
     kv_start = q_pos + 1u - params.sliding_window;
   }
-  let kv_end = q_pos + 1u;
+  var kv_end: u32 = q_pos + 1u;
+  if (params.is_swa != 0u && params.bidir_end > params.bidir_start && q_pos >= params.bidir_start && q_pos < params.bidir_end) {
+    kv_end = max(kv_end, params.bidir_end);
+  }
   let total_kv = kv_end - kv_start;
   let chunk = (total_kv + K_SPLITS - 1u) / K_SPLITS;
   let s_begin = kv_start + split_id * chunk;

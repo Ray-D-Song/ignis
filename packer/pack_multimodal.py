@@ -70,12 +70,19 @@ class SingleShardWriter:
             "layout": "row_major",
         }
 
-    def add_q8(self, meta: dict[str, Any], name: str, arr: np.ndarray, verify_list: list[tuple[str, float]] | None = None) -> None:
+    def add_q8(
+        self,
+        meta: dict[str, Any],
+        name: str,
+        arr: np.ndarray,
+        verify_list: list[tuple[str, float]] | None = None,
+        clip: list[float] | None = None,
+    ) -> None:
         w = np.asarray(arr, dtype=np.float32)
         q_u32, s_u32, padded_shape = quantize_int8_g64_sym(w)
         q_off, q_bytes = self.add(q_u32.tobytes())
         s_off, s_bytes = self.add(s_u32.tobytes())
-        meta[f"{name}.quants"] = {
+        q_entry: dict[str, Any] = {
             "shard": self.shard_name,
             "offset": q_off,
             "bytes": q_bytes,
@@ -85,6 +92,9 @@ class SingleShardWriter:
             "dtype": "u32_q8",
             "layout": "row_major",
         }
+        if clip is not None:
+            q_entry["clip"] = clip
+        meta[f"{name}.quants"] = q_entry
         meta[f"{name}.scales"] = {
             "shard": self.shard_name,
             "offset": s_off,
@@ -323,6 +333,106 @@ def _pack_lfm3_omni(
     return mm_shards, mm_meta
 
 
+def _pack_gemma4_omni(
+    out_dir: Path,
+    cfg: dict[str, Any],
+    hf_tensors,
+    quant_errors: list[tuple[str, float]],
+    verify: bool = True,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    mm_shards: list[dict[str, Any]] = []
+    mm_meta: dict[str, Any] = {}
+    vlist = quant_errors if verify else None
+
+    def add_clipped_q8(writer: SingleShardWriter, name: str, hf_pfx: str) -> None:
+        clip = None
+        if f"{hf_pfx}.input_min" in hf_tensors:
+            clip = [
+                float(hf_tensors.get(f"{hf_pfx}.input_min").reshape(-1)[0]),
+                float(hf_tensors.get(f"{hf_pfx}.input_max").reshape(-1)[0]),
+                float(hf_tensors.get(f"{hf_pfx}.output_min").reshape(-1)[0]),
+                float(hf_tensors.get(f"{hf_pfx}.output_max").reshape(-1)[0]),
+            ]
+        writer.add_q8(mm_meta, name, hf_tensors.get(f"{hf_pfx}.linear.weight"), vlist, clip=clip)
+
+    # 1. Vision Tower + EmbedVision -> vision.ignis
+    vc = cfg["vision_config"]
+    vw = SingleShardWriter(out_dir, "vision", "vision.ignis", 0xFFFFFFF0)
+    vw.add_q8(mm_meta, "vision.patch_proj", hf_tensors.get("model.vision_tower.patch_embedder.input_proj.weight"), vlist)
+    pos_tbl = hf_tensors.get("model.vision_tower.patch_embedder.position_embedding_table")  # [2, 10240, 768]
+    vw.add_f16_packed(mm_meta, "vision.pos_table", pos_tbl.reshape(-1, pos_tbl.shape[-1]))
+
+    for i in range(vc["num_hidden_layers"]):
+        pfx = f"model.vision_tower.encoder.layers.{i}"
+        opfx = f"vision.blk.{i}"
+        vw.add_f32(mm_meta, f"{opfx}.input_layernorm", hf_tensors.get(f"{pfx}.input_layernorm.weight"))
+        vw.add_f32(mm_meta, f"{opfx}.post_attention_layernorm", hf_tensors.get(f"{pfx}.post_attention_layernorm.weight"))
+        vw.add_f32(mm_meta, f"{opfx}.pre_feedforward_layernorm", hf_tensors.get(f"{pfx}.pre_feedforward_layernorm.weight"))
+        vw.add_f32(mm_meta, f"{opfx}.post_feedforward_layernorm", hf_tensors.get(f"{pfx}.post_feedforward_layernorm.weight"))
+        vw.add_f32(mm_meta, f"{opfx}.q_norm", hf_tensors.get(f"{pfx}.self_attn.q_norm.weight"))
+        vw.add_f32(mm_meta, f"{opfx}.k_norm", hf_tensors.get(f"{pfx}.self_attn.k_norm.weight"))
+        add_clipped_q8(vw, f"{opfx}.q_proj", f"{pfx}.self_attn.q_proj")
+        add_clipped_q8(vw, f"{opfx}.k_proj", f"{pfx}.self_attn.k_proj")
+        add_clipped_q8(vw, f"{opfx}.v_proj", f"{pfx}.self_attn.v_proj")
+        add_clipped_q8(vw, f"{opfx}.o_proj", f"{pfx}.self_attn.o_proj")
+        add_clipped_q8(vw, f"{opfx}.gate_proj", f"{pfx}.mlp.gate_proj")
+        add_clipped_q8(vw, f"{opfx}.up_proj", f"{pfx}.mlp.up_proj")
+        add_clipped_q8(vw, f"{opfx}.down_proj", f"{pfx}.mlp.down_proj")
+
+    if vc.get("standardize") and "model.vision_tower.std_bias" in hf_tensors:
+        vw.add_f32(mm_meta, "vision.std_bias", hf_tensors.get("model.vision_tower.std_bias"))
+        vw.add_f32(mm_meta, "vision.std_scale", hf_tensors.get("model.vision_tower.std_scale"))
+    vw.add_q8(mm_meta, "vision.embed_proj", hf_tensors.get("model.embed_vision.embedding_projection.weight"), vlist)
+    mm_shards.append(vw.finalize())
+
+    # 2. Audio Tower (SubSample + 12L Conformer) + EmbedAudio -> audio_enc.ignis
+    ac = cfg["audio_config"]
+    aw = SingleShardWriter(out_dir, "audio_enc", "audio_enc.ignis", 0xFFFFFFF1)
+    aw.add_f32(mm_meta, "audio.sub.layer0.conv", hf_tensors.get("model.audio_tower.subsample_conv_projection.layer0.conv.weight"))
+    aw.add_f32(mm_meta, "audio.sub.layer0.norm", hf_tensors.get("model.audio_tower.subsample_conv_projection.layer0.norm.weight"))
+    aw.add_f32(mm_meta, "audio.sub.layer1.conv", hf_tensors.get("model.audio_tower.subsample_conv_projection.layer1.conv.weight"))
+    aw.add_f32(mm_meta, "audio.sub.layer1.norm", hf_tensors.get("model.audio_tower.subsample_conv_projection.layer1.norm.weight"))
+    aw.add_q8(mm_meta, "audio.sub.input_proj", hf_tensors.get("model.audio_tower.subsample_conv_projection.input_proj_linear.weight"), vlist)
+
+    for i in range(ac["num_hidden_layers"]):
+        pfx = f"model.audio_tower.layers.{i}"
+        opfx = f"audio.blk.{i}"
+        aw.add_f32(mm_meta, f"{opfx}.ff1.pre_norm", hf_tensors.get(f"{pfx}.feed_forward1.pre_layer_norm.weight"))
+        aw.add_f32(mm_meta, f"{opfx}.ff1.post_norm", hf_tensors.get(f"{pfx}.feed_forward1.post_layer_norm.weight"))
+        add_clipped_q8(aw, f"{opfx}.ff1.w1", f"{pfx}.feed_forward1.ffw_layer_1")
+        add_clipped_q8(aw, f"{opfx}.ff1.w2", f"{pfx}.feed_forward1.ffw_layer_2")
+
+        aw.add_f32(mm_meta, f"{opfx}.norm_pre_attn", hf_tensors.get(f"{pfx}.norm_pre_attn.weight"))
+        aw.add_f32(mm_meta, f"{opfx}.norm_post_attn", hf_tensors.get(f"{pfx}.norm_post_attn.weight"))
+        add_clipped_q8(aw, f"{opfx}.q_proj", f"{pfx}.self_attn.q_proj")
+        add_clipped_q8(aw, f"{opfx}.k_proj", f"{pfx}.self_attn.k_proj")
+        add_clipped_q8(aw, f"{opfx}.v_proj", f"{pfx}.self_attn.v_proj")
+        add_clipped_q8(aw, f"{opfx}.post_proj", f"{pfx}.self_attn.post")
+        aw.add_q8(mm_meta, f"{opfx}.rel_k_proj", hf_tensors.get(f"{pfx}.self_attn.relative_k_proj.weight"), vlist)
+        aw.add_f32(mm_meta, f"{opfx}.per_dim_scale", hf_tensors.get(f"{pfx}.self_attn.per_dim_scale"))
+
+        aw.add_f32(mm_meta, f"{opfx}.lconv.pre_norm", hf_tensors.get(f"{pfx}.lconv1d.pre_layer_norm.weight"))
+        add_clipped_q8(aw, f"{opfx}.lconv.lin_start", f"{pfx}.lconv1d.linear_start")
+        dw_w = hf_tensors.get(f"{pfx}.lconv1d.depthwise_conv1d.weight")
+        aw.add_f32(mm_meta, f"{opfx}.lconv.dw_conv", dw_w.reshape(dw_w.shape[0], -1))
+        aw.add_f32(mm_meta, f"{opfx}.lconv.conv_norm", hf_tensors.get(f"{pfx}.lconv1d.conv_norm.weight"))
+        add_clipped_q8(aw, f"{opfx}.lconv.lin_end", f"{pfx}.lconv1d.linear_end")
+
+        aw.add_f32(mm_meta, f"{opfx}.ff2.pre_norm", hf_tensors.get(f"{pfx}.feed_forward2.pre_layer_norm.weight"))
+        aw.add_f32(mm_meta, f"{opfx}.ff2.post_norm", hf_tensors.get(f"{pfx}.feed_forward2.post_layer_norm.weight"))
+        add_clipped_q8(aw, f"{opfx}.ff2.w1", f"{pfx}.feed_forward2.ffw_layer_1")
+        add_clipped_q8(aw, f"{opfx}.ff2.w2", f"{pfx}.feed_forward2.ffw_layer_2")
+
+        aw.add_f32(mm_meta, f"{opfx}.norm_out", hf_tensors.get(f"{pfx}.norm_out.weight"))
+
+    aw.add_q8(mm_meta, "audio.output_proj", hf_tensors.get("model.audio_tower.output_proj.weight"), vlist)
+    aw.add_f32(mm_meta, "audio.output_proj_b", hf_tensors.get("model.audio_tower.output_proj.bias"))
+    aw.add_q8(mm_meta, "audio.embed_proj", hf_tensors.get("model.embed_audio.embedding_projection.weight"), vlist)
+    mm_shards.append(aw.finalize())
+
+    return mm_shards, mm_meta
+
+
 def pack_multimodal_shards(
     model_dir: Path,
     out_dir: Path,
@@ -338,4 +448,6 @@ def pack_multimodal_shards(
     kind = mm_bp.get("kind")
     if kind == "lfm3_omni":
         return _pack_lfm3_omni(model_dir, out_dir, cfg, blueprint, hf_tensors, quant_errors, verify=verify)
+    if kind == "gemma4":
+        return _pack_gemma4_omni(out_dir, cfg, hf_tensors, quant_errors, verify=verify)
     raise ValueError(f"Unsupported multimodal kind: {kind}")
