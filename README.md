@@ -1,52 +1,56 @@
 # Ignis
 
-**Ignis** 是一个基于第一性原理从零构建的 **Browser-Native WebGPU LLM 推理引擎与通用框架**。  
-它不依赖 GGUF/ONNX/TVM 等外部推理运行时，从存储格式、内存重排、WGSL 融合算子到 OPFS 流式底座全部面向浏览器沙箱和 WebGPU 物理特性垂直设计。
+**Ignis** 是一个基于第一性原理从零构建的 **Browser-Native WebGPU LLM & Full-Omni 多模态推理引擎与通用框架**。  
+它不依赖 GGUF/ONNX/TVM 等外部推理运行时，从 `.ignis` 分片存储格式、W3C 基线 WGSL 算子代码生成、OPFS 流式底座到 Rust/WASM 分词与 JSON Schema FSM 约束解码全部面向浏览器沙箱垂直设计。
 
-## 核心特性
+## 核心能力全景
 
-* **WebGPU 原生对齐格式（`.ignis` v1）**：
-  * 线性层采用 `INT4_G64_ASYM`（8×4bit 打入 `u32` + `f16x2` scale/min 分离存储），LM Head 支持 `INT4_G64` / `INT8_G64` 可选配置，零分支解包。
-  * **大词表 Embedding 外置**：`token_embd` 转成 `INT8_ROW` 存放于 `embd.ignis`，通过 Worker OPFS `SyncAccessHandle` + LRU 按行查表，不占 GPU 显存（Spark-X2.6-4B 节省 ~670 MiB）。
-* **混合注意力 KV-Cache 分治**：
-  * 原生支持 `Sliding Window Attention`（固定环形 Ring Buffer，窗口外不增长）与 `Full Attention` 交替架构，以及双基频部分旋转 RoPE、逐头 `sigmoid(attn_gate)` 门控。
-* **高性能 WGSL 计算管线**：
-  * 强制启用 `shader-f16` 与 `subgroups`（`subgroupAdd` 归约兼容 Wave32/Wave64）。
-  * Split-KV GQA FlashDecoding（`attention_decode.wgsl`）、原地残差融合、轻量 WGSL 模板代码生成（`kernels/codegen.mjs` 支持 `GeGLU` / `SwiGLU`）与静态预绑定单次提交 Decode。
-* **浏览器零卡顿工程底座**：
-  * 全链路 Dedicated Web Worker 运行，OPFS 持久化缓存 + 16 MiB 环形 `StagingBuffer` 流式入显存（热启动主线程 JS Heap ~1.1 MB），`Chunked Prefill` 保障主页面 60fps 零掉帧。
-* **极简 Rust → WASM Tokenizer**：
-  * 自研零 JS 依赖 Byte-Level BPE 分词器（`tokenizer/`），在 131K 词表上与 `llama-tokenize` 100% 对齐。
+* **多架构统一 Declarative Blueprint 引擎**：
+  * 原生一套引擎支持 **Spark-X2.6-4B**（Ring SWA + Full + Sigmoid Gate）、**Llama / Qwen2 / Qwen3 / Phi3**、**LiquidAI/LFM3-Omni-2B**（ShortConv `K=7` + SWA + Full + 图像/音频理解 + DepthDecoder + 24 kHz LiquidCodec 语音合成）与 **google/gemma-4-E4B-it**（`262K` 词表 Z-Tiling + 42 层 KV-Sharing +外置 `INT8_ROW` PLE + SigLIP2 + Chunked Conformer）。
+* **WebGPU 原生对齐格式与低显存分级降级**：
+  * 支持 `INT4_G64_ASYM`、`INT8_G64_SYM`（LM Head / PLE 投影）及 **`INT3_G64_ASYM`**（32×3-bit 打入 3×`u32`，LFM3-Omni 显存压缩至 `755 MiB`）；超大词表 `token_embd` 与 Gemma 4 `ple_embd` 常驻 OPFS 外置查表（节省数 GiB VRAM）。
+  * 严格遵循 **W3C WebGPU 基线**：所有 `kernels/` 禁用实验性 `@builtin(subgroup_id)` / `@builtin(num_subgroups)`，内置 `useSubgroups=false` 共享内存归约降级（Bit-Exact 对齐）与 `detectDeviceProfile()` 硬件分级适配。
+* **Rust/WASM 分词与结构化 JSON Schema FSM 约束解码**：
+  * 自研零外部 JS 依赖 Rust/WASM 引擎（`tokenizer/`），同时支持 Byte-Level BPE 与 SentencePiece `ByteFallback`（131K / 128K / 262K 词表 **100% 精确一致**）。
+  * 内置 JSON Schema → Thompson NFA → 等价类 DFA → 状态级 packed `u32` Bitset **FSM 约束解码**（`response_format`），零拷贝屏蔽 131K+ 词表仅 **`0.285 ms/tok`**（`p95 = 2.05 ms`）。
+* **双模式无损投机解码（Speculative Decoding）**：
+  * **N-gram Lookup**（零额外显存后缀匹配，`Spark-4B` 实测 `84.5%` 接受率、`134.0 tok/s` / `1.30x` 加速）。
+  * **Draft-Target**（`INT3_G64` 草稿 + `INT4/INT8` 目标模型，支持 ShortConv 零读取 GPU 状态快照回滚与 Leviathan 无损随机拒绝采样，与自回归基线 **100% 比特级一致**）。
+* **开发者 SDK 与全栈示例**：
+  * `@ignis/core`（`IgnisOpenAI` OpenAI 兼容文本/流式/全模态客户端）与 `@ignis/packer`（`ignis-pack` 离线打包 CLI）。
+  * `examples/chat-vinext/`：基于 `vinext` + React 19 RSC 的多模型全模态浏览器 Chat 工作台（OPFS 缓存、`<think>` 折叠、图像/WAV 上传与 24 kHz 语音播放）。
 
-## 真实 Spark-X2.6-4B 实测摘要
+## 真机实测指标摘要（Thorium 138 · AMD RX 6800 XT）
 
-在 Windows 11 / Edge `157.0` / AMD RX 6800 XT 上对 `XHToken/Spark-X2.6-4B`（4.45B 参数）实测（详见 [docs/benchmark-spark-4b.md](docs/benchmark-spark-4b.md)）：
-* **显存占用**：`2.16 GiB`（`INT4` LM Head） / `2.32 GiB`（`INT8` LM Head）
-* **Decode 速度**：**`85.4 tok/s`（Wall-Clock） / `127.2 tok/s`（GPU `timestamp-query`）**
-* **OPFS 热启动**：`2.14 s` 就绪，主线程 JS Heap `1.11 MB`，`maxFrameMs = 18.01 ms`
-* **精度对齐**：Logits 余弦相似度 vs BF16 达 **`0.9990 ~ 0.9997`**，Top-1 命中率 **100%**
+| 模型 / 能力 | 显存 / 耗时 | 精度 / 速度实测结果 |
+| :--- | :--- | :--- |
+| **Spark-X2.6-4B** (`INT8_G64` LM Head) | `2.32 GiB` VRAM | Wall **`85.4 tok/s`**（`vinext` 多轮 `86.0 / 81.8 tok/s`），vs BF16 `cos=0.9990~0.9997` |
+| **LFM3-Omni-2B** (Full Omni) | `1054.86 MiB` GPU | 15/15 全模态对拍全过；Text `cos=0.9981` / VQA `0.9981` / Audio `0.9990` / 24kHz WAV `0.9990` |
+| **Gemma-4-E4B-it** (Full Omni + Q8 PLE) | `2588.7 MiB` Base / `3075.8 MiB` Peak | 10/10 全模态对拍全过；Text `cos=0.9988` / VQA `0.9934` / Audio `0.9590`（`Top-1` 全中） |
+| **`INT3_G64` 硬件降级 (`LFM3-2B`)** | **`755.10 MiB`** GPU | `useSubgroups=false` 余弦 `0.99999999996`；Q3 Greedy Token IDs 与 Q4 100% 一致 |
+| **Rust/WASM JSON Schema FSM** | **`0.285 ms/tok`** 中位掩码开销 | Spark-4B + LFM3 × 3 类复杂 Schema **6/6 100% 合法严格匹配** |
+| **双模式投机解码 (`N-gram` + `Draft-Target`)** | Zero-VRAM / Dual-Engine | Greedy **100% 比特级等价**；Spark N-gram **`134.0 tok/s`（`1.30x`）**；LFM3 ShortConv 接受率 **`90.2%`** |
 
 ## 快速开始与自动化测试
 
 ```bash
-# 安装测试依赖（Playwright + Edge 驱动）
+# 安装测试依赖（Playwright）与构建 Rust/WASM 引擎
 npm install
+npm run build:wasm
 
-# 离线打包 HuggingFace Safetensors 模型为 .ignis v1
-packer/.venv/Scripts/python.exe packer/ignis_pack.py \
-  --input <hf-model-dir> --output <ignis-out-dir> --lm-head-dtype int8
+# 离线打包 HuggingFace 模型为 .ignis（支持 Spark / Qwen / Llama / LFM3-Omni / Gemma-4）
+npx ignis-pack --input <hf-model-dir> --output <ignis-out-dir> --lm-head-dtype int8
 
-# 运行全套自动化验证（硬件探针 + WGSL 算子单测 + 131K 分词器 + 逐层数值对齐 + OPFS Worker E2E + 多架构 SwiGLU）
+# 分别运行核心回归、全模态对拍、SDK 与 Phase 6 全套测试
 npm test
+npm run test:lfm3
+npm run test:gemma4
+npm run test:sdk
+npm run test:phase6
 
-# 运行 36 层 4B 尺寸吞吐与 60fps Chunked Prefill 基准压测
-npm run test:phase4
-
-# 启动 vinext Chat Demo（默认加载 Spark-X2.6-4B · INT8_G64 LM Head）
+# 启动 vinext 全模态 Chat Demo（默认加载 Spark-X2.6-4B · INT8_G64，可切换 LFM3-Omni 与 Gemma-4-E4B）
 npm run demo:chat
-
-# 自动化端到端测试 vinext Chat Demo（Edge WebGPU 双轮对话 + 速度断言）
 npm run test:vinext
 ```
 
-详细路线图见 [ROADMAP.md](ROADMAP.md)，二进制格式规范见 [docs/format-spec.md](docs/format-spec.md)。
+详细路线图见 [ROADMAP.md](ROADMAP.md)，进度记录见 [PROGRESS.md](PROGRESS.md)，二进制格式规范见 [docs/format-spec.md](docs/format-spec.md)。
