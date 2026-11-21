@@ -1,28 +1,50 @@
 {
-  "name": "@ignis/core",
+  "name": "ignis-webgpu",
   "version": "0.1.0",
-  "description": "Zero-backend browser WebGPU LLM & Full-Omni multimodal inference SDK with OpenAI-compatible streaming API",
+  "description": "Zero-dependency browser WebGPU LLM & Full-Omni multimodal inference SDK with OpenAI-compatible streaming API, Rust/WASM JSON Schema FSM, and Speculative Decoding",
   "type": "module",
-  "main": "./index.mjs",
-  "types": "./index.d.ts",
+  "main": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./index.d.ts",
-      "import": "./index.mjs"
-    }
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs"
+    },
+    "./worker": "./dist/runtime/ignis-worker.mjs",
+    "./wasm": "./dist/runtime/wasm/ignis_tokenizer.wasm",
+    "./kernels/*": "./dist/kernels/*"
   },
   "files": [
-    "index.mjs",
-    "index.d.ts",
-    "openai-client.mjs"
+    "dist/",
+    "README.md",
+    "LICENSE"
   ],
+  "scripts": {
+    "build": "node scripts/prepare-dist.mjs",
+    "prepack": "node scripts/prepare-dist.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ray-D-Song/Ignis.git",
+    "directory": "packages/core"
+  },
+  "homepage": "https://ignis.pages.dev",
+  "bugs": {
+    "url": "https://github.com/Ray-D-Song/Ignis/issues"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "keywords": [
     "webgpu",
     "llm",
     "omni",
     "openai-sdk",
+    "json-schema",
+    "speculative-decoding",
     "ignis",
     "browser-ai"
   ],
+  "author": "Ray-D-Song",
   "license": "Apache-2.0"
 }

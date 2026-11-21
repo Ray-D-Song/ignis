@@ -9,30 +9,57 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-from safetensors import safe_open
+_DEPS_LOADED = False
 
-from blueprints import build_blueprint
-from pack_multimodal import pack_multimodal_shards
-from quant import (
-    PAYLOAD_OFFSET,
-    TENSOR_ALIGN,
-    align_up,
-    dequantize_int3_g64_asym,
-    dequantize_int4_g64_asym,
-    dequantize_int8_g64_sym,
-    make_shard_header,
-    quantize_int3_g64_asym,
-    quantize_int4_g64_asym,
-    quantize_int8_g64_sym,
-    stream_write_int8_row_shard,
-)
+
+def _ensure_deps() -> None:
+    """Lazy-load runtime ML/quant dependencies so `--help` runs cleanly before pip install."""
+    global _DEPS_LOADED
+    if _DEPS_LOADED:
+        return
+    import numpy as np
+    from safetensors import safe_open
+    from blueprints import build_blueprint
+    from pack_multimodal import pack_multimodal_shards
+    from quant import (
+        PAYLOAD_OFFSET,
+        TENSOR_ALIGN,
+        align_up,
+        dequantize_int3_g64_asym,
+        dequantize_int4_g64_asym,
+        dequantize_int8_g64_sym,
+        make_shard_header,
+        quantize_int3_g64_asym,
+        quantize_int4_g64_asym,
+        quantize_int8_g64_sym,
+        stream_write_int8_row_shard,
+    )
+
+    globals().update({
+        "np": np,
+        "safe_open": safe_open,
+        "build_blueprint": build_blueprint,
+        "pack_multimodal_shards": pack_multimodal_shards,
+        "PAYLOAD_OFFSET": PAYLOAD_OFFSET,
+        "TENSOR_ALIGN": TENSOR_ALIGN,
+        "align_up": align_up,
+        "dequantize_int3_g64_asym": dequantize_int3_g64_asym,
+        "dequantize_int4_g64_asym": dequantize_int4_g64_asym,
+        "dequantize_int8_g64_sym": dequantize_int8_g64_sym,
+        "make_shard_header": make_shard_header,
+        "quantize_int3_g64_asym": quantize_int3_g64_asym,
+        "quantize_int4_g64_asym": quantize_int4_g64_asym,
+        "quantize_int8_g64_sym": quantize_int8_g64_sym,
+        "stream_write_int8_row_shard": stream_write_int8_row_shard,
+    })
+    _DEPS_LOADED = True
 
 
 class ShardWriter:
     """Packs 256-byte aligned GPU tensor blobs into bounded .ignis shards."""
 
     def __init__(self, out_dir: Path, max_shard_bytes: int = 512 * 1024 * 1024) -> None:
+        _ensure_deps()
         self.out_dir = out_dir
         self.max_shard_bytes = max_shard_bytes
         self.current_idx = 0
@@ -79,6 +106,7 @@ class ShardWriter:
 
 def load_hf_tensor_reader(model_dir: Path):
     """Returns a lazy tensor accessor supporting BF16/FP16/FP32 safetensors via PyTorch."""
+    _ensure_deps()
     index_file = model_dir / "model.safetensors.index.json"
     if index_file.exists():
         index = json.loads(index_file.read_text(encoding="utf-8"))
@@ -118,6 +146,7 @@ def load_hf_tensor_reader(model_dir: Path):
 
 def _quantize_chunked_2d(tensor_slice, shape: list[int], fn, chunk_rows: int = 16384):
     """Quantize large 2D tensors chunk-by-chunk to avoid full float32 RAM allocation."""
+    _ensure_deps()
     m, k = shape
     if m <= chunk_rows:
         arr = tensor_slice[:]
@@ -145,6 +174,7 @@ def pack_model(
     weight_bits: int = 4,
     pack_multimodal: bool = True,
 ) -> dict[str, Any]:
+    _ensure_deps()
     out_dir.mkdir(parents=True, exist_ok=True)
     cfg = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     blueprint = build_blueprint(cfg)

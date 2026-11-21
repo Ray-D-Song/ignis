@@ -216,3 +216,9 @@ export function buildIgnisChatPrompt(
   blueprint: Record<string, unknown>,
   options?: { enableThinking?: boolean; thinkingEffort?: IgnisThinkingEffort }
 ): Promise<{ prompt: string; images: unknown[]; audios: Float32Array[] }>;
+
+export function getIgnisAssetUrls(): {
+  workerUrl: string;
+  wasmUrl: string;
+  kernelBaseUrl: string;
+};

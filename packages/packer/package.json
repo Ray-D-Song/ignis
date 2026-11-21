@@ -1,21 +1,43 @@
 {
-  "name": "@ignis/packer",
+  "name": "ignis-webgpu-packer",
   "version": "0.1.0",
-  "description": "Offline safetensors to .ignis WebGPU model packer CLI (Spark2.5, Qwen2/3, LFM3-Omni, Gemma-4)",
+  "description": "Offline HuggingFace Safetensors to .ignis WebGPU shard packer CLI (Spark2.5, Qwen2/3, Llama, Phi, LFM3-Omni, Gemma-4)",
   "type": "module",
   "bin": {
-    "ignis-pack": "./bin/ignis-pack.mjs"
+    "ignis-pack": "./bin/ignis-pack.mjs",
+    "ignis-webgpu-packer": "./bin/ignis-pack.mjs"
   },
   "files": [
     "bin/",
-    "pyproject.toml"
+    "py/",
+    "pyproject.toml",
+    "README.md",
+    "LICENSE"
   ],
+  "scripts": {
+    "build": "node scripts/prepare-dist.mjs",
+    "prepack": "node scripts/prepare-dist.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ray-D-Song/Ignis.git",
+    "directory": "packages/packer"
+  },
+  "homepage": "https://ignis.pages.dev",
+  "bugs": {
+    "url": "https://github.com/Ray-D-Song/Ignis/issues"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "keywords": [
     "webgpu",
     "llm",
-    "multimodal",
     "quantization",
+    "safetensors",
+    "multimodal",
     "ignis"
   ],
+  "author": "Ray-D-Song",
   "license": "Apache-2.0"
 }

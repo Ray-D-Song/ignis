@@ -9,3 +9,11 @@ export { Gemma4OmniRuntime } from '../../runtime/multimodal/gemma4-omni-runtime.
 export { preprocessLfm3Image, preprocessGemma4Image } from '../../runtime/multimodal/image-proc.mjs';
 export { extractLfm3LogMel, extractGemma4LogMel, encodeWavPcm16, decodeWav, resampleLinear } from '../../runtime/multimodal/audio-dsp.mjs';
 export { IgnisOpenAI, buildIgnisChatPrompt } from './openai-client.mjs';
+
+export function getIgnisAssetUrls() {
+  return {
+    workerUrl: new URL('../../runtime/ignis-worker.mjs', import.meta.url).href,
+    wasmUrl: new URL('../../runtime/wasm/ignis_tokenizer.wasm', import.meta.url).href,
+    kernelBaseUrl: new URL('../../kernels', import.meta.url).href,
+  };
+}
