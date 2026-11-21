@@ -2,6 +2,7 @@ export { IgnisEngine } from '../../runtime/ignis-engine.mjs';
 export { IgnisClient } from '../../runtime/ignis-client.mjs';
 export { IgnisTokenizer } from '../../runtime/wasm-tokenizer.mjs';
 export { sampleToken } from '../../runtime/sampler.mjs';
+export { detectDeviceProfile } from '../../runtime/device-profile.mjs';
 export { Lfm3OmniRuntime } from '../../runtime/multimodal/lfm3-omni-runtime.mjs';
 export { Gemma4OmniRuntime } from '../../runtime/multimodal/gemma4-omni-runtime.mjs';
 export { preprocessLfm3Image, preprocessGemma4Image } from '../../runtime/multimodal/image-proc.mjs';

@@ -149,6 +149,30 @@ export class IgnisOpenAI {
   destroy(): Promise<void>;
 }
 
+export interface IgnisDeviceProfile {
+  supported: boolean;
+  tier: 'tier1_full' | 'tier2_no_subgroups' | 'tier3_constrained' | 'unsupported';
+  hasF16: boolean;
+  hasSubgroups: boolean;
+  hasTimestampQuery: boolean;
+  maxBufferSize: number;
+  maxStorageBufferBindingSize: number;
+  maxComputeWorkgroupStorageSize: number;
+  maxComputeInvocationsPerWorkgroup: number;
+  recommendedWeightBits: 3 | 4;
+  recommendedUseSubgroups: boolean;
+  recommendedMaxShardBytes: number;
+  estimatedVramClass: 'high' | 'medium' | 'low';
+  adapterInfo: {
+    vendor: string;
+    architecture: string;
+    device: string;
+    description: string;
+  } | null;
+}
+
+export function detectDeviceProfile(adapterOrNull?: GPUAdapter | null): Promise<IgnisDeviceProfile>;
+
 export function buildIgnisChatPrompt(
   messages: ChatMessage[],
   blueprint: Record<string, unknown>,
