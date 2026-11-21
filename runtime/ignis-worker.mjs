@@ -88,6 +88,8 @@ self.onmessage = async (ev) => {
         promptIds = null,
         promptText = null,
         maxNewTokens = 32,
+        maxThinkingTokens = 0,
+        endThinkTokenId = 4,
         chunkSize = engine.maxBatchTokens,
         sampling = { temperature: 0.0 },
         stopOnEos = true,
@@ -131,9 +133,20 @@ self.onmessage = async (ev) => {
       let committedText = '';
 
       if (!abortRequested && lastLogits) {
+        let thinkClosed = !(maxThinkingTokens > 0);
         for (let step = 0; step < maxNewTokens; step++) {
           if (abortRequested) break;
-          const nextTok = sampleToken(lastLogits, history, sampling);
+          let nextTok;
+          if (!thinkClosed && step >= maxThinkingTokens) {
+            // Budget forcing: close <think> channel with </think> so remaining tokens go to final answer
+            nextTok = endThinkTokenId;
+            thinkClosed = true;
+          } else {
+            nextTok = sampleToken(lastLogits, history, sampling);
+            if (nextTok === endThinkTokenId) {
+              thinkClosed = true;
+            }
+          }
           if (stopOnEos && nextTok === eosId) {
             break;
           }

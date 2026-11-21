@@ -120,26 +120,30 @@ async function main() {
       { timeout: 60000 }
     );
 
-    const turn1Text = await page.locator('.msg.assistant .bubble').last().innerText();
+    const turn1Text = await page.locator('.msg.assistant .answer-body').last().innerText();
     const decode1 = await page.locator('#stat-decode').innerText();
-    console.log('=== Turn 1 Output ===\n', turn1Text, '\n[Decode Speed]:', decode1);
+    console.log('=== Turn 1 Answer ===\n', turn1Text, '\n[Decode Speed]:', decode1);
     if (turn1Text.includes('\uFFFD')) throw new Error('Detected UTF-8 replacement mojibake in Turn 1');
-    if (turn1Text.trim().length < 10) throw new Error('Turn 1 output unexpectedly short');
+    if (turn1Text.trim().length < 10 || turn1Text.trim() === '...') {
+      throw new Error(`Turn 1 final answer outside <think> missing or too short: "${turn1Text}"`);
+    }
 
     // Turn 2: incremental multi-turn follow-up
-    await page.fill('#chat-input', '能举一个生活中的简单例子吗？');
+    await page.fill('#chat-input', '比较 WebGPU 与 WebAssembly 在纯浏览器端运行大语言模型时的本质瓶颈差异。');
     await page.click('#btn-send');
     await page.waitForFunction(
       () => document.getElementById('status-text')?.textContent?.includes('就绪 · INT8_G64 LM Head'),
       null,
-      { timeout: 60000 }
+      { timeout: 90000 }
     );
 
-    const turn2Text = await page.locator('.msg.assistant .bubble').last().innerText();
+    const turn2Text = await page.locator('.msg.assistant .answer-body').last().innerText();
     const decode2 = await page.locator('#stat-decode').innerText();
-    console.log('=== Turn 2 (Incremental KV) Output ===\n', turn2Text, '\n[Decode Speed]:', decode2);
+    console.log('=== Turn 2 (Incremental KV) Answer ===\n', turn2Text, '\n[Decode Speed]:', decode2);
     if (turn2Text.includes('\uFFFD')) throw new Error('Detected UTF-8 replacement mojibake in Turn 2');
-    if (turn2Text.trim().length < 10) throw new Error('Turn 2 output unexpectedly short');
+    if (turn2Text.trim().length < 20 || turn2Text.trim() === '...') {
+      throw new Error(`Turn 2 final answer outside <think> missing or too short: "${turn2Text}"`);
+    }
 
     const tps1 = parseFloat(decode1);
     const tps2 = parseFloat(decode2);

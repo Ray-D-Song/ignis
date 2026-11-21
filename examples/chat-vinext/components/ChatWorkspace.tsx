@@ -79,7 +79,7 @@ export function ChatWorkspace({ models }: { models: ModelPreset[] }) {
   const [enableThinking, setEnableThinking] = useState(true);
   const [effort, setEffort] = useState<'low' | 'high'>('low');
   const [temperature, setTemperature] = useState(0.6);
-  const [maxNewTokens, setMaxNewTokens] = useState(1024);
+  const [maxNewTokens, setMaxNewTokens] = useState(1536);
 
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
@@ -249,9 +249,13 @@ export function ChatWorkspace({ models }: { models: ModelPreset[] }) {
 
     try {
       const enc = await client.encode(promptDeltaText);
+      const maxThinkingTokens = enableThinking
+        ? (effort === 'low' ? Math.min(384, Math.floor(maxNewTokens * 0.45)) : Math.floor(maxNewTokens * 0.65))
+        : 0;
       const res = await client.generate({
         promptIds: enc.ids,
         maxNewTokens,
+        maxThinkingTokens,
         chunkSize: 64,
         sampling: { temperature, topK: 40, topP: 0.95, repetitionPenalty: 1.05 },
         stopOnEos: true,
@@ -351,8 +355,8 @@ export function ChatWorkspace({ models }: { models: ModelPreset[] }) {
                 disabled={status === 'generating'}
                 onChange={(e) => setEffort(e.target.value as 'low' | 'high')}
               >
-                <option value="low">low（快速推理）</option>
-                <option value="high">high（深度思考）</option>
+                <option value="low">low（快速推理 · 思考 ≤384 tok）</option>
+                <option value="high">high（深度思考 · 思考 ≤65% 预算）</option>
               </select>
             </label>
           )}
@@ -371,9 +375,9 @@ export function ChatWorkspace({ models }: { models: ModelPreset[] }) {
             Max New Tokens: {maxNewTokens}
             <input
               type="range"
-              min="64"
-              max="2048"
-              step="64"
+              min="256"
+              max="4096"
+              step="128"
               value={maxNewTokens}
               onChange={(e) => setMaxNewTokens(parseInt(e.target.value, 10))}
             />
@@ -434,8 +438,11 @@ export function ChatWorkspace({ models }: { models: ModelPreset[] }) {
               </div>
             </div>
           ) : (
-            messages.map((m) => {
+            messages.map((m, idx) => {
               const parsed = m.role === 'assistant' ? splitThinking(m.content) : null;
+              const isActivelyThinking = Boolean(
+                parsed?.isThinking && status === 'generating' && idx === messages.length - 1
+              );
               return (
                 <div key={m.id} className={`msg ${m.role}`}>
                   <div className="msg-role">
@@ -448,12 +455,18 @@ export function ChatWorkspace({ models }: { models: ModelPreset[] }) {
                     ) : (
                       <>
                         {parsed?.think && (
-                          <details className="think-box" open={parsed.isThinking}>
-                            <summary>{parsed.isThinking ? '正在思考...' : '查看思考过程'}</summary>
+                          <details className="think-box" open={isActivelyThinking}>
+                            <summary>
+                              {isActivelyThinking
+                                ? '正在思考...'
+                                : parsed?.isThinking
+                                  ? '思考过程（已中止或达上限）'
+                                  : '查看思考过程'}
+                            </summary>
                             <pre>{parsed.think}</pre>
                           </details>
                         )}
-                        <div>{parsed?.answer || (parsed?.isThinking ? '' : '...')}</div>
+                        <div className="answer-body">{parsed?.answer || (isActivelyThinking ? '' : '...')}</div>
                       </>
                     )}
                   </div>
