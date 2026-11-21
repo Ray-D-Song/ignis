@@ -4,7 +4,7 @@
 
 **A zero-dependency, browser-native WebGPU LLM and Full-Omni multimodal inference engine built from first principles.**
 
-[**Live Demo**](https://ignis.pages.dev) · [**ignis-webgpu**](packages/core/README.md) · [**ignis-webgpu-packer**](packages/packer/README.md) · [**Contributing**](CONTRIBUTING.md)
+[**Live Demo**](https://ignis.ray-d-song.com) · [**ignis-webgpu**](packages/core/README.md) · [**ignis-webgpu-packer**](packages/packer/README.md) · [**Contributing**](CONTRIBUTING.md)
 
 Ignis does not wrap ONNX Runtime, llama.cpp/WASM, or Apache TVM. Every layer—from its 256-byte-aligned `.ignis` binary shards and OPFS `SyncAccessHandle` streaming loader, to strict W3C baseline WGSL kernels, Rust/WASM tokenizers, JSON Schema FSM logit masking, and GPU-resident speculative decoding—is engineered specifically around browser sandbox constraints (`ArrayBuffer` caps, COOP/COEP isolation, WGSL subgroup divergence, and VRAM limits).
 

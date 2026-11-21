@@ -6,7 +6,7 @@
 它不依赖 GGUF/ONNX/TVM 等外部推理运行时，从 `.ignis` 分片存储格式、W3C 基线 WGSL 算子代码生成、OPFS 流式底座到 Rust/WASM 分词与 JSON Schema FSM 约束解码全部面向浏览器沙箱垂直设计。
 
 - **仓库**：https://github.com/Ray-D-Song/Ignis
-- **在线演示**：https://ignis.pages.dev
+- **在线演示**：https://ignis.ray-d-song.com
 - **npm 包**：[`ignis-webgpu`](packages/core/package.json) · [`ignis-webgpu-packer`](packages/packer/package.json)
 
 ## 核心能力全景
