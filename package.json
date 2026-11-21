@@ -16,7 +16,6 @@
   },
   "main": "packages/core/index.mjs",
   "directories": {
-    "doc": "docs",
     "example": "examples",
     "test": "tests"
   },

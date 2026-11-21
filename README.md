@@ -129,5 +129,5 @@ npm run demo:chat      # Start examples/chat-vinext locally at http://localhost:
 ## License & Attribution
 
 - Ignis engine, kernels, packer, tokenizer, SDK, and demo UI are licensed under the **Apache License 2.0** ([LICENSE](LICENSE)).
-- Model configuration / architecture notes derived from upstream open-source references carry their original notices ([CONTRIBUTING.md](CONTRIBUTING.md), [docs/configuration_spark.py](docs/configuration_spark.py)).
+- Contribution guidelines and upstream attribution notes live in [CONTRIBUTING.md](CONTRIBUTING.md).
 - Pre-quantized demo weights remain governed by their upstream model licenses (`Apache-2.0` for `XHToken/Spark-X2.6-4B`, `LFM Open License v1.0` for `LiquidAI/LFM3-Omni-2B`, and `Gemma Terms of Use` for `google/gemma-4-E4B-it`).
