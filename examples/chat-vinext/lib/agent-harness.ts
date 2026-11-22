@@ -6,6 +6,17 @@ import {
 } from '@codemirror/lang-javascript';
 import type { IgnisClient } from '../../../runtime/ignis-client.mjs';
 import { computeLineDiff, formatUnifiedDiff } from './diff';
+import {
+  buildPiSystemPrompt,
+  PiAgent,
+  type PiAgentContext,
+  type PiAgentMessage,
+  type PiAgentTool,
+  type PiAssistantMessage,
+  type PiToolCallContent,
+  type PiToolResultMessage,
+  type PiUserMessage,
+} from './pi-agent-core';
 import { formatSingleTurnPrompt, splitThinking, type ArchKind, type OmniGenMode } from './prompt-templates';
 import {
   parseNodeTestOutput,
@@ -17,7 +28,6 @@ import {
   applyEditPatch,
   formatNumberedContent,
   formatWorkspaceTree,
-  grepWorkspaceFiles,
   normalizeWorkspacePath,
   readWorkspaceFile,
   upsertWorkspaceFile,
@@ -26,6 +36,10 @@ import {
 } from './workspace-fs';
 
 export type AgentToolName =
+  | 'read'
+  | 'write'
+  | 'edit'
+  | 'bash'
   | 'list_files'
   | 'read_file'
   | 'grep_files'
@@ -39,7 +53,7 @@ export type ApprovalPolicy = 'auto' | 'ask';
 export interface ApprovalRequest {
   id: string;
   step: number;
-  tool: 'edit_file' | 'write_file' | 'run_command';
+  tool: 'write' | 'edit' | 'bash' | 'edit_file' | 'write_file' | 'run_command';
   thought: string;
   target: string;
   preview: string;
@@ -121,6 +135,7 @@ export interface AgentTurnResult {
   traceEntries: AgentTraceEntry[];
   workspaceFiles: WorkspaceFile[];
   checkpoints: WorkspaceCheckpoint[];
+  transcriptMessages: PiAgentMessage[];
   testSummary: NodeTestSummary | null;
   audioUrl?: string;
   totalPromptTokens: number;
@@ -133,6 +148,7 @@ export interface AgentTurnResult {
   aborted: boolean;
 }
 
+/** Strict WASM JSON Schema FSM covering Pi's 4 core tools + reply. */
 export function buildAgentActionSchema(): Record<string, unknown> {
   return {
     oneOf: [
@@ -140,17 +156,7 @@ export function buildAgentActionSchema(): Record<string, unknown> {
         type: 'object',
         properties: {
           thought: { type: 'string' },
-          tool: { const: 'list_files' },
-          dir: { type: 'string' },
-        },
-        required: ['thought', 'tool', 'dir'],
-        additionalProperties: false,
-      },
-      {
-        type: 'object',
-        properties: {
-          thought: { type: 'string' },
-          tool: { const: 'read_file' },
+          tool: { const: 'read' },
           path: { type: 'string' },
         },
         required: ['thought', 'tool', 'path'],
@@ -160,29 +166,7 @@ export function buildAgentActionSchema(): Record<string, unknown> {
         type: 'object',
         properties: {
           thought: { type: 'string' },
-          tool: { const: 'grep_files' },
-          pattern: { type: 'string' },
-        },
-        required: ['thought', 'tool', 'pattern'],
-        additionalProperties: false,
-      },
-      {
-        type: 'object',
-        properties: {
-          thought: { type: 'string' },
-          tool: { const: 'edit_file' },
-          path: { type: 'string' },
-          old_text: { type: 'string' },
-          new_text: { type: 'string' },
-        },
-        required: ['thought', 'tool', 'path', 'old_text', 'new_text'],
-        additionalProperties: false,
-      },
-      {
-        type: 'object',
-        properties: {
-          thought: { type: 'string' },
-          tool: { const: 'write_file' },
+          tool: { const: 'write' },
           path: { type: 'string' },
           content: { type: 'string' },
         },
@@ -193,7 +177,19 @@ export function buildAgentActionSchema(): Record<string, unknown> {
         type: 'object',
         properties: {
           thought: { type: 'string' },
-          tool: { const: 'run_command' },
+          tool: { const: 'edit' },
+          path: { type: 'string' },
+          oldText: { type: 'string' },
+          newText: { type: 'string' },
+        },
+        required: ['thought', 'tool', 'path', 'oldText', 'newText'],
+        additionalProperties: false,
+      },
+      {
+        type: 'object',
+        properties: {
+          thought: { type: 'string' },
+          tool: { const: 'bash' },
           command: { type: 'string' },
         },
         required: ['thought', 'tool', 'command'],
@@ -203,10 +199,10 @@ export function buildAgentActionSchema(): Record<string, unknown> {
         type: 'object',
         properties: {
           thought: { type: 'string' },
-          tool: { const: 'finish' },
-          summary: { type: 'string' },
+          tool: { const: 'reply' },
+          text: { type: 'string' },
         },
-        required: ['thought', 'tool', 'summary'],
+        required: ['thought', 'tool', 'text'],
         additionalProperties: false,
       },
     ],
@@ -217,6 +213,10 @@ function median(values?: number[]): number | null {
   if (!values || values.length === 0) return null;
   const s = [...values].sort((a, b) => a - b);
   return s[Math.floor(s.length / 2)];
+}
+
+function normalizeToLf(s: string): string {
+  return s.replace(/\r\n/g, '\n');
 }
 
 function summarizeArgs(args: Record<string, unknown>): Record<string, unknown> {
@@ -254,10 +254,14 @@ function compactCommandOutput(raw: string): string {
 /** Collapse common LLM React wrapper duplication (e.g. redundant `export default function App() { return <App />; }`). */
 function normalizeReactModuleContent(targetPath: string, content: string): string {
   if (!/\.(?:[cm]?jsx?|[cm]?tsx?)$/i.test(targetPath)) return content;
-  const appDecls = content.match(/(?:^|\n)\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+App\b|(?:^|\n)\s*(?:export\s+)?(?:const|let|var|class)\s+App\b/g) || [];
+  const appDecls =
+    content.match(
+      /(?:^|\n)\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+App\b|(?:^|\n)\s*(?:export\s+)?(?:const|let|var|class)\s+App\b/g,
+    ) || [];
   if (appDecls.length < 2) return content;
 
-  const wrapperRe = /(\r?\n)\s*export\s+default\s+function\s+App\s*\(\s*\)\s*\{\s*return\s*<\s*App\s*\/?\s*>\s*;?\s*\}\s*;?\s*$/;
+  const wrapperRe =
+    /(\r?\n)\s*export\s+default\s+function\s+App\s*\(\s*\)\s*\{\s*return\s*<\s*App\s*\/?\s*>\s*;?\s*\}\s*;?\s*$/;
   if (!wrapperRe.test(content)) return content;
 
   const withoutWrapper = content.replace(wrapperRe, '');
@@ -290,7 +294,9 @@ function validateCodeSyntax(
   else if (lower.endsWith('.js') || lower.endsWith('.mjs') || lower.endsWith('.cjs')) lang = javascriptLanguage;
   if (!lang) return null;
 
-  const getTagName = (tagNode: { firstChild: { name: string; from: number; to: number; nextSibling: unknown } | null }): string => {
+  const getTagName = (tagNode: {
+    firstChild: { name: string; from: number; to: number; nextSibling: unknown } | null;
+  }): string => {
     for (
       let c = tagNode.firstChild as { name: string; from: number; to: number; nextSibling: unknown } | null;
       c;
@@ -388,8 +394,8 @@ function validateCodeSyntax(
     return `${targetPath}:${errLine}:${errCol}\n${snippet}\n${pointer}\nSyntaxError: ${customErr || `Unexpected token or unbalanced syntax at line ${errLine}, column ${errCol}`}`;
   }
 
-  // Catch duplicate column-0 top-level declarations even across FunctionDeclaration hoisting
-  const topDeclRe = /^(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)|^(?:export\s+)?(?:const|let|var|class)\s+([A-Za-z_$][\w$]*)/gm;
+  const topDeclRe =
+    /^(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)|^(?:export\s+)?(?:const|let|var|class)\s+([A-Za-z_$][\w$]*)/gm;
   const seenTopNames = new Set<string>();
   let declMatch: RegExpExecArray | null;
   while ((declMatch = topDeclRe.exec(content)) !== null) {
@@ -424,7 +430,7 @@ function validateCodeSyntax(
         for (const k of Object.keys(parsedPkg.dependencies || {})) installedPkgs.add(k);
         for (const k of Object.keys(parsedPkg.devDependencies || {})) installedPkgs.add(k);
       } catch {
-        // fallback to default set
+        // ignore invalid package.json parse
       }
     }
 
@@ -470,120 +476,146 @@ function validateCodeSyntax(
   return null;
 }
 
-function buildAgentSystemPrompt(workspace: WorkspaceFile[], lang: 'en' | 'zh'): string {
-  const langHint =
-    lang === 'zh'
-      ? 'Write explanations in Chinese when the user writes in Chinese; keep file paths, code, and commands exact.'
-      : 'Keep responses concise and grounded in observed tool outputs.';
-
-  return `You are Ignis, a disciplined frontend/full-stack coding agent running locally inside a WebContainer Vite + React sandbox.
-Output ONE valid JSON action per turn matching the schema.
-
-Tools:
-- read_file {"thought":"...","tool":"read_file","path":"..."}: Read a project file with line numbers.
-- list_files {"thought":"...","tool":"list_files","dir":"."}: List files in workspace.
-- grep_files {"thought":"...","tool":"grep_files","pattern":"..."}: Search regex/substring across project files.
-- edit_file {"thought":"...","tool":"edit_file","path":"...","old_text":"...","new_text":"..."}: Replace an exact existing snippet cleanly (copy exact lines from read_file without line-number prefixes).
-- write_file {"thought":"...","tool":"write_file","path":"...","content":"..."}: Create a new file or write complete updated file content.
-- run_command {"thought":"...","tool":"run_command","command":"..."}: Run Node/npm/shell commands (e.g. "npm run build", "ls -la").
-- finish {"thought":"...","tool":"finish","summary":"..."}: Finish after building clean, valid working code.
-
-Examples:
-- {"thought":"Inspect App entry point first","tool":"read_file","path":"src/App.jsx"}
-- {"thought":"Build interactive React application in src/App.jsx","tool":"write_file","path":"src/App.jsx","content":"import { useState } from 'react';\\n..."}
-- {"thought":"Verify production bundle compiles cleanly","tool":"run_command","command":"npm run build"}
-- {"thought":"Implemented requested React application","tool":"finish","summary":"Built interactive React app in src/App.jsx and src/App.css."}
-
-Project files:
-${formatWorkspaceTree(workspace)}
-
-Strict engineering rules:
-1. Inspect existing starter files (e.g. src/App.jsx, src/App.css, package.json) with read_file before editing. Never guess file contents.
-2. When building or replacing a UI view, use write_file on src/App.jsx / src/App.css and keep code concise (under ~85 lines, minimal comments) so the JSON action fits cleanly in one step.
-3. Ensure all JSX/JS/CSS syntax and imports match installed packages in package.json (react, react-dom). Do not import uninstalled packages.
-4. Never fabricate build, file, or command outputs. ${langHint}`;
-}
-
-interface ObservationItem {
-  step: number;
-  tool: string;
+interface ToolResultDetails {
   filePath?: string;
-  isAutoRead?: boolean;
-  ok: boolean;
-  full: string;
-  compact: string;
+  compactOut?: string;
+  diffText?: string;
+  added?: number;
+  removed?: number;
+  exitCode?: number;
+  testSummary?: NodeTestSummary | null;
+  checkpointId?: string;
 }
 
-function buildCompactObservationsBlock(
-  observations: ObservationItem[],
-  maxRecentDetail = 5,
-  charBudget = 7200,
+interface PreparedWritePayload {
+  kind: 'write';
+  targetPath: string;
+  content: string;
+  before: string;
+  existedBefore: boolean;
+  added: number;
+  removed: number;
+  diffText: string;
+}
+
+interface PreparedEditPayload {
+  kind: 'edit';
+  targetPath: string;
+  updatedContent: string;
+  before: string;
+  added: number;
+  removed: number;
+  diffText: string;
+}
+
+type PreparedMutation = PreparedWritePayload | PreparedEditPayload;
+
+/** Render stateful Pi transcript messages compactly within model context limits. */
+function serializePiContextMessages(
+  messages: PiAgentMessage[],
+  maxSeqLen: number,
+  extraGuidance = '',
 ): string {
-  if (observations.length === 0) return '';
-  // Keep latest read_file for up to 5 distinct files plus latest run_command test output
-  const keptReadIndices: number[] = [];
-  const seenReadPaths = new Set<string>();
-  let lastCmdIdx = -1;
-  for (let i = observations.length - 1; i >= 0; i--) {
-    const obs = observations[i];
-    if (lastCmdIdx === -1 && obs.tool === 'run_command') {
-      lastCmdIdx = i;
+  const latestFileMsgIdx = new Set<number>();
+  const seenFiles = new Set<string>();
+  let lastBashIdx = -1;
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== 'toolResult') continue;
+    const det = m.details as ToolResultDetails | undefined;
+    if (lastBashIdx === -1 && m.toolName === 'bash') {
+      lastBashIdx = i;
     }
-    if (keptReadIndices.length < 5 && ((obs.tool === 'read_file' && obs.ok) || obs.isAutoRead)) {
-      const key = obs.filePath || String(i);
-      if (!seenReadPaths.has(key)) {
-        seenReadPaths.add(key);
-        keptReadIndices.push(i);
+    if (seenFiles.size < 4 && det?.filePath && !m.isError) {
+      if (!seenFiles.has(det.filePath)) {
+        seenFiles.add(det.filePath);
+        latestFileMsgIdx.add(i);
       }
     }
   }
-  const keptReadSet = new Set(keptReadIndices);
-  if (lastCmdIdx !== -1) {
-    keptReadSet.add(lastCmdIdx);
+
+  const keepFullSet = new Set<number>(latestFileMsgIdx);
+  if (lastBashIdx !== -1) keepFullSet.add(lastBashIdx);
+
+  const lines = messages.map((m, idx) => {
+    const isRecent = idx >= messages.length - 4;
+    if (m.role === 'user') {
+      const txt = typeof m.content === 'string' ? m.content : m.content.map((c) => c.text).join('\n');
+      return `[User]: ${txt}`;
+    }
+    if (m.role === 'assistant') {
+      const parts: string[] = [];
+      for (const blk of m.content) {
+        if (blk.type === 'toolCall') {
+          const argPreview =
+            blk.name === 'write'
+              ? JSON.stringify({
+                  path: blk.arguments.path,
+                  contentChars: String(blk.arguments.content || '').length,
+                })
+              : blk.name === 'edit'
+                ? JSON.stringify({
+                    path: blk.arguments.path,
+                    oldTextLen: String(blk.arguments.oldText || '').length,
+                    newTextLen: String(blk.arguments.newText || '').length,
+                  })
+                : JSON.stringify(blk.arguments);
+          parts.push(`[Assistant Action -> ${blk.name}]: ${argPreview}`);
+        } else if (blk.type === 'text' && blk.text.trim()) {
+          parts.push(`[Assistant]: ${isRecent ? blk.text.trim() : blk.text.trim().slice(0, 320)}`);
+        }
+      }
+      return parts.join('\n');
+    }
+
+    const rawText = m.content.map((c) => c.text).join('\n');
+    const det = m.details as ToolResultDetails | undefined;
+    if (isRecent || keepFullSet.has(idx)) {
+      const cap = det?.filePath ? 5800 : 2400;
+      return `[Tool Result (${m.toolName} -> ${m.isError ? 'ERROR' : 'OK'})]:\n${rawText.slice(0, cap)}`;
+    }
+    const shortSummary = det?.compactOut || rawText.split('\n')[0].slice(0, 180);
+    return `[Tool Result (${m.toolName} -> ${m.isError ? 'ERROR' : 'OK'})]: ${shortSummary}`;
+  });
+
+  const charBudget = maxSeqLen <= 4096 ? 6800 : 16500;
+  let joined = lines.filter(Boolean).join('\n\n');
+  let shrinkCursor = 0;
+  while (joined.length > charBudget && shrinkCursor < lines.length - 2) {
+    const m = messages[shrinkCursor];
+    if (m && m.role === 'toolResult' && !latestFileMsgIdx.has(shrinkCursor)) {
+      const det = m.details as ToolResultDetails | undefined;
+      const shortSummary = det?.compactOut || m.content[0]?.text?.slice(0, 140) || '';
+      lines[shrinkCursor] = `[Tool Result (${m.toolName} -> ${m.isError ? 'ERROR' : 'OK'})]: ${shortSummary}`;
+      joined = lines.filter(Boolean).join('\n\n');
+    }
+    shrinkCursor++;
   }
 
-  const selected = observations.map((obs, i) => {
-    const isRecent = i >= observations.length - maxRecentDetail || keptReadSet.has(i);
-    return isRecent ? obs.full : obs.compact;
-  });
-  let joined = selected.join('\n\n');
-  let shrinkIdx = 0;
-  while (joined.length > charBudget && shrinkIdx < selected.length - 1) {
-    if (!keptReadSet.has(shrinkIdx)) {
-      selected[shrinkIdx] = observations[shrinkIdx].compact;
-      joined = selected.join('\n\n');
-    }
-    shrinkIdx++;
-  }
-  for (let k = keptReadIndices.length - 1; k >= 0 && joined.length > charBudget; k--) {
-    const idx = keptReadIndices[k];
-    if (idx < observations.length - 2) {
-      selected[idx] = observations[idx].compact;
-      joined = selected.join('\n\n');
-    }
-  }
-  return joined;
+  return extraGuidance ? `${joined}\n\n${extraGuidance}` : joined;
 }
 
-export async function runAgentTurn(opts: {
+export async function runAgentTurn(params: {
   client: IgnisClient;
   archKind: ArchKind;
   maxSeqLen: number;
   capabilities: { vision: boolean; audioIn: boolean; audioOut: boolean; thinking: boolean };
   userPrompt: string;
   historyText?: string;
+  transcriptMessages?: PiAgentMessage[];
   workspaceFiles: WorkspaceFile[];
-  sandbox: CodingSandboxAdapter;
-  approvalPolicy?: ApprovalPolicy;
+  approvalPolicy: ApprovalPolicy;
   attachedImage?: PendingImageInput | null;
   attachedAudio?: PendingAudioInput | null;
   generationMode: OmniGenMode;
   maxNewTokens: number;
   maxSteps?: number;
   lang: 'en' | 'zh';
-  enableThinking?: boolean;
-  effort?: 'low' | 'high';
-  callbacks?: AgentTurnCallbacks;
+  enableThinking: boolean;
+  effort: 'low' | 'high';
+  sandbox: CodingSandboxAdapter;
+  callbacks: AgentTurnCallbacks;
 }): Promise<AgentTurnResult> {
   const {
     client,
@@ -592,26 +624,27 @@ export async function runAgentTurn(opts: {
     capabilities,
     userPrompt,
     historyText = '',
-    sandbox,
-    approvalPolicy = 'auto',
-    attachedImage = null,
-    attachedAudio = null,
+    transcriptMessages = [],
+    workspaceFiles: initialFiles,
+    approvalPolicy,
+    attachedImage,
+    attachedAudio,
     generationMode,
     maxNewTokens,
-    maxSteps = 8,
+    maxSteps = 12,
     lang,
-    enableThinking = false,
-    effort = 'low',
-    callbacks = {},
-  } = opts;
+    enableThinking,
+    effort,
+    sandbox,
+    callbacks,
+  } = params;
 
-  let workspace = [...opts.workspaceFiles];
-  const toolCalls: AgentToolCallRecord[] = [];
+  let workspace = initialFiles.map((f) => ({ ...f }));
   const traceEntries: AgentTraceEntry[] = [];
   const checkpoints: WorkspaceCheckpoint[] = [];
-  const seenSignatures = new Set<string>();
-  const readPaths = new Set<string>();
-  const observations: ObservationItem[] = [];
+  const toolCalls: AgentToolCallRecord[] = [];
+  const preparedMutations = new Map<string, PreparedMutation>();
+  const freshReadPaths = new Set<string>();
 
   let totalPromptTokens = 0;
   let totalGeneratedTokens = 0;
@@ -620,12 +653,23 @@ export async function runAgentTurn(opts: {
   let totalPrefillMs = 0;
   let lastCurPos = 0;
   let wasAborted = false;
-  let lastTestSummary: NodeTestSummary | null = null;
-  let editedSinceLastTest = false;
-  let lastCommandFailed = false;
+  const lastTestSummaryRef: { current: NodeTestSummary | null } = { current: null };
+  let lastToolError = false;
   let approveAllThisRun = false;
+  let stepCounter = 0;
+  let retriedReplyGate = false;
 
-  const schema = buildAgentActionSchema();
+  const hasPriorCheckpointsInTranscript = transcriptMessages.some(
+    (m) => m.role === 'toolResult' && (m.toolName === 'write' || m.toolName === 'edit') && !m.isError,
+  );
+
+  // Build seed transcript if continuing from text history without prior Pi messages
+  let baseMessages: PiAgentMessage[] = [...transcriptMessages];
+  if (baseMessages.length === 0 && historyText.trim()) {
+    baseMessages = [{ role: 'user', content: `Prior context:\n${historyText.trim()}`, timestamp: Date.now() }];
+  }
+
+  let effectiveTaskPrompt = userPrompt;
 
   // Step 0: Multimodal Perception when user attached UI screenshot or voice memo
   if ((attachedImage && capabilities.vision) || (attachedAudio && capabilities.audioIn)) {
@@ -633,111 +677,505 @@ export async function runAgentTurn(opts: {
     await client.reset();
     const percPrompt = formatSingleTurnPrompt(archKind, {
       systemPrompt:
-        'Describe the attached software screenshot or voice instruction concisely so a coding agent can inspect files and fix or implement it.',
+        'Describe the attached software screenshot or voice instruction concisely so a coding agent can inspect files and implement or fix it.',
       userPrompt,
+      enableThinking: false,
       includeImageTag: Boolean(attachedImage && capabilities.vision),
       includeAudioTag: Boolean(attachedAudio && capabilities.audioIn),
     });
-    const enc = await client.encode(percPrompt);
+    const enc0 = await client.encode(percPrompt);
+    peakPromptTokens = Math.max(peakPromptTokens, enc0.ids.length);
     const percRes = await client.generate({
-      promptIds: enc.ids,
+      promptIds: enc0.ids,
       images:
         attachedImage && capabilities.vision
           ? [{ data: attachedImage.data, width: attachedImage.width, height: attachedImage.height, channels: attachedImage.channels }]
           : [],
-      audios: attachedAudio && capabilities.audioIn ? [attachedAudio.pcm16k] : [],
+      audios:
+        attachedAudio && capabilities.audioIn
+          ? [{ pcm16k: attachedAudio.pcm16k }]
+          : [],
       generationMode: 'text',
-      maxNewTokens: 160,
+      maxNewTokens: 256,
       chunkSize: 64,
-      sampling: { temperature: 0, topK: 1, topP: 1.0, repetitionPenalty: 1.0 },
+      sampling: { temperature: 0.2, topK: 20, topP: 0.9, repetitionPenalty: 1.0 },
       stopOnEos: true,
     });
-    const dur = performance.now() - tPerc0;
-    const obsText = (percRes.generatedText || '').trim();
-    const percTokens = percRes.promptLen || enc.ids.length;
-    totalPromptTokens += percTokens;
-    peakPromptTokens = Math.max(peakPromptTokens, percTokens);
+    totalPromptTokens += percRes.promptLen || enc0.ids.length;
     totalGeneratedTokens += percRes.generatedIds.length;
     totalDecodeMs += percRes.decodeMs || 0;
     totalPrefillMs += percRes.prefillMs || 0;
-    lastCurPos = percRes.curPos || lastCurPos;
+    lastCurPos = percRes.curPos || 0;
     wasAborted = Boolean(percRes.aborted);
 
-    observations.push({
-      step: 0,
-      tool: 'perception',
-      ok: Boolean(obsText),
-      full: `[Attached Media Perception]: ${obsText}`,
-      compact: `[Attached Media Perception]: ${obsText.slice(0, 220)}`,
-    });
-    const entry: AgentTraceEntry = {
+    const perceptionText = splitThinking(percRes.generatedText || '').answer.trim();
+    if (perceptionText) {
+      effectiveTaskPrompt = `${userPrompt}\n\n[Multimodal Inspection Note]:\n${perceptionText}`;
+    }
+    const percEntry: AgentTraceEntry = {
       id: `trace-perc-${Date.now()}`,
       phase: 'perception',
       step: 0,
-      title: 'Multimodal Perception',
-      detail: obsText || '(No observation produced)',
-      durationMs: dur,
-      promptTokens: percTokens,
-      ok: Boolean(obsText),
+      title: 'Multimodal Analysis',
+      detail: perceptionText || '(no multimodal observation)',
+      durationMs: performance.now() - tPerc0,
+      promptTokens: percRes.promptLen || enc0.ids.length,
+      ok: Boolean(perceptionText),
     };
-    traceEntries.push(entry);
-    callbacks.onTraceEntry?.(entry);
+    traceEntries.push(percEntry);
+    callbacks.onTraceEntry?.(percEntry);
   }
 
-  let finishSummary = '';
+  const prepareWrite = async (targetPathRaw: string, contentRaw: string): Promise<{ ok: true; payload: PreparedWritePayload } | { ok: false; error: string }> => {
+    const targetPath = normalizeWorkspacePath(targetPathRaw || 'src/App.jsx');
+    const content = normalizeReactModuleContent(targetPath, contentRaw);
+    const existing = readWorkspaceFile(workspace, targetPath);
+    const before = existing ? existing.content : '';
 
-  // Steps 1..maxSteps: Schema-Locked Tool Selection & WebContainer Execution
-  for (let step = 1; step <= maxSteps && !wasAborted; step++) {
-    callbacks.onToolStepStart?.(step, maxSteps);
-    const sysPrompt = buildAgentSystemPrompt(workspace, lang);
-    const historyBlock = historyText ? `Prior context:\n${historyText}\n\n` : '';
-
-    let nudge = '';
-    if (toolCalls.length > 0) {
-      const seq = toolCalls.map((c) => `${c.tool}${c.ok ? '' : '(err)'}`).join(' -> ');
-      nudge = `\nExecuted so far: ${seq}.`;
-      const failingNames = lastTestSummary
-        ? lastTestSummary.cases.filter((c) => !c.ok).map((c) => c.name)
-        : [];
-      if (lastTestSummary && lastTestSummary.failed > 0) {
-        const failDetail = failingNames.length > 0 ? `: ${failingNames.join('; ')}` : '';
-        nudge += ` Still failing (${lastTestSummary.failed} of ${lastTestSummary.total}${failDetail}) — fix with edit_file and re-run tests.`;
-      } else if (lastCommandFailed) {
-        nudge += ' Last command exited non-zero — inspect the error, fix with edit_file/write_file, and re-run "npm run build" to confirm it succeeds.';
-      } else if (checkpoints.length === 0 && readPaths.size >= 2) {
-        nudge += ' Starter files inspected — call write_file on src/App.jsx now to implement the application (keep code concise, under 85 lines).';
-      } else if (editedSinceLastTest) {
-        nudge += ' File updated cleanly — edit/write any remaining files or call finish when complete.';
-      }
+    if (existing && normalizeToLf(before).trim() === normalizeToLf(content).trim()) {
+      return {
+        ok: false,
+        error: `write rejected: content is identical to existing ${targetPath}. Write new application code implementing the user's request.`,
+      };
     }
 
-    // Fit observations strictly within model maxSeqLen budget
-    let obsBudget = maxSeqLen <= 4096 ? 7200 : 15500;
-    let obsTextBlock = buildCompactObservationsBlock(observations, maxSeqLen <= 4096 ? 4 : 6, obsBudget);
-    const buildStepPrompt = (obsStr: string) => {
-      const obsSection = obsStr
-        ? `\n\nObservations:\n${obsStr}${nudge}\n\nChoose the next JSON tool action (or call "finish" once verified):`
-        : '\n\nChoose your first JSON tool action:';
-      return formatSingleTurnPrompt(archKind, {
+    const syntaxErr = validateCodeSyntax(targetPath, content, workspace);
+    if (syntaxErr) {
+      return {
+        ok: false,
+        error: `write to ${targetPath} failed validation (file was NOT modified on disk):\n${syntaxErr}\n\nFix the error above and call 'write' on ${targetPath} again with the complete corrected file content.`,
+      };
+    }
+
+    const diffCounts = computeLineDiff(before, content);
+    const diffText = formatUnifiedDiff(targetPath, before, content);
+    return {
+      ok: true,
+      payload: {
+        kind: 'write',
+        targetPath,
+        content,
+        before,
+        existedBefore: Boolean(existing),
+        added: diffCounts.added,
+        removed: diffCounts.removed,
+        diffText,
+      },
+    };
+  };
+
+  const prepareEdit = async (
+    targetPathRaw: string,
+    oldText: string,
+    newText: string,
+  ): Promise<{ ok: true; payload: PreparedEditPayload } | { ok: false; error: string }> => {
+    const targetPath = normalizeWorkspacePath(targetPathRaw || '');
+    if (!targetPath) {
+      return { ok: false, error: 'edit requires a valid file path.' };
+    }
+
+    if (normalizeToLf(oldText).trim() === normalizeToLf(newText).trim()) {
+      return {
+        ok: false,
+        error: `edit rejected: newText is identical to oldText (no changes made). To build or replace ${targetPath}, call 'write' with the complete new file content instead of 'edit'.`,
+      };
+    }
+
+    let existing = readWorkspaceFile(workspace, targetPath);
+    if (!existing && sandbox.readFile) {
+      const disk = await sandbox.readFile(targetPath);
+      if (disk !== null) {
+        workspace = upsertWorkspaceFile(workspace, targetPath, disk, false);
+        callbacks.onWorkspaceUpdate?.(workspace);
+        existing = readWorkspaceFile(workspace, targetPath);
+      }
+    }
+    if (!existing) {
+      return {
+        ok: false,
+        error: `File "${targetPath}" does not exist. Use 'write' to create it or 'read' "." to inspect project files.`,
+      };
+    }
+
+    const patchRes = applyEditPatch(targetPath, existing.content, oldText, newText);
+    if (!patchRes.ok) {
+      return {
+        ok: false,
+        error: `${patchRes.error}\n\nTip: Use 'write' instead of 'edit' when replacing most or all of ${targetPath}.`,
+      };
+    }
+
+    const normalizedUpdated = normalizeReactModuleContent(targetPath, patchRes.updatedContent);
+    const syntaxErr = validateCodeSyntax(targetPath, normalizedUpdated, workspace);
+    if (syntaxErr) {
+      return {
+        ok: false,
+        error: `edit to ${targetPath} failed validation and was NOT written to disk:\n${syntaxErr}\n\nFix the issue and retry 'edit' or use 'write' on ${targetPath}.`,
+      };
+    }
+
+    return {
+      ok: true,
+      payload: {
+        kind: 'edit',
+        targetPath,
+        updatedContent: normalizedUpdated,
+        before: existing.content,
+        added: patchRes.added,
+        removed: patchRes.removed,
+        diffText: patchRes.diffText,
+      },
+    };
+  };
+
+  // Core 4 Pi tools wired to StackBlitz WebContainer + CodeMirror Diff Checkpoints
+  const piTools: PiAgentTool[] = [
+    {
+      name: 'read',
+      label: 'Read',
+      description: 'Read a file with line numbers (or pass "." to list project files).',
+      execute: async (_toolCallId, args) => {
+        const rawPath = String(args.path ?? '.').trim();
+        const targetPath = normalizeWorkspacePath(rawPath);
+
+        if (!rawPath || rawPath === '.' || rawPath === './' || targetPath === '') {
+          if (sandbox.listFiles) {
+            workspace = await sandbox.listFiles();
+            callbacks.onWorkspaceUpdate?.(workspace);
+          }
+          const tree = formatWorkspaceTree(workspace);
+          const out = `Listed ${workspace.length} files:\n${tree}`;
+          return {
+            content: [{ type: 'text', text: out }],
+            details: { compactOut: `Listed ${workspace.length} files` } satisfies ToolResultDetails,
+          };
+        }
+
+        let f = readWorkspaceFile(workspace, targetPath);
+        if (!f && sandbox.readFile) {
+          const disk = await sandbox.readFile(targetPath);
+          if (disk !== null) {
+            workspace = upsertWorkspaceFile(workspace, targetPath, disk, false);
+            callbacks.onWorkspaceUpdate?.(workspace);
+            f = readWorkspaceFile(workspace, targetPath);
+          }
+        }
+
+        if (!f) {
+          // Support listing a subdirectory prefix (e.g. "src") cleanly without erroring
+          const dirPrefix = targetPath.replace(/\/+$/, '');
+          const matched = workspace.filter((wf) => wf.path.startsWith(`${dirPrefix}/`));
+          if (matched.length > 0) {
+            const out = `Listed ${matched.length} files under ${dirPrefix}/:\n${formatWorkspaceTree(matched)}`;
+            return {
+              content: [{ type: 'text', text: out }],
+              details: { compactOut: `Listed ${matched.length} files in ${dirPrefix}/` } satisfies ToolResultDetails,
+            };
+          }
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `File "${targetPath}" not found. Existing files:\n${formatWorkspaceTree(workspace)}`,
+              },
+            ],
+            isError: true,
+            details: { compactOut: `read "${targetPath}" not found` } satisfies ToolResultDetails,
+          };
+        }
+
+        const startLine = typeof args.offset === 'number' && args.offset > 0 ? Math.floor(args.offset) : 1;
+        const maxLines = typeof args.limit === 'number' && args.limit > 0 ? Math.floor(args.limit) : 160;
+        const numbered = formatNumberedContent(f.content, startLine, undefined, maxLines);
+        const out = `${f.path} (lines ${numbered.shownFrom}-${numbered.shownTo} of ${numbered.totalLines}):\n${numbered.text}`;
+        freshReadPaths.add(normalizeWorkspacePath(f.path));
+        if (checkpoints.length === 0) {
+          callbacks.onOpenFile?.(f.path, 'code');
+        }
+        return {
+          content: [{ type: 'text', text: out }],
+          details: {
+            filePath: f.path,
+            compactOut: `Read ${f.path} (${numbered.totalLines} lines)`,
+          } satisfies ToolResultDetails,
+        };
+      },
+    },
+    {
+      name: 'write',
+      label: 'Write',
+      description: 'Create a new file or overwrite an existing file completely.',
+      execute: async (toolCallId, args) => {
+        let prepared = preparedMutations.get(toolCallId);
+        if (!prepared || prepared.kind !== 'write') {
+          const res = await prepareWrite(String(args.path ?? ''), String(args.content ?? ''));
+          if (!res.ok) {
+            return {
+              content: [{ type: 'text', text: res.error }],
+              isError: true,
+              details: { compactOut: `write ${normalizeWorkspacePath(String(args.path ?? ''))} rejected` } satisfies ToolResultDetails,
+            };
+          }
+          prepared = res.payload;
+        }
+        preparedMutations.delete(toolCallId);
+
+        const { targetPath, content, before, existedBefore, added, removed, diffText } = prepared;
+        await sandbox.writeFile(targetPath, content);
+        freshReadPaths.add(normalizeWorkspacePath(targetPath));
+        workspace = upsertWorkspaceFile(workspace, targetPath, content, true, {
+          addedLines: added,
+          removedLines: removed,
+        });
+        callbacks.onWorkspaceUpdate?.(workspace);
+
+        const checkpointId = `ckpt-${stepCounter}-${Date.now()}`;
+        const ckpt: WorkspaceCheckpoint = {
+          id: checkpointId,
+          step: stepCounter,
+          tool: 'write',
+          path: targetPath,
+          existedBefore,
+          beforeContent: before,
+          afterContent: content,
+          added,
+          removed,
+          diffText,
+          createdAt: Date.now(),
+        };
+        checkpoints.push(ckpt);
+        callbacks.onCheckpoint?.(ckpt);
+        callbacks.onOpenFile?.(targetPath, existedBefore ? 'diff' : 'code');
+
+        const numbered = formatNumberedContent(content, 1, undefined, 160);
+        const out = `Wrote ${content.length} chars to ${targetPath} (${numbered.totalLines} lines):\n${numbered.text}`;
+        return {
+          content: [{ type: 'text', text: out }],
+          details: {
+            filePath: targetPath,
+            checkpointId,
+            diffText,
+            added,
+            removed,
+            compactOut: `Wrote ${targetPath} (${content.length} chars)`,
+          } satisfies ToolResultDetails,
+        };
+      },
+    },
+    {
+      name: 'edit',
+      label: 'Edit',
+      description: 'Surgical exact text replacement inside an existing file.',
+      execute: async (toolCallId, args) => {
+        let prepared = preparedMutations.get(toolCallId);
+        if (!prepared || prepared.kind !== 'edit') {
+          const res = await prepareEdit(
+            String(args.path ?? ''),
+            String(args.oldText ?? ''),
+            String(args.newText ?? ''),
+          );
+          if (!res.ok) {
+            return {
+              content: [{ type: 'text', text: res.error }],
+              isError: true,
+              details: { compactOut: `edit ${normalizeWorkspacePath(String(args.path ?? ''))} failed` } satisfies ToolResultDetails,
+            };
+          }
+          prepared = res.payload;
+        }
+        preparedMutations.delete(toolCallId);
+
+        const { targetPath, updatedContent, before, added, removed, diffText } = prepared;
+        const existing = readWorkspaceFile(workspace, targetPath);
+        await sandbox.writeFile(targetPath, updatedContent);
+        freshReadPaths.add(normalizeWorkspacePath(targetPath));
+        workspace = upsertWorkspaceFile(workspace, targetPath, updatedContent, true, {
+          addedLines: (existing?.addedLines || 0) + added,
+          removedLines: (existing?.removedLines || 0) + removed,
+        });
+        callbacks.onWorkspaceUpdate?.(workspace);
+
+        const checkpointId = `ckpt-${stepCounter}-${Date.now()}`;
+        const ckpt: WorkspaceCheckpoint = {
+          id: checkpointId,
+          step: stepCounter,
+          tool: 'edit',
+          path: targetPath,
+          existedBefore: true,
+          beforeContent: before,
+          afterContent: updatedContent,
+          added,
+          removed,
+          diffText,
+          createdAt: Date.now(),
+        };
+        checkpoints.push(ckpt);
+        callbacks.onCheckpoint?.(ckpt);
+        callbacks.onOpenFile?.(targetPath, 'diff');
+
+        const numbered = formatNumberedContent(updatedContent, 1, undefined, 160);
+        const out = `Edited ${targetPath} (+${added}/-${removed}):\n${diffText}\n\nCurrent ${targetPath} (${numbered.totalLines} lines):\n${numbered.text}`;
+        return {
+          content: [{ type: 'text', text: out }],
+          details: {
+            filePath: targetPath,
+            checkpointId,
+            diffText,
+            added,
+            removed,
+            compactOut: `Edited ${targetPath} (+${added}/-${removed})`,
+          } satisfies ToolResultDetails,
+        };
+      },
+    },
+    {
+      name: 'bash',
+      label: 'Bash',
+      description: 'Execute a shell command inside WebContainer.',
+      execute: async (_toolCallId, args) => {
+        const cmd = String(args.command ?? '').trim();
+        if (!cmd || ['read', 'write', 'edit', 'read_file', 'write_file', 'edit_file'].includes(cmd)) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `"${cmd || '(empty)'}" is a tool name, not a shell command. Call the "${cmd || 'read'}" tool directly instead of bash.`,
+              },
+            ],
+            isError: true,
+            details: { compactOut: `Invalid bash command: ${cmd}` } satisfies ToolResultDetails,
+          };
+        }
+
+        const cmdRes = await sandbox.runCommand(cmd);
+        const cleanOut = stripAnsi(cmdRes.output);
+        const testSummary = cmdRes.testSummary || parseNodeTestOutput(cleanOut);
+        if (testSummary) lastTestSummaryRef.current = testSummary;
+
+        const compactOutText = compactCommandOutput(cleanOut);
+        const out = `$ ${cmd} (exit ${cmdRes.exitCode}, ${Math.round(cmdRes.durationMs)}ms)\n${compactOutText || '(no output)'}`;
+        return {
+          content: [{ type: 'text', text: out }],
+          isError: cmdRes.exitCode !== 0,
+          details: {
+            exitCode: cmdRes.exitCode,
+            testSummary,
+            compactOut: testSummary
+              ? `$ ${cmd} -> exit ${cmdRes.exitCode} (${testSummary.passed}/${testSummary.total} passed)`
+              : `$ ${cmd} -> exit ${cmdRes.exitCode}`,
+          } satisfies ToolResultDetails,
+        };
+      },
+    },
+  ];
+
+  const schema = buildAgentActionSchema();
+  const agent = new PiAgent({
+    systemPrompt: '',
+    messages: baseMessages,
+    tools: piTools,
+  });
+
+  const actionStartTimeMap = new Map<string, number>();
+  const actionCallMap = new Map<string, PiToolCallContent>();
+
+  agent.subscribe((ev) => {
+    if (ev.type === 'tool_execution_start') {
+      actionStartTimeMap.set(ev.toolCallId, performance.now());
+    } else if (ev.type === 'tool_execution_end') {
+      const tc = actionCallMap.get(ev.toolCallId);
+      const det = (ev.result.details || {}) as ToolResultDetails;
+      const outText = ev.result.content.map((c) => c.text).join('\n');
+      const dur = performance.now() - (actionStartTimeMap.get(ev.toolCallId) ?? performance.now());
+      const isRepeatedReadGuard = ev.toolName === 'read' && ev.isError && outText.startsWith('[Pi Harness]:');
+      lastToolError = ev.isError && !isRepeatedReadGuard;
+
+      if (!isRepeatedReadGuard) {
+        const record: AgentToolCallRecord = {
+          id: ev.toolCallId,
+          step: stepCounter,
+          tool: ev.toolName as AgentToolName,
+          thought: tc?.thought || '',
+          args: tc?.arguments || {},
+          output: outText,
+          ok: !ev.isError,
+          durationMs: dur,
+          fsmMedianMs: tc?.fsmMedianMs ?? null,
+          diffText: det.diffText,
+          added: det.added,
+          removed: det.removed,
+          exitCode: det.exitCode,
+          testSummary: det.testSummary,
+          checkpointId: det.checkpointId,
+        };
+        toolCalls.push(record);
+        callbacks.onToolStepComplete?.(record);
+      }
+
+      const toolTrace: AgentTraceEntry = {
+        id: `trace-tool-${stepCounter}-${Date.now()}`,
+        phase: 'tool',
+        step: stepCounter,
+        title: `${ev.toolName} -> ${ev.isError ? 'err' : 'ok'}`,
+        detail: det.compactOut || outText.slice(0, 220),
+        durationMs: dur,
+        fsmMedianMs: tc?.fsmMedianMs ?? null,
+        promptTokens: tc?.promptTokens,
+        ok: !ev.isError,
+      };
+      traceEntries.push(toolTrace);
+      callbacks.onTraceEntry?.(toolTrace);
+    }
+  });
+
+  const runDecisionStep = async (
+    context: PiAgentContext,
+    turnIndex: number,
+    extraHint = '',
+  ): Promise<{
+    kind: 'toolCall';
+    tc: PiToolCallContent;
+  } | {
+    kind: 'reply';
+    text: string;
+    thought: string;
+    decodeTokPerSec: number;
+  } | {
+    kind: 'stop';
+    reason: 'aborted' | 'error';
+    message: string;
+  }> => {
+    const sysPrompt = buildPiSystemPrompt({
+      workspaceTree: formatWorkspaceTree(workspace),
+      lang,
+    });
+    const reserveGen = maxSeqLen <= 4096 ? 1200 : 2048;
+
+    let workingMessages = [...context.messages];
+    let serialized = serializePiContextMessages(workingMessages, maxSeqLen, extraHint);
+    const statusHint =
+      freshReadPaths.size > 0 && checkpoints.length === 0
+        ? `\n[Status]: Already read [${[...freshReadPaths].join(', ')}]. Do NOT read them again; call "write" on src/App.jsx (keep code concise, under 85 lines) or read another unread file.`
+        : checkpoints.length > 0 && !lastToolError
+          ? `\n[Status]: Modified [${[...new Set(checkpoints.map((c) => c.path))].join(', ')}]. Update any remaining files, optionally run "bash" ("npm run build"), or call "reply" to finish.`
+          : '';
+    const buildPrompt = (ctxText: string) =>
+      formatSingleTurnPrompt(archKind, {
         systemPrompt: sysPrompt,
-        userPrompt: `${historyBlock}Task:\n${userPrompt}${obsSection}`,
+        userPrompt: `${ctxText}${statusHint}\n\nChoose the next single JSON action:`,
         enableThinking: false,
       });
-    };
 
-    const reserveGen = maxSeqLen <= 4096 ? 1200 : 2048;
-    let fullPrompt = buildStepPrompt(obsTextBlock);
-    let enc = await client.encode(fullPrompt);
-    while (enc.ids.length > maxSeqLen - reserveGen && obsBudget > 1000) {
-      obsBudget = Math.floor(obsBudget * 0.6);
-      obsTextBlock = buildCompactObservationsBlock(observations, 1, obsBudget);
-      fullPrompt = buildStepPrompt(obsTextBlock);
-      enc = await client.encode(fullPrompt);
+    let enc = await client.encode(buildPrompt(serialized));
+    while (enc.ids.length > maxSeqLen - reserveGen && workingMessages.length > 2) {
+      workingMessages = workingMessages.slice(1);
+      serialized = serializePiContextMessages(workingMessages, maxSeqLen, extraHint);
+      enc = await client.encode(buildPrompt(serialized));
     }
 
     peakPromptTokens = Math.max(peakPromptTokens, enc.ids.length);
     await client.reset();
-    const tDecStart = performance.now();
+    const tDec0 = performance.now();
     const stepRes = await client.generate({
       promptIds: enc.ids,
       images: [],
@@ -748,7 +1186,7 @@ export async function runAgentTurn(opts: {
       sampling: { temperature: 0, topK: 1, topP: 1.0, repetitionPenalty: 1.0 },
       responseFormat: {
         type: 'json_schema',
-        json_schema: { name: 'ignis_coding_action', schema, strict: true },
+        json_schema: { name: 'pi_coding_action', schema, strict: true },
       },
       stopOnEos: true,
     });
@@ -757,10 +1195,14 @@ export async function runAgentTurn(opts: {
     totalPromptTokens += promptLen;
     peakPromptTokens = Math.max(peakPromptTokens, promptLen);
     totalGeneratedTokens += stepRes.generatedIds.length;
-    totalDecodeMs += stepRes.decodeMs || performance.now() - tDecStart;
+    totalDecodeMs += stepRes.decodeMs || performance.now() - tDec0;
     totalPrefillMs += stepRes.prefillMs || 0;
     lastCurPos = stepRes.curPos || lastCurPos;
-    wasAborted = Boolean(stepRes.aborted);
+    wasAborted = wasAborted || Boolean(stepRes.aborted);
+
+    if (stepRes.aborted) {
+      return { kind: 'stop', reason: 'aborted', message: 'Stopped by user.' };
+    }
 
     const fsmMs = median(stepRes.fsmMaskMsSamples);
     const rawJson = splitThinking(stepRes.generatedText || '').answer.trim();
@@ -770,10 +1212,10 @@ export async function runAgentTurn(opts: {
       action = JSON.parse(rawJson) as Record<string, unknown>;
     } catch {
       const traceFail: AgentTraceEntry = {
-        id: `trace-dec-err-${step}-${Date.now()}`,
+        id: `trace-dec-err-${turnIndex}-${Date.now()}`,
         phase: 'decision',
-        step,
-        title: `Step ${step} JSON Decode Fallback`,
+        step: stepCounter,
+        title: `Turn ${turnIndex} JSON Truncated`,
         detail: rawJson.slice(0, 320),
         durationMs: stepRes.decodeMs || 0,
         fsmMedianMs: fsmMs,
@@ -782,31 +1224,26 @@ export async function runAgentTurn(opts: {
       };
       traceEntries.push(traceFail);
       callbacks.onTraceEntry?.(traceFail);
-      if (step < maxSteps && !seenSignatures.has('json-trunc-retry')) {
-        seenSignatures.add('json-trunc-retry');
-        observations.push({
-          step,
-          tool: 'write_file',
-          ok: false,
-          full: '[JSON Action Truncated]: Your previous tool call JSON exceeded the step token limit and was cut off. Emit a shorter, more concise write_file (under 75 lines, no comments).',
-          compact: '[Retry]: Previous JSON truncated; emit shorter write_file.',
-        });
-        continue;
+      if (!extraHint) {
+        return runDecisionStep(
+          context,
+          turnIndex,
+          '[Retry]: Your previous JSON action exceeded step length and was truncated. Keep code concise (under 75 lines, no comments) inside write/edit and try again.',
+        );
       }
-      break;
+      return { kind: 'stop', reason: 'error', message: 'Model output exceeded single-step JSON budget.' };
     }
 
-    const toolName = String(action.tool || 'finish') as AgentToolName;
+    const toolName = String(action.tool || 'reply');
     const thought = String(action.thought || '').trim();
     const cleanArgs = summarizeArgs(action);
-    const sig = `${toolName}:${JSON.stringify(cleanArgs)}`;
 
     const decisionTrace: AgentTraceEntry = {
-      id: `trace-dec-${step}-${Date.now()}`,
+      id: `trace-dec-${turnIndex}-${Date.now()}`,
       phase: 'decision',
-      step,
-      title: `FSM -> ${toolName}`,
-      detail: thought ? `${thought}\n${JSON.stringify(cleanArgs)}` : JSON.stringify(cleanArgs),
+      step: stepCounter,
+      title: `Pi FSM -> ${toolName}`,
+      detail: thought ? `${thought}\n${JSON.stringify(cleanArgs).slice(0, 260)}` : JSON.stringify(cleanArgs).slice(0, 260),
       durationMs: stepRes.decodeMs || 0,
       fsmMedianMs: fsmMs,
       promptTokens: promptLen,
@@ -815,476 +1252,207 @@ export async function runAgentTurn(opts: {
     traceEntries.push(decisionTrace);
     callbacks.onTraceEntry?.(decisionTrace);
 
-    if (toolName === 'finish') {
-      const stillFailing = Boolean(lastTestSummary && lastTestSummary.failed > 0);
-      const noEditsYet = checkpoints.length === 0;
-      if ((stillFailing || lastCommandFailed || noEditsYet) && step < maxSteps && !seenSignatures.has('finish-gate')) {
-        seenSignatures.add('finish-gate');
-        observations.push({
-          step,
-          tool: 'finish',
-          ok: false,
-          full: noEditsYet
-            ? '[Harness Verification Gate]: Cannot finish yet — no files have been modified. Call write_file on src/App.jsx to build the requested application first.'
-            : `[Harness Verification Gate]: Cannot finish yet (${
-                stillFailing
-                  ? `${lastTestSummary!.passed}/${lastTestSummary!.total} tests passed, ${lastTestSummary!.failed} STILL FAILING`
-                  : 'last build/command exited non-zero'
-              }). Fix any remaining error and run "npm run build" via run_command before finishing.`,
-          compact: noEditsYet
-            ? '[Gate]: No code changes written yet; use write_file first.'
-            : '[Gate]: Verification command failed; fix & re-verify before finishing.',
-        });
-        continue;
-      }
-      finishSummary = String(action.summary || '').trim();
-      break;
-    }
-    seenSignatures.delete('finish-gate');
-
-    if (seenSignatures.has(sig)) {
-      if (toolName === 'read_file') {
-        const targetPath = normalizeWorkspacePath(String(action.path || ''));
-        const f = readWorkspaceFile(workspace, targetPath);
-        if (f) {
-          const numbered = formatNumberedContent(f.content, 1, undefined, 130);
-          observations.push({
-            step,
-            tool: toolName,
-            filePath: targetPath,
-            isAutoRead: true,
-            ok: false,
-            full: `[Harness Guard]: ${targetPath} was already read (content shown below). Do NOT call read_file again — call edit_file now with exact old_text and new_text:\n${numbered.text}`,
-            compact: `[Guard]: ${targetPath} already read — call edit_file now.`,
-          });
-          if (step >= maxSteps - 1) break;
-          continue;
-        }
-      }
-      observations.push({
-        step,
-        tool: toolName,
-        ok: false,
-        full: `[Harness Guard]: Tool ${toolName} with identical arguments was already executed. Choose a different file, command, or edit.`,
-        compact: `[Guard]: Repeated ${toolName} skipped.`,
-      });
-      if (step >= maxSteps - 1) break;
-      continue;
-    }
-    seenSignatures.add(sig);
-
-    // Pre-check HITL Approval Gate for side-effecting tools
-    // Skip prompting when Guardrail A will intercept an unread edit_file into an auto-read
-    const targetEditPath = toolName === 'edit_file' ? normalizeWorkspacePath(String(action.path || '')) : '';
-    const unreadBeforeEdit = toolName === 'edit_file' && !readPaths.has(targetEditPath);
-    let deniedReason: string | null = null;
-    if (
-      approvalPolicy === 'ask' &&
-      !approveAllThisRun &&
-      callbacks.onApprovalRequest &&
-      ((toolName === 'edit_file' && !unreadBeforeEdit) ||
-        toolName === 'write_file' ||
-        toolName === 'run_command')
-    ) {
-      let target = '';
-      let preview = '';
-      let added = 0;
-      let removed = 0;
-
-      if (toolName === 'edit_file') {
-        target = normalizeWorkspacePath(String(action.path || ''));
-        const f = readWorkspaceFile(workspace, target);
-        if (f) {
-          const sim = applyEditPatch(
-            target,
-            f.content,
-            String(action.old_text || ''),
-            String(action.new_text || ''),
-          );
-          if (sim.ok) {
-            preview = sim.diffText;
-            added = sim.added;
-            removed = sim.removed;
-          } else {
-            preview = `old_text:\n${String(action.old_text || '')}\n\nnew_text:\n${String(action.new_text || '')}`;
-          }
-        } else {
-          preview = `Missing file: ${target}`;
-        }
-      } else if (toolName === 'write_file') {
-        target = normalizeWorkspacePath(String(action.path || ''));
-        const existing = readWorkspaceFile(workspace, target);
-        const nextContent = String(action.content || '');
-        preview = existing
-          ? formatUnifiedDiff(target, existing.content, nextContent)
-          : nextContent.slice(0, 1200);
-      } else {
-        target = 'jsh';
-        preview = `$ ${String(action.command || '')}`;
-      }
-
-      const tAppr0 = performance.now();
-      const decision = await callbacks.onApprovalRequest({
-        id: `appr-${step}-${Date.now()}`,
-        step,
-        tool: toolName,
+    if (toolName === 'reply') {
+      return {
+        kind: 'reply',
         thought,
-        target,
-        preview,
-        added,
-        removed,
-      });
-      const apprDur = performance.now() - tAppr0;
-
-      if (decision.approved) {
-        if (decision.approveAll) approveAllThisRun = true;
-        const apprTrace: AgentTraceEntry = {
-          id: `trace-appr-${step}-${Date.now()}`,
-          phase: 'approval',
-          step,
-          title: `Approved -> ${toolName} (${target})`,
-          detail: approveAllThisRun ? 'Approved (all remaining for turn)' : 'Approved by user',
-          durationMs: apprDur,
-          ok: true,
-        };
-        traceEntries.push(apprTrace);
-        callbacks.onTraceEntry?.(apprTrace);
-      } else {
-        deniedReason = decision.reason || 'User denied this action.';
-        const denyTrace: AgentTraceEntry = {
-          id: `trace-deny-${step}-${Date.now()}`,
-          phase: 'approval',
-          step,
-          title: `Denied -> ${toolName} (${target})`,
-          detail: deniedReason,
-          durationMs: apprDur,
-          ok: false,
-        };
-        traceEntries.push(denyTrace);
-        callbacks.onTraceEntry?.(denyTrace);
-      }
+        text: String(action.text || '').trim(),
+        decodeTokPerSec: stepRes.decodeTokPerSec || 0,
+      };
     }
 
-    // Execute Tool
-    const tTool0 = performance.now();
-    let ok = true;
-    let output = '';
-    let compactOut = '';
-    let diffText: string | undefined;
-    let added: number | undefined;
-    let removed: number | undefined;
-    let exitCode: number | undefined;
-    let testSummary: NodeTestSummary | null = null;
-    let checkpointId: string | undefined;
-    let isAutoRead = false;
-
-    if (deniedReason !== null) {
-      ok = false;
-      output = `[User Denied ${toolName}]: ${deniedReason}. Adjust your approach or call finish.`;
-      compactOut = `[Denied ${toolName}]: ${deniedReason}`;
-    } else if (toolName === 'list_files') {
-      if (sandbox.listFiles) {
-        workspace = await sandbox.listFiles();
-        callbacks.onWorkspaceUpdate?.(workspace);
-      }
-      const dirPrefix = normalizeWorkspacePath(String(action.dir || ''));
-      const matched = workspace.filter((f) => !dirPrefix || dirPrefix === '.' || f.path.startsWith(dirPrefix));
-      output = formatWorkspaceTree(matched) || '(empty directory)';
-      compactOut = `Listed ${matched.length} files`;
-    } else if (toolName === 'read_file') {
-      const targetPath = normalizeWorkspacePath(String(action.path || ''));
-      let f = readWorkspaceFile(workspace, targetPath);
-      if (!f && sandbox.readFile) {
-        const disk = await sandbox.readFile(targetPath);
-        if (disk !== null) {
-          workspace = upsertWorkspaceFile(workspace, targetPath, disk, false);
-          callbacks.onWorkspaceUpdate?.(workspace);
-          f = readWorkspaceFile(workspace, targetPath);
-        }
-      }
-      if (!f) {
-        ok = false;
-        output = `File "${targetPath}" not found. Project files:\n${formatWorkspaceTree(workspace)}`;
-        compactOut = `read_file "${targetPath}" missing`;
-      } else {
-        readPaths.add(normalizeWorkspacePath(f.path));
-        const numbered = formatNumberedContent(f.content, 1, undefined, 130);
-        output = `${f.path} (lines ${numbered.shownFrom}-${numbered.shownTo} of ${numbered.totalLines}):\n${numbered.text}`;
-        compactOut = `Read ${f.path} (${numbered.totalLines} lines)`;
-        if (checkpoints.length === 0) {
-          callbacks.onOpenFile?.(f.path, 'code');
-        }
-      }
-    } else if (toolName === 'grep_files') {
-      const pat = String(action.pattern || '');
-      const hits = grepWorkspaceFiles(workspace, pat);
-      output = hits.length > 0 ? hits.join('\n') : `No matches found for "${pat}".`;
-      compactOut = `grep "${pat}": ${hits.length} hit(s)`;
-    } else if (toolName === 'edit_file') {
-      const targetPath = normalizeWorkspacePath(String(action.path || ''));
-      let existing = readWorkspaceFile(workspace, targetPath);
-      if (!existing && sandbox.readFile) {
-        const disk = await sandbox.readFile(targetPath);
-        if (disk !== null) {
-          workspace = upsertWorkspaceFile(workspace, targetPath, disk, false);
-          callbacks.onWorkspaceUpdate?.(workspace);
-          existing = readWorkspaceFile(workspace, targetPath);
-        }
-      }
-      if (!existing) {
-        ok = false;
-        output = `Cannot edit "${targetPath}": file not found.`;
-        compactOut = `edit_file "${targetPath}" missing`;
-      } else if (!readPaths.has(targetPath)) {
-        // Guardrail A: force reading unread files before accepting blind patches
-        readPaths.add(targetPath);
-        seenSignatures.delete(sig);
-        isAutoRead = true;
-        const numbered = formatNumberedContent(existing.content, 1, undefined, 200);
-        ok = false;
-        output = `[Harness Guard]: You must read ${targetPath} before editing it. Here is the current content of ${targetPath} (lines ${numbered.shownFrom}-${numbered.shownTo} of ${numbered.totalLines}):\n${numbered.text}\nNow call edit_file with exact old_text.`;
-        compactOut = `Auto-read ${targetPath} before edit`;
-        callbacks.onOpenFile?.(targetPath, 'code');
-      } else {
-        const patchRes = applyEditPatch(
-          targetPath,
-          existing.content,
-          String(action.old_text || ''),
-          String(action.new_text || ''),
-        );
-        if (!patchRes.ok) {
-          ok = false;
-          output = patchRes.error;
-          compactOut = `edit_file "${targetPath}" failed to match`;
-        } else {
-          const normalizedUpdated = normalizeReactModuleContent(targetPath, patchRes.updatedContent);
-          const syntaxErr = validateCodeSyntax(targetPath, normalizedUpdated, workspace);
-
-          if (syntaxErr !== null) {
-            // Guardrail B: reject syntax-breaking edits and keep original file intact
-            const currentNumbered = formatNumberedContent(existing.content, 1, undefined, 130);
-            ok = false;
-            output = `SyntaxError introduced in ${targetPath} — edit was rolled back automatically:\n${syntaxErr}\n\nCurrent ${targetPath} content:\n${currentNumbered.text}\n\nFix the syntax in your next edit_file call.`;
-            compactOut = `Syntax error in ${targetPath} (auto-reverted)`;
-          } else {
-            await sandbox.writeFile(targetPath, normalizedUpdated);
-            workspace = upsertWorkspaceFile(workspace, targetPath, normalizedUpdated, true, {
-              addedLines: (existing.addedLines || 0) + patchRes.added,
-              removedLines: (existing.removedLines || 0) + patchRes.removed,
-            });
-            callbacks.onWorkspaceUpdate?.(workspace);
-
-            checkpointId = `ckpt-${step}-${Date.now()}`;
-            const ckpt: WorkspaceCheckpoint = {
-              id: checkpointId,
-              step,
-              tool: 'edit_file',
-              path: targetPath,
-              existedBefore: true,
-              beforeContent: existing.content,
-              afterContent: normalizedUpdated,
-              added: patchRes.added,
-              removed: patchRes.removed,
-              diffText: patchRes.diffText,
-              createdAt: Date.now(),
-            };
-            checkpoints.push(ckpt);
-            callbacks.onCheckpoint?.(ckpt);
-            callbacks.onOpenFile?.(targetPath, 'diff');
-
-            diffText = patchRes.diffText;
-            added = patchRes.added;
-            removed = patchRes.removed;
-            editedSinceLastTest = true;
-            isAutoRead = true;
-
-            // Clear stale command cache signatures since source changed
-            for (const s of [...seenSignatures]) {
-              if (s.startsWith('run_command:')) {
-                seenSignatures.delete(s);
-              }
-            }
-
-            // Refresh any cached read_file observation of this path so the model sees current lines
-            const updatedNumbered = formatNumberedContent(normalizedUpdated, 1, undefined, 130);
-            for (const prevObs of observations) {
-              if ((prevObs.tool === 'read_file' || prevObs.isAutoRead) && prevObs.filePath === targetPath) {
-                prevObs.full = `[Current ${targetPath} after Step ${step} edit (${updatedNumbered.totalLines} lines)]:\n${updatedNumbered.text}`;
-              }
-            }
-
-            output = `Patched ${targetPath} (+${patchRes.added}/-${patchRes.removed}):\n${patchRes.diffText}\n\nCurrent ${targetPath} (${updatedNumbered.totalLines} lines):\n${updatedNumbered.text}`;
-            compactOut = `Patched ${targetPath} (+${patchRes.added}/-${patchRes.removed})`;
-          }
-        }
-      }
-    } else if (toolName === 'write_file') {
-      const targetPath = normalizeWorkspacePath(String(action.path || 'untitled.txt'));
-      const content = normalizeReactModuleContent(targetPath, String(action.content || ''));
-      const existing = readWorkspaceFile(workspace, targetPath);
-      const before = existing ? existing.content : '';
-      const syntaxErr = validateCodeSyntax(targetPath, content, workspace);
-      if (syntaxErr) {
-        ok = false;
-        exitCode = 1;
-        output = `[Syntax Error]: Proposed write to ${targetPath} failed syntax validation and was NOT written to disk:\n${syntaxErr}`;
-        compactOut = `write_file syntax error in ${targetPath}`;
-      } else {
-        const diffCounts = computeLineDiff(before, content);
-        const computedDiff = formatUnifiedDiff(targetPath, before, content);
-
-        await sandbox.writeFile(targetPath, content);
-        readPaths.add(targetPath);
-        workspace = upsertWorkspaceFile(workspace, targetPath, content, true, {
-          addedLines: diffCounts.added,
-          removedLines: diffCounts.removed,
-        });
-        callbacks.onWorkspaceUpdate?.(workspace);
-
-        checkpointId = `ckpt-${step}-${Date.now()}`;
-        const ckpt: WorkspaceCheckpoint = {
-          id: checkpointId,
-          step,
-          tool: 'write_file',
-          path: targetPath,
-          existedBefore: Boolean(existing),
-          beforeContent: before,
-          afterContent: content,
-          added: diffCounts.added,
-          removed: diffCounts.removed,
-          diffText: computedDiff,
-          createdAt: Date.now(),
-        };
-        checkpoints.push(ckpt);
-        callbacks.onCheckpoint?.(ckpt);
-        callbacks.onOpenFile?.(targetPath, existing ? 'diff' : 'code');
-
-        diffText = computedDiff;
-        added = diffCounts.added;
-        removed = diffCounts.removed;
-        editedSinceLastTest = true;
-        isAutoRead = true;
-        for (const s of [...seenSignatures]) {
-          if (s.startsWith('run_command:')) {
-            seenSignatures.delete(s);
-          }
-        }
-
-        const updatedNumbered = formatNumberedContent(content, 1, undefined, 130);
-        for (const prevObs of observations) {
-          if ((prevObs.tool === 'read_file' || prevObs.isAutoRead) && prevObs.filePath === targetPath) {
-            prevObs.full = `[Current ${targetPath} after Step ${step} write (${updatedNumbered.totalLines} lines)]:\n${updatedNumbered.text}`;
-          }
-        }
-
-        output = `Wrote ${content.length} chars to ${targetPath} (${updatedNumbered.totalLines} lines):\n${updatedNumbered.text}`;
-        compactOut = `Wrote ${targetPath} (${content.length} chars)`;
-      }
-    } else if (toolName === 'run_command') {
-      const cmd = String(action.command || '').trim() || 'npm test';
-      const cmdRes = await sandbox.runCommand(cmd);
-      exitCode = cmdRes.exitCode;
-      ok = cmdRes.exitCode === 0;
-      lastCommandFailed = cmdRes.exitCode !== 0;
-      if (lastCommandFailed) {
-        for (const s of [...seenSignatures]) {
-          if (s.startsWith('read_file:')) {
-            seenSignatures.delete(s);
-          }
-        }
-      }
-      const cleanOut = stripAnsi(cmdRes.output);
-      testSummary = cmdRes.testSummary || parseNodeTestOutput(cleanOut);
-      if (testSummary) {
-        lastTestSummary = testSummary;
-        editedSinceLastTest = false;
-      }
-
-      const compactOutText = compactCommandOutput(cleanOut);
-      output = `$ ${cmd} (exit ${cmdRes.exitCode}, ${Math.round(cmdRes.durationMs)}ms)\n${compactOutText || '(no output)'}`;
-      compactOut = testSummary
-        ? `$ ${cmd} -> exit ${cmdRes.exitCode} (${testSummary.passed}/${testSummary.total} passed)`
-        : `$ ${cmd} -> exit ${cmdRes.exitCode}`;
-    }
-
-    const toolDur = performance.now() - tTool0;
-    const record: AgentToolCallRecord = {
-      id: `tc-${step}-${Date.now()}`,
-      step,
-      tool: toolName,
+    const callId = `tc-${turnIndex}-${Date.now()}`;
+    const tc: PiToolCallContent = {
+      type: 'toolCall',
+      id: callId,
+      name: toolName,
+      arguments: cleanArgs,
       thought,
-      args: cleanArgs,
-      output,
-      ok,
-      durationMs: toolDur,
-      fsmMedianMs: fsmMs,
-      diffText,
-      added,
-      removed,
-      exitCode,
-      testSummary,
-      checkpointId,
-    };
-    toolCalls.push(record);
-    callbacks.onToolStepComplete?.(record);
-
-    const toolTrace: AgentTraceEntry = {
-      id: `trace-tool-${step}-${Date.now()}`,
-      phase: 'tool',
-      step,
-      title: `${toolName} (${ok ? 'ok' : 'err'})`,
-      detail: output.slice(0, 700),
-      durationMs: toolDur,
       fsmMedianMs: fsmMs,
       promptTokens: promptLen,
-      ok,
+      durationMs: stepRes.decodeMs || 0,
     };
-    traceEntries.push(toolTrace);
-    callbacks.onTraceEntry?.(toolTrace);
+    actionCallMap.set(callId, tc);
+    return { kind: 'toolCall', tc };
+  };
 
-    const obsCap = toolName === 'read_file' || isAutoRead ? 5600 : 2400;
-    const obsFilePath =
-      toolName === 'read_file' || toolName === 'edit_file' || toolName === 'write_file'
-        ? normalizeWorkspacePath(String(action.path || ''))
-        : undefined;
-    observations.push({
-      step,
-      tool: toolName,
-      filePath: obsFilePath,
-      isAutoRead,
-      ok,
-      full: `[Step ${step} ${toolName} -> ${ok ? 'OK' : 'ERROR'}]:\n${output.slice(0, obsCap)}`,
-      compact: `[Step ${step} ${toolName} -> ${ok ? 'OK' : 'ERROR'}]: ${compactOut}`,
-    });
-  }
+  let directReplyText = '';
 
-  // Final Synthesis Stage
+  const updatedTranscript = await agent.prompt(effectiveTaskPrompt, {
+    maxTurns: maxSteps,
+    streamFn: async (context, turnIndex) => {
+      stepCounter = turnIndex;
+      callbacks.onToolStepStart?.(turnIndex, maxSteps);
+      const stepOutcome = await runDecisionStep(context, turnIndex);
+
+      if (stepOutcome.kind === 'stop') {
+        const stoppedMsg: PiAssistantMessage = {
+          role: 'assistant',
+          content: [{ type: 'text', text: stepOutcome.message }],
+          stopReason: stepOutcome.reason,
+          timestamp: Date.now(),
+        };
+        return stoppedMsg;
+      }
+
+      if (stepOutcome.kind === 'reply') {
+        directReplyText = stepOutcome.text;
+        return {
+          role: 'assistant',
+          content: [{ type: 'text', text: stepOutcome.text }],
+          stopReason: 'stop',
+          timestamp: Date.now(),
+        };
+      }
+
+      return {
+        role: 'assistant',
+        content: [stepOutcome.tc],
+        stopReason: 'toolUse',
+        timestamp: Date.now(),
+      };
+    },
+    beforeToolCall: async ({ toolCall, args }) => {
+      const name = toolCall.name;
+      if (name === 'read') {
+        const targetPath = normalizeWorkspacePath(String(args.path ?? ''));
+        if (targetPath && freshReadPaths.has(targetPath)) {
+          return {
+            block: true,
+            reason: `[Pi Harness]: ${targetPath} is already shown in full in the tool results above and has not changed. Do NOT call 'read' on ${targetPath} again — call 'write' on src/App.jsx with the complete new application code (or read a different unread file such as src/App.css).`,
+          };
+        }
+        return;
+      }
+      if (name !== 'write' && name !== 'edit' && name !== 'bash') {
+        return;
+      }
+
+      let preview = '';
+      let target = '';
+      let added: number | undefined;
+      let removed: number | undefined;
+
+      if (name === 'write') {
+        const prep = await prepareWrite(String(args.path ?? ''), String(args.content ?? ''));
+        if (!prep.ok) {
+          return { block: true, reason: prep.error };
+        }
+        preparedMutations.set(toolCall.id, prep.payload);
+        target = prep.payload.targetPath;
+        preview = prep.payload.diffText;
+        added = prep.payload.added;
+        removed = prep.payload.removed;
+      } else if (name === 'edit') {
+        const prep = await prepareEdit(
+          String(args.path ?? ''),
+          String(args.oldText ?? ''),
+          String(args.newText ?? ''),
+        );
+        if (!prep.ok) {
+          return { block: true, reason: prep.error };
+        }
+        preparedMutations.set(toolCall.id, prep.payload);
+        target = prep.payload.targetPath;
+        preview = prep.payload.diffText;
+        added = prep.payload.added;
+        removed = prep.payload.removed;
+      } else {
+        target = 'jsh';
+        preview = `$ ${String(args.command ?? '')}`;
+      }
+
+      if (approvalPolicy === 'ask' && !approveAllThisRun && callbacks.onApprovalRequest) {
+        const tAppr0 = performance.now();
+        const decision = await callbacks.onApprovalRequest({
+          id: `appr-${stepCounter}-${Date.now()}`,
+          step: stepCounter,
+          tool: name,
+          thought: toolCall.thought || '',
+          target,
+          preview,
+          added,
+          removed,
+        });
+        const apprDur = performance.now() - tAppr0;
+
+        if (decision.approved) {
+          if (decision.approveAll) approveAllThisRun = true;
+          const apprTrace: AgentTraceEntry = {
+            id: `trace-appr-${stepCounter}-${Date.now()}`,
+            phase: 'approval',
+            step: stepCounter,
+            title: `Approved -> ${name} (${target})`,
+            detail: approveAllThisRun ? 'Approved (all remaining for turn)' : 'Approved by user',
+            durationMs: apprDur,
+            ok: true,
+          };
+          traceEntries.push(apprTrace);
+          callbacks.onTraceEntry?.(apprTrace);
+        } else {
+          preparedMutations.delete(toolCall.id);
+          const denyReason = decision.reason || 'User denied this action.';
+          const denyTrace: AgentTraceEntry = {
+            id: `trace-deny-${stepCounter}-${Date.now()}`,
+            phase: 'approval',
+            step: stepCounter,
+            title: `Denied -> ${name} (${target})`,
+            detail: denyReason,
+            durationMs: apprDur,
+            ok: false,
+          };
+          traceEntries.push(denyTrace);
+          callbacks.onTraceEntry?.(denyTrace);
+          return { block: true, reason: `[User Denied ${name}]: ${denyReason}.` };
+        }
+      }
+    },
+    getSteeringMessages: ({ lastAssistantMessage }) => {
+      if (lastAssistantMessage.stopReason !== 'stop') return [];
+      const needFixAfterError = lastToolError && stepCounter < maxSteps - 1;
+      const needCodeFirst = checkpoints.length === 0 && !hasPriorCheckpointsInTranscript && stepCounter < maxSteps - 1;
+      if (!retriedReplyGate && (needFixAfterError || needCodeFirst)) {
+        retriedReplyGate = true;
+        directReplyText = '';
+        const msg = needFixAfterError
+          ? '[Pi Steering]: The previous tool call failed. Recover by calling "write" on src/App.jsx with valid, complete pure React + CSS code before replying.'
+          : '[Pi Steering]: No code files were modified yet. Call "write" on src/App.jsx now to implement the application before replying.';
+        return [{ role: 'user', content: msg, timestamp: Date.now() }];
+      }
+      return [];
+    },
+  });
+
+  // Final Grounded Response (either direct rich Pi reply or grounded Markdown synthesis / 24 kHz voice)
   let finalText = '';
   let audioUrl: string | undefined;
 
   const needVoiceSynth = Boolean(capabilities.audioOut && generationMode !== 'text');
-  const shouldSynthesize =
-    !wasAborted && (toolCalls.length > 0 || needVoiceSynth || finishSummary.length < 140);
+  const shouldUseDirectReply = !needVoiceSynth && directReplyText.length >= 80 && checkpoints.length > 0;
 
-  if (shouldSynthesize) {
-    callbacks.onStatusText?.(lang === 'zh' ? '正在汇总修改与测试结果...' : 'Synthesizing engineering summary...');
+  if (wasAborted) {
+    finalText = directReplyText || 'Stopped.';
+    callbacks.onFinalToken?.(finalText, 0);
+  } else if (shouldUseDirectReply) {
+    finalText = directReplyText;
+    callbacks.onFinalToken?.(finalText, 0);
+  } else {
+    callbacks.onStatusText?.(lang === 'zh' ? '正在汇总修改结果...' : 'Synthesizing engineering summary...');
     const tSynth0 = performance.now();
     await client.reset();
 
-    const evidenceBlock =
-      observations.length > 0
-        ? `\n\nObserved Tool Execution Results:\n${buildCompactObservationsBlock(observations, 4, maxSeqLen <= 4096 ? 4800 : 8500)}`
-        : '';
-    const verifiedLine = lastTestSummary
-      ? `Verified latest test result: ${lastTestSummary.passed}/${lastTestSummary.total} tests passed (${lastTestSummary.failed} failed). CRITICAL: NEVER claim tests passed if failed > 0.`
-      : 'Verified command execution log above.';
-    const finishNote = finishSummary ? `\n\nAgent Draft Summary:\n${finishSummary}` : '';
-    const synthUserPrompt = `${historyText ? `Prior context:\n${historyText}\n\n` : ''}Original task:\n${userPrompt}${evidenceBlock}\n\n${verifiedLine}${finishNote}\n\nWrite a concise Markdown summary stating exact files created/modified and observed results.`;
+    const evidenceSummary = serializePiContextMessages(updatedTranscript.slice(-8), maxSeqLen);
+    const lastTest = lastTestSummaryRef.current;
+    const verifiedLine = lastTest
+      ? `Observed test summary: ${lastTest.passed}/${lastTest.total} passed (${lastTest.failed} failed).`
+      : checkpoints.length > 0
+        ? `Updated files: ${[...new Set(checkpoints.map((c) => c.path))].join(', ')}.`
+        : 'No workspace files were modified in this turn.';
+    const synthUserPrompt = `Task:\n${userPrompt}\n\nExecuted Activity:\n${evidenceSummary}\n\n${verifiedLine}\n\nWrite a concise Markdown summary stating exact files modified and observed results.`;
 
     const useThinking = Boolean(capabilities.thinking && enableThinking && !needVoiceSynth);
     const synthPrompt = formatSingleTurnPrompt(archKind, {
-      systemPrompt:
-        'You are Ignis Assistant. Summarize code changes and observed build/command results accurately in Markdown.',
+      systemPrompt: 'You are Ignis Assistant. Summarize file changes and observed results accurately in Markdown.',
       userPrompt: synthUserPrompt,
       enableThinking: useThinking,
       effort,
@@ -1308,11 +1476,11 @@ export async function runAgentTurn(opts: {
         images: [],
         audios: [],
         generationMode: needVoiceSynth ? generationMode : 'text',
-        maxNewTokens: Math.min(maxNewTokens, 768),
-        maxThinkingTokens: archKind === 'spark' && useThinking ? (effort === 'low' ? 256 : 512) : 0,
+        maxNewTokens: Math.min(maxNewTokens, 640),
+        maxThinkingTokens: archKind === 'spark' && useThinking ? (effort === 'low' ? 192 : 384) : 0,
         chunkSize: 64,
         sampling: {
-          temperature: 0.35,
+          temperature: 0.3,
           topK: 40,
           topP: 0.95,
           repetitionPenalty: archKind === 'spark' ? 1.05 : 1.0,
@@ -1328,7 +1496,7 @@ export async function runAgentTurn(opts: {
     }
     finalText = thinkPrefix
       ? `${thinkPrefix}${synthRes.generatedText || ''}`
-      : synthRes.generatedText || finishSummary;
+      : synthRes.generatedText || directReplyText || 'Completed.';
     totalPromptTokens += synthRes.promptLen || synthPromptLen;
     totalGeneratedTokens += synthRes.generatedIds.length;
     totalDecodeMs += synthRes.decodeMs || performance.now() - tSynth0;
@@ -1348,9 +1516,6 @@ export async function runAgentTurn(opts: {
     };
     traceEntries.push(synthTrace);
     callbacks.onTraceEntry?.(synthTrace);
-  } else {
-    finalText = finishSummary || 'Task completed.';
-    callbacks.onFinalToken?.(finalText, 0);
   }
 
   return {
@@ -1359,7 +1524,8 @@ export async function runAgentTurn(opts: {
     traceEntries,
     workspaceFiles: workspace,
     checkpoints,
-    testSummary: lastTestSummary,
+    transcriptMessages: updatedTranscript,
+    testSummary: lastTestSummaryRef.current,
     audioUrl,
     totalPromptTokens,
     totalGeneratedTokens,

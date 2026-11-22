@@ -16,6 +16,7 @@ import {
   type PendingAudioInput,
   type PendingImageInput,
 } from '@/lib/agent-harness';
+import type { PiAgentMessage } from '@/lib/pi-agent-core';
 import { COPY, type UiLang } from '@/lib/i18n';
 import {
   buildSparkSystemPrefix,
@@ -264,6 +265,7 @@ export function ChatWorkspace({
   const workspaceRef = useRef(workspaceFiles);
   workspaceRef.current = workspaceFiles;
   const approvalResolverRef = useRef<((d: ApprovalDecision) => void) | null>(null);
+  const piTranscriptRef = useRef<PiAgentMessage[]>([]);
 
   const customModelPreset: ModelPreset = {
     id: CUSTOM_MODEL_ID,
@@ -421,6 +423,7 @@ export function ChatWorkspace({
       }
       loadedModelIdRef.current = null;
       kvTurnsRef.current = 0;
+      piTranscriptRef.current = [];
 
       if (navigator.storage?.getDirectory) {
         const root = await navigator.storage.getDirectory();
@@ -654,6 +657,7 @@ export function ChatWorkspace({
     revokeAllObjectUrls();
     kvTurnsRef.current = 0;
     kvThinkingKeyRef.current = '';
+    piTranscriptRef.current = [];
     setPendingImage(null);
     setPendingAudio(null);
     setMessages([]);
@@ -786,6 +790,7 @@ export function ChatWorkspace({
     }
     setDiffOriginals({});
     setCheckpoints([]);
+    piTranscriptRef.current = [];
     setSelectedFilePath('src/App.jsx');
     setEditorMode('code');
     setPreviewRefreshSeq((s) => s + 1);
@@ -1117,6 +1122,7 @@ export function ChatWorkspace({
         capabilities: modelForTurn.capabilities,
         userPrompt: promptText,
         historyText,
+        transcriptMessages: piTranscriptRef.current,
         workspaceFiles: workspaceRef.current,
         approvalPolicy,
         attachedImage: imgAttach,
@@ -1226,6 +1232,7 @@ export function ChatWorkspace({
         ),
       );
       setContextBudget({ peak: result.peakPromptTokens, max: result.maxSeqLen });
+      piTranscriptRef.current = result.transcriptMessages;
       if (result.checkpoints.length > 0) {
         const lastEdited = result.checkpoints[result.checkpoints.length - 1];
         setSelectedFilePath(lastEdited.path);

@@ -49,16 +49,11 @@ interface TopBarProps {
   onLoadModel: () => void;
 }
 
-export function SparkMark({ size = 16 }: { size?: number }) {
+export function SparkMark({ size = 20 }: { size?: number }) {
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path
-        d="M13.2 2.5L5.5 13.4H11.5L10.4 21.5L18.5 10.6H12.4L13.2 2.5Z"
-        fill="#f97316"
-        stroke="#fb923c"
-        strokeWidth="1.1"
-        strokeLinejoin="round"
-      />
+    <svg width={size} height={size} viewBox="0 0 32 32" fill="none" aria-hidden="true">
+      <rect width="32" height="32" rx="8" fill="#09090b" />
+      <path d="M16 5L22 14L17.5 14L20 27L10 17L14.5 17L16 5Z" fill="#f97316" />
     </svg>
   );
 }
@@ -123,7 +118,7 @@ export function TopBar(props: TopBarProps) {
     <header className="topbar">
       <div className="topbar-left">
         <div className="brand-lockup">
-          <SparkMark size={17} />
+          <SparkMark size={20} />
           <span className="brand-wordmark">{t.brandName}</span>
         </div>
 

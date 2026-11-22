@@ -235,14 +235,18 @@ function summarizeToolCall(tc: AgentToolCallRecord, lang: UiLang): string {
   switch (tc.tool) {
     case 'list_files':
       return lang === 'zh' ? `列出目录 ${dir}` : `List ${dir}`;
+    case 'read':
     case 'read_file':
-      return lang === 'zh' ? `读取 ${path}` : `Read ${path}`;
+      return lang === 'zh' ? `读取 ${path || '.'}` : `Read ${path || '.'}`;
     case 'grep_files':
       return lang === 'zh' ? `搜索 "${pattern}"` : `Grep "${pattern}"`;
+    case 'edit':
     case 'edit_file':
-      return lang === 'zh' ? `补丁修改 ${path}` : `Edit ${path}`;
+      return lang === 'zh' ? `编辑 ${path}` : `Edit ${path}`;
+    case 'write':
     case 'write_file':
       return lang === 'zh' ? `写入 ${path}` : `Write ${path}`;
+    case 'bash':
     case 'run_command':
       return `$ ${command}`;
     default:
@@ -254,13 +258,17 @@ function ToolIcon({ tool }: { tool: AgentToolCallRecord['tool'] }) {
   switch (tool) {
     case 'list_files':
       return <FolderTree size={13} style={{ color: '#a1a1aa', flexShrink: 0 }} />;
+    case 'read':
     case 'read_file':
       return <FileText size={13} style={{ color: '#60a5fa', flexShrink: 0 }} />;
     case 'grep_files':
       return <Search size={13} style={{ color: '#38bdf8', flexShrink: 0 }} />;
+    case 'edit':
     case 'edit_file':
+    case 'write':
     case 'write_file':
       return <FileCode2 size={13} style={{ color: '#4ade80', flexShrink: 0 }} />;
+    case 'bash':
     case 'run_command':
       return <Terminal size={13} style={{ color: '#fb923c', flexShrink: 0 }} />;
     default:
@@ -487,7 +495,7 @@ export function ThreadView(props: ThreadViewProps) {
           return (
             <div key={m.id} className="turn-assistant msg assistant">
               <div className="assistant-avatar">
-                <SparkMark size={14} />
+                <SparkMark size={20} />
               </div>
 
               <div className="assistant-body">

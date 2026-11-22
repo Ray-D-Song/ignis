@@ -55,15 +55,6 @@ export function discoverIgnisModels(): ModelPreset[] {
       sizeLabel: '1.8 GB',
       licenseName: 'LFM Open License v1.0',
     },
-    {
-      id: 'gemma-4-e4b',
-      folder: 'gemma-4-e4b-ignis',
-      shortName: 'Gemma-4 E4B',
-      label: 'Gemma-4 E4B · High-Capacity Omni',
-      description: 'High-capacity multimodal & reasoning',
-      sizeLabel: '6.2 GB',
-      licenseName: 'Gemma Terms of Use',
-    },
   ];
 
   const available: ModelPreset[] = [];

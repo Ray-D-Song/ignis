@@ -92,28 +92,5 @@ export function getPublicCdnModels(cdnBaseRaw: string): ModelPreset[] {
         thinking: false,
       },
     },
-    {
-      id: 'gemma-4-e4b',
-      shortName: 'Gemma-4 E4B',
-      label: 'Gemma-4 E4B · High-Capacity Omni',
-      description: 'High-capacity multimodal & reasoning',
-      sizeLabel: '6.2 GB',
-      dirPath: `${base}/gemma-4-e4b-ignis`,
-      modelBaseUrl: `${base}/gemma-4-e4b-ignis`,
-      lmHeadDtype: 'u32_q8',
-      architecture: 'gemma4_text',
-      topModelType: 'gemma4',
-      gpuMiB: 2532.7,
-      embdMiB: 644.0,
-      pleMiB: 2692.0,
-      licenseName: 'Gemma Terms of Use',
-      requiresTermsAck: true,
-      capabilities: {
-        vision: true,
-        audioIn: true,
-        audioOut: false,
-        thinking: true,
-      },
-    },
   ];
 }

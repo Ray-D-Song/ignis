@@ -25,7 +25,7 @@ export interface WorkspaceFile {
 export interface WorkspaceCheckpoint {
   id: string;
   step: number;
-  tool: 'edit_file' | 'write_file' | 'manual';
+  tool: 'edit' | 'write' | 'edit_file' | 'write_file' | 'manual';
   path: string;
   existedBefore: boolean;
   beforeContent: string;

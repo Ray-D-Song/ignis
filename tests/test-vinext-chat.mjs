@@ -168,6 +168,9 @@ async function main() {
     if (!modelOptions.includes('spark-1.7b-q8head')) {
       throw new Error(`Expected model selector to include 'spark-1.7b-q8head', got ${JSON.stringify(modelOptions)}`);
     }
+    if (modelOptions.includes('gemma-4-e4b')) {
+      throw new Error(`Expected 'gemma-4-e4b' to be removed from model selector, got ${JSON.stringify(modelOptions)}`);
+    }
 
     // Click Load Model and wait until ready
     await page.click('#btn-load-model');
@@ -250,22 +253,23 @@ async function main() {
     if (!doneReached) {
       throw new Error('Timed out after 300000ms waiting for Spark Agent turn + synthesis to finish');
     }
-    if (approvalCount < 1) {
-      throw new Error('Expected at least 1 HITL #approval-card prompt during Spark Agent turn');
-    }
-
     const sparkTools = await page.locator('.tool-call-card').count();
     const toolSummaries = await page.locator('.tool-call-summary').allInnerTexts();
     const agentOut = await page.locator('.msg.assistant .answer-body').last().innerText();
-    console.log('[spark-agent] tools=', sparkTools, toolSummaries.map((s) => s.replace(/\s+/g, ' ')));
-    console.log('[spark-agent-answer]', agentOut.trim().slice(0, 180));
+    console.log('[spark-agent] approvals=', approvalCount, 'tools=', sparkTools, toolSummaries.map((s) => s.replace(/\s+/g, ' ')));
+    console.log('[spark-agent-answer]', agentOut.trim().slice(0, 240));
+    if (approvalCount < 1 || sparkTools < 2) {
+      await page.click('#tab-btn-trace').catch(() => {});
+      const traces = await page.locator('[data-testid="trace-entry"]').allInnerTexts().catch(() => []);
+      console.log('[spark-agent-traces]', traces.map((x) => x.replace(/\s+/g, ' ')));
+    }
+    if (approvalCount < 1) {
+      throw new Error('Expected at least 1 HITL #approval-card prompt during Spark Agent turn');
+    }
     if (agentOut.trim().length < 10) {
       throw new Error(`Expected substantive Agent answer, got "${agentOut}"`);
     }
     if (sparkTools < 2) {
-      await page.click('#tab-btn-trace').catch(() => {});
-      const traces = await page.locator('[data-testid="trace-entry"]').allInnerTexts().catch(() => []);
-      console.log('[spark-agent-traces]', traces.map((x) => x.replace(/\s+/g, ' ')));
       throw new Error(`Expected >= 2 tool calls on Spark Agent app-building run, got ${sparkTools}`);
     }
 
