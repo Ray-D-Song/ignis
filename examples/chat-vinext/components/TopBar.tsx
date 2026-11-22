@@ -4,7 +4,9 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   Check,
   ChevronDown,
+  Download,
   Eye,
+  Loader2,
   PanelLeft,
   PanelRight,
   RefreshCw,
@@ -93,11 +95,13 @@ export function TopBar(props: TopBarProps) {
   const dotClass =
     status === 'ready'
       ? 'ready'
-      : status === 'loading' || status === 'generating'
-        ? 'busy'
-        : status === 'error'
-          ? 'error'
-          : '';
+      : status === 'idle'
+        ? 'idle'
+        : status === 'loading' || status === 'generating'
+          ? 'busy'
+          : status === 'error'
+            ? 'error'
+            : '';
 
   const termsBlocked = Boolean(activeModel?.requiresTermsAck && !termsAcked);
   const displayName = activeModel.isCustom
@@ -283,18 +287,24 @@ export function TopBar(props: TopBarProps) {
               <span>{t.reloadModel}</span>
             </>
           ) : status === 'loading' ? (
-            <span>{t.loadingPct(loadPct)}</span>
+            <>
+              <Loader2 size={13} className="spin-icon" />
+              <span>{t.loadingPct(loadPct)}</span>
+            </>
           ) : (
-            <span>
-              {t.loadModel}
-              {activeModel.sizeLabel ? ` (${activeModel.sizeLabel})` : ''}
-            </span>
+            <>
+              <Download size={12} />
+              <span>
+                {t.loadModel}
+                {activeModel.sizeLabel ? ` (${activeModel.sizeLabel})` : ''}
+              </span>
+            </>
           )}
         </button>
       </div>
 
       <div className="topbar-right">
-        <div className="status-pill" title={statusText}>
+        <div className={`status-pill ${status}`} title={statusText}>
           <span className={`status-dot ${dotClass}`} />
           <span id="status-text">{statusText}</span>
         </div>

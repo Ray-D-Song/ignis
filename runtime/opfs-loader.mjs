@@ -56,6 +56,16 @@ async function streamUrlToOpfs(url, dirHandle, filename, expectedBytes, onChunk)
   }
   const fh = await dirHandle.getFileHandle(filename, { create: true });
   const reader = resp.body.getReader();
+  const totalBytes = expectedBytes ?? (Number(resp.headers.get('content-length')) || 0);
+  let lastEmitAt = 0;
+  const emit = (offset, force = false) => {
+    if (!onChunk) return;
+    const now = performance.now();
+    if (force || now - lastEmitAt >= 60) {
+      lastEmitAt = now;
+      onChunk(offset, totalBytes);
+    }
+  };
 
   if (typeof fh.createSyncAccessHandle === 'function') {
     const access = await fh.createSyncAccessHandle();
@@ -70,8 +80,9 @@ async function streamUrlToOpfs(url, dirHandle, filename, expectedBytes, onChunk)
           written += access.write(value.subarray(written), { at: offset + written });
         }
         offset += value.byteLength;
-        if (onChunk) onChunk(offset, expectedBytes);
+        emit(offset);
       }
+      emit(offset, true);
       access.flush();
       if (expectedBytes != null && offset !== expectedBytes) {
         throw new Error(`Size mismatch streaming ${filename}: got ${offset}, expected ${expectedBytes}`);
@@ -88,8 +99,9 @@ async function streamUrlToOpfs(url, dirHandle, filename, expectedBytes, onChunk)
         if (done) break;
         await writable.write(value);
         offset += value.byteLength;
-        if (onChunk) onChunk(offset, expectedBytes);
+        emit(offset);
       }
+      emit(offset, true);
       await writable.close();
     } catch (e) {
       await writable.abort();
@@ -100,6 +112,19 @@ async function streamUrlToOpfs(url, dirHandle, filename, expectedBytes, onChunk)
 
 export async function ensureOpfsModel(modelBaseUrl, modelKey, { onProgress } = {}) {
   const dirHandle = await getModelDir(modelKey);
+  if (onProgress) {
+    onProgress({
+      phase: 'manifest',
+      file: 'manifest.json',
+      loaded: 0,
+      total: 0,
+      overallLoaded: 0,
+      overallTotal: 0,
+      fileIndex: 0,
+      fileCount: 0,
+      cached: false,
+    });
+  }
   const manifestResp = await fetch(`${modelBaseUrl}/manifest.json`);
   if (!manifestResp.ok) throw new Error(`Failed to fetch manifest.json: ${manifestResp.status}`);
   const manifestText = await manifestResp.text();
@@ -109,7 +134,12 @@ export async function ensureOpfsModel(modelBaseUrl, modelKey, { onProgress } = {
   let cacheHits = 0;
   let cacheMisses = 0;
 
-  for (const shard of manifest.shards) {
+  const fileCount = manifest.shards.length;
+  const overallTotal = manifest.shards.reduce((sum, s) => sum + (s.bytes || 0), 0);
+  let completedBytes = 0;
+
+  for (let idx = 0; idx < fileCount; idx++) {
+    const shard = manifest.shards[idx];
     const recorded = cachedState.shards[shard.file];
     let hit = false;
     if (recorded && recorded.sha256 === shard.sha256 && recorded.bytes === shard.bytes) {
@@ -125,14 +155,39 @@ export async function ensureOpfsModel(modelBaseUrl, modelKey, { onProgress } = {
     }
     if (hit) {
       cacheHits += 1;
-      if (onProgress) onProgress({ file: shard.file, loaded: shard.bytes, total: shard.bytes, cached: true });
+      if (onProgress) {
+        onProgress({
+          phase: 'cache',
+          file: shard.file,
+          loaded: shard.bytes,
+          total: shard.bytes,
+          overallLoaded: completedBytes + shard.bytes,
+          overallTotal,
+          fileIndex: idx + 1,
+          fileCount,
+          cached: true,
+        });
+      }
     } else {
       cacheMisses += 1;
       await streamUrlToOpfs(`${modelBaseUrl}/${shard.file}`, dirHandle, shard.file, shard.bytes, (loaded, total) => {
-        if (onProgress) onProgress({ file: shard.file, loaded, total, cached: false });
+        if (onProgress) {
+          onProgress({
+            phase: 'download',
+            file: shard.file,
+            loaded,
+            total,
+            overallLoaded: completedBytes + loaded,
+            overallTotal,
+            fileIndex: idx + 1,
+            fileCount,
+            cached: false,
+          });
+        }
       });
       cachedState.shards[shard.file] = { sha256: shard.sha256, bytes: shard.bytes };
     }
+    completedBytes += shard.bytes || 0;
   }
 
   // Cache tokenizer.json if available
@@ -146,12 +201,38 @@ export async function ensureOpfsModel(modelBaseUrl, modelKey, { onProgress } = {
   } catch {
     hasTokenizer = false;
   }
+  if (onProgress) {
+    onProgress({
+      phase: 'tokenizer',
+      file: 'tokenizer.json',
+      loaded: hasTokenizer ? 1 : 0,
+      total: 1,
+      overallLoaded: overallTotal,
+      overallTotal,
+      fileIndex: fileCount,
+      fileCount,
+      cached: hasTokenizer,
+    });
+  }
   if (!hasTokenizer) {
     const tokResp = await fetch(`${modelBaseUrl}/tokenizer.json`);
     if (tokResp.ok) {
       const tokBytes = new Uint8Array(await tokResp.arrayBuffer());
       await writeBytesToOpfs(dirHandle, 'tokenizer.json', tokBytes);
       cachedState.hasTokenizer = true;
+    }
+    if (onProgress) {
+      onProgress({
+        phase: 'tokenizer',
+        file: 'tokenizer.json',
+        loaded: 1,
+        total: 1,
+        overallLoaded: overallTotal,
+        overallTotal,
+        fileIndex: fileCount,
+        fileCount,
+        cached: false,
+      });
     }
   }
 
@@ -167,16 +248,46 @@ export async function readOpfsFileBytes(dirHandle, filename) {
   return new Uint8Array(await file.arrayBuffer());
 }
 
-export async function uploadOpfsShardsToGpu(device, dirHandle, manifest, stagingBytes = DEFAULT_STAGING_BYTES) {
+export async function uploadOpfsShardsToGpu(
+  device,
+  dirHandle,
+  manifest,
+  stagingBytes = DEFAULT_STAGING_BYTES,
+  onProgress = null
+) {
   const gpuShards = new Map();
   const gpuShardsInfo = manifest.shards.filter((s) => typeof s.id === 'number');
+  const totalGpuBytes = gpuShardsInfo.reduce((sum, s) => sum + (s.bytes || 0), 0);
+  const fileCount = gpuShardsInfo.length;
+  let gpuDoneBytes = 0;
+  let lastGpuEmitAt = 0;
+  const emitGpuProgress = (file, loaded, total, fileIndex, force = false) => {
+    if (!onProgress) return;
+    const now = performance.now();
+    if (force || now - lastGpuEmitAt >= 60) {
+      lastGpuEmitAt = now;
+      onProgress({
+        phase: 'gpu_upload',
+        file,
+        loaded,
+        total,
+        overallLoaded: gpuDoneBytes + loaded,
+        overallTotal: totalGpuBytes,
+        fileIndex,
+        fileCount,
+        cached: true,
+      });
+    }
+  };
+
   const staging = device.createBuffer({
     size: stagingBytes,
     usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
 
   try {
-    for (const sInfo of gpuShardsInfo) {
+    for (let idx = 0; idx < fileCount; idx++) {
+      const sInfo = gpuShardsInfo[idx];
       const fh = await dirHandle.getFileHandle(sInfo.file);
       const gpuSize = alignUp(sInfo.bytes, 4);
       const gpuBuf = device.createBuffer({
@@ -212,7 +323,9 @@ export async function uploadOpfsShardsToGpu(device, dirHandle, manifest, staging
             enc.copyBufferToBuffer(staging, 0, gpuBuf, offset, alignedCopy);
             device.queue.submit([enc.finish()]);
             offset += readTotal;
+            emitGpuProgress(sInfo.file, offset, sInfo.bytes, idx + 1);
           }
+          emitGpuProgress(sInfo.file, sInfo.bytes, sInfo.bytes, idx + 1, true);
         } finally {
           access.close();
         }
@@ -234,8 +347,11 @@ export async function uploadOpfsShardsToGpu(device, dirHandle, manifest, staging
           enc.copyBufferToBuffer(staging, 0, gpuBuf, offset, alignedCopy);
           device.queue.submit([enc.finish()]);
           offset += ab.byteLength;
+          emitGpuProgress(sInfo.file, offset, sInfo.bytes, idx + 1);
         }
+        emitGpuProgress(sInfo.file, sInfo.bytes, sInfo.bytes, idx + 1, true);
       }
+      gpuDoneBytes += sInfo.bytes || 0;
       gpuShards.set(sInfo.id, gpuBuf);
     }
   } finally {

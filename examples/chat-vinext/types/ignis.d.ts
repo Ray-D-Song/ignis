@@ -1,8 +1,13 @@
 declare module '../../../runtime/ignis-client.mjs' {
   export interface IgnisProgressEvent {
+    phase?: 'manifest' | 'download' | 'cache' | 'tokenizer' | 'compile' | 'gpu_upload' | 'tokenizer_init';
     file: string;
     loaded: number;
     total: number;
+    overallLoaded?: number;
+    overallTotal?: number;
+    fileIndex?: number;
+    fileCount?: number;
     cached: boolean;
   }
 

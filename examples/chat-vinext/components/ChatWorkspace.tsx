@@ -9,9 +9,14 @@ import { detectDeviceProfile } from '../../../runtime/device-profile.mjs';
 type IgnisDeviceProfile = Awaited<ReturnType<typeof detectDeviceProfile>>;
 
 interface IgnisProgressEvent {
+  phase?: LoadProgressState['phase'];
   file: string;
   loaded: number;
   total: number;
+  overallLoaded?: number;
+  overallTotal?: number;
+  fileIndex?: number;
+  fileCount?: number;
   cached: boolean;
 }
 
@@ -42,11 +47,13 @@ import {
   type PendingAudioInput,
   type PendingImageInput,
 } from '@/lib/agent-harness';
-import { CUSTOM_MODEL_ID, TopBar } from './TopBar';
+import { TopBar } from './TopBar';
 import { LeftRail } from './LeftRail';
-import { ThreadView, type StudioMessage } from './ThreadView';
+import { ThreadView, type LoadProgressState, type StudioMessage } from './ThreadView';
 import { Composer } from './Composer';
 import { WorkspacePane, type FsmPreset, type WorkspaceTab } from './WorkspacePane';
+
+const CUSTOM_MODEL_ID = '__custom__';
 
 const FSM_PRESETS: FsmPreset[] = [
   {
@@ -149,8 +156,9 @@ export function ChatWorkspace({
   const [hasUnreadArtifact, setHasUnreadArtifact] = useState(false);
 
   const [status, setStatus] = useState<'idle' | 'loading' | 'ready' | 'generating' | 'error'>('idle');
-  const [statusText, setStatusText] = useState<string>(COPY[initialLang].statusIdle);
+  const [statusText, setStatusText] = useState<string>(COPY[initialLang].statusIdleShort);
   const [loadPct, setLoadPct] = useState(0);
+  const [loadProgress, setLoadProgress] = useState<LoadProgressState | null>(null);
 
   const [enableThinking, setEnableThinking] = useState(() => getArchKind(models[0]) === 'spark');
   const [effort, setEffort] = useState<'low' | 'high'>('low');
@@ -277,9 +285,18 @@ export function ChatWorkspace({
     setPendingAudio(null);
     kvTurnsRef.current = 0;
     kvThinkingKeyRef.current = '';
-    if (loadedModelIdRef.current && loadedModelIdRef.current !== nextId && status === 'ready') {
+    if (loadedModelIdRef.current && loadedModelIdRef.current !== nextId) {
       setStatus('idle');
+      statusRef.current = 'idle';
+      setLoadPct(0);
+      setLoadProgress(null);
       setStatusText(t.statusSwitched);
+    } else if (status === 'error') {
+      setStatus('idle');
+      statusRef.current = 'idle';
+      setLoadPct(0);
+      setLoadProgress(null);
+      setStatusText(t.statusIdleShort);
     }
   };
 
@@ -329,6 +346,7 @@ export function ChatWorkspace({
       setStats((s) => ({ ...s, cacheMode: t.opfsCleared, ctxPos: 0 }));
       setStatus('idle');
       setLoadPct(0);
+      setLoadProgress(null);
       setStatusText(t.opfsCleared);
     } catch (err) {
       setStatus('error');
@@ -336,7 +354,9 @@ export function ChatWorkspace({
     }
   };
 
-  const loadModel = async (): Promise<{ client: IgnisClient; resolvedModel: ModelPreset } | null> => {
+  const loadModel = async (
+    queuedPrompt: string | null = null,
+  ): Promise<{ client: IgnisClient; resolvedModel: ModelPreset } | null> => {
     const current = activePresetRef.current || activeModel;
     if (!current) return null;
     const baseUrl = (
@@ -348,10 +368,25 @@ export function ChatWorkspace({
       return null;
     }
 
+    const displayName = current.shortName || current.label.split('·')[0].trim();
     setStatus('loading');
     statusRef.current = 'loading';
-    setLoadPct(0);
-    setStatusText(`Loading ${current.shortName || current.label}...`);
+    setLoadPct(2);
+    setLoadProgress({
+      phase: 'manifest',
+      file: 'manifest.json',
+      loaded: 0,
+      total: 0,
+      overallLoaded: 0,
+      overallTotal: 0,
+      fileIndex: 0,
+      fileCount: 0,
+      cached: false,
+      overallPct: 2,
+      speedMBps: null,
+      queuedPrompt,
+    });
+    setStatusText(lang === 'zh' ? `加载 ${displayName}...` : `Loading ${displayName}...`);
     try {
       if (clientRef.current) {
         await clientRef.current.destroy();
@@ -360,10 +395,86 @@ export function ChatWorkspace({
       const client = new IgnisClient('/ignis/runtime/ignis-worker.mjs');
       clientRef.current = client;
 
+      let highestPct = 2;
+      let lastSpeedAt = performance.now();
+      let lastSpeedBytes = 0;
+      let emaSpeedMBps: number | null = null;
+      let lastDownloadLoaded = 0;
+      let lastDownloadTotal = 0;
+
       client.onProgress = (p: IgnisProgressEvent) => {
-        const pct = p.total ? Math.round((p.loaded / p.total) * 100) : 0;
-        setLoadPct(pct);
-        setStatusText(`${p.cached ? 'OPFS' : 'Downloading'} ${p.file} (${pct}%)`);
+        const phase = p.phase || (p.cached ? 'cache' : 'download');
+        let mappedPct = highestPct;
+        if (phase === 'manifest') {
+          mappedPct = 2;
+        } else if (phase === 'download' || phase === 'cache') {
+          const oLoaded = p.overallLoaded ?? p.loaded;
+          const oTotal = p.overallTotal ?? p.total;
+          lastDownloadLoaded = oLoaded;
+          lastDownloadTotal = oTotal;
+          mappedPct = oTotal > 0 ? 4 + Math.round((oLoaded / oTotal) * 78) : highestPct;
+          if (phase === 'download') {
+            const now = performance.now();
+            const dt = now - lastSpeedAt;
+            if (dt >= 180 && oLoaded >= lastSpeedBytes) {
+              const inst = ((oLoaded - lastSpeedBytes) / (1024 * 1024)) / (dt / 1000);
+              emaSpeedMBps = emaSpeedMBps === null ? inst : emaSpeedMBps * 0.65 + inst * 0.35;
+              lastSpeedAt = now;
+              lastSpeedBytes = oLoaded;
+            }
+          }
+        } else if (phase === 'tokenizer') {
+          mappedPct = 84;
+        } else if (phase === 'compile') {
+          mappedPct = 88;
+        } else if (phase === 'gpu_upload') {
+          const gTotal = p.overallTotal || p.total || 1;
+          const gLoaded = p.overallLoaded ?? p.loaded ?? 0;
+          mappedPct = 89 + Math.round((gLoaded / gTotal) * 9);
+        } else if (phase === 'tokenizer_init') {
+          mappedPct = 99;
+        }
+
+        highestPct = Math.max(highestPct, Math.min(99, mappedPct));
+        const shownLoaded =
+          phase === 'download' || phase === 'cache'
+            ? p.overallLoaded ?? p.loaded
+            : lastDownloadLoaded || p.overallLoaded || 0;
+        const shownTotal =
+          phase === 'download' || phase === 'cache'
+            ? p.overallTotal ?? p.total
+            : lastDownloadTotal || p.overallTotal || 0;
+
+        setLoadPct(highestPct);
+        setLoadProgress({
+          phase,
+          file: p.file,
+          loaded: p.loaded,
+          total: p.total,
+          overallLoaded: shownLoaded,
+          overallTotal: shownTotal,
+          fileIndex: p.fileIndex ?? 0,
+          fileCount: p.fileCount ?? 0,
+          cached: p.cached,
+          overallPct: highestPct,
+          speedMBps: phase === 'download' ? emaSpeedMBps : null,
+          queuedPrompt,
+        });
+
+        if (phase === 'download') {
+          const speedStr = emaSpeedMBps !== null ? ` · ${emaSpeedMBps.toFixed(1)} MB/s` : '';
+          setStatusText(`${lang === 'zh' ? '加载中' : 'Loading'} ${highestPct}%${speedStr}`);
+        } else if (phase === 'compile') {
+          setStatusText(
+            lang === 'zh' ? `加载中 ${highestPct}% · 编译 WebGPU` : `Loading ${highestPct}% · WebGPU Shaders`,
+          );
+        } else if (phase === 'gpu_upload') {
+          setStatusText(
+            lang === 'zh' ? `加载中 ${highestPct}% · 装载显存` : `Loading ${highestPct}% · GPU VRAM`,
+          );
+        } else {
+          setStatusText(`${lang === 'zh' ? '加载中' : 'Loading'} ${highestPct}%`);
+        }
       };
       client.onDeviceLost = (reason: string) => {
         setStatus('error');
@@ -424,11 +535,13 @@ export function ChatWorkspace({
         heapMB: perfMem ? `${(perfMem.usedJSHeapSize / (1024 * 1024)).toFixed(1)} MB` : '-',
       }));
       setLoadPct(100);
+      setLoadProgress(null);
       setStatus('ready');
       statusRef.current = 'ready';
       setStatusText(getReadyLabel(resolvedPreset, lang));
       return { client, resolvedModel: resolvedPreset };
     } catch (err) {
+      setLoadProgress(null);
       setStatus('error');
       statusRef.current = 'error';
       setStatusText(`Load failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -878,7 +991,7 @@ export function ChatWorkspace({
     let resolved = activeModel;
 
     if (statusRef.current !== 'ready' || !client) {
-      const loaded = await loadModel();
+      const loaded = await loadModel(input.trim() || null);
       if (!loaded) return;
       client = loaded.client;
       resolved = loaded.resolvedModel;
@@ -901,7 +1014,7 @@ export function ChatWorkspace({
     let resolved = activeModel;
 
     if (statusRef.current !== 'ready' || !client) {
-      const loaded = await loadModel();
+      const loaded = await loadModel(prompt);
       if (!loaded) return;
       client = loaded.client;
       resolved = loaded.resolvedModel;
@@ -1002,7 +1115,7 @@ export function ChatWorkspace({
           const nextLang: UiLang = lang === 'en' ? 'zh' : 'en';
           setLang(nextLang);
           if (status === 'idle') {
-            setStatusText(COPY[nextLang].statusIdle);
+            setStatusText(COPY[nextLang].statusIdleShort);
           } else if (status === 'ready') {
             setStatusText(getReadyLabel(activeModel, nextLang));
           }
@@ -1070,8 +1183,13 @@ export function ChatWorkspace({
             lang={lang}
             messages={messages}
             status={status}
+            statusText={statusText}
+            loadProgress={loadProgress}
             activeModel={activeModel}
             termsBlocked={termsBlocked}
+            onLoadModel={() => {
+              loadModel();
+            }}
             onRunStarter={handleRunStarter}
             onOpenArtifact={(art) => {
               setActiveArtifact(art);

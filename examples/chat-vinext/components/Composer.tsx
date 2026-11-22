@@ -176,6 +176,10 @@ export function Composer(props: ComposerProps) {
             <span className="mode-indicator">
               {mode === 'agent' ? t.modeBadgeAgent : t.modeBadgeChat}
             </span>
+
+            {status === 'idle' && !termsBlocked && (
+              <span className="idle-composer-hint hide-mobile">{t.composerIdleHint}</span>
+            )}
           </div>
 
           <div className="composer-bar-right">

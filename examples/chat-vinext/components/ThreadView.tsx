@@ -4,13 +4,17 @@ import React from 'react';
 import {
   ArrowRight,
   BarChart3,
+  Check,
   CheckCircle2,
   ChevronRight,
+  Circle,
   Code2,
+  Download,
   Eye,
   FileCode2,
   FileText,
   Layout,
+  Loader2,
   Sparkles,
   Volume2,
   XCircle,
@@ -26,6 +30,30 @@ import type {
 } from '@/lib/agent-harness';
 import { MarkdownContent } from './MarkdownContent';
 import { SparkMark } from './TopBar';
+
+export type LoadPhase =
+  | 'manifest'
+  | 'download'
+  | 'cache'
+  | 'tokenizer'
+  | 'compile'
+  | 'gpu_upload'
+  | 'tokenizer_init';
+
+export interface LoadProgressState {
+  phase: LoadPhase;
+  file: string;
+  loaded: number;
+  total: number;
+  overallLoaded: number;
+  overallTotal: number;
+  fileIndex: number;
+  fileCount: number;
+  cached: boolean;
+  overallPct: number;
+  speedMBps: number | null;
+  queuedPrompt: string | null;
+}
 
 export interface StudioMessage {
   id: string;
@@ -48,12 +76,114 @@ interface ThreadViewProps {
   lang: UiLang;
   messages: StudioMessage[];
   status: 'idle' | 'loading' | 'ready' | 'generating' | 'error';
+  statusText: string;
+  loadProgress: LoadProgressState | null;
   activeModel: ModelPreset;
   termsBlocked: boolean;
+  onLoadModel: () => void;
   onRunStarter: (prompt: string, opts?: { generationMode?: 'text' | 'interleaved' }) => void;
   onOpenArtifact: (artifact: AgentArtifact) => void;
   onPreviewHtml: (title: string, html: string) => void;
   scrollEndRef: React.RefObject<HTMLDivElement | null>;
+}
+
+function formatBytes(bytes: number): string {
+  if (!bytes || bytes <= 0) return '0 B';
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(0)} MB`;
+  return `${(bytes / 1024).toFixed(0)} KB`;
+}
+
+function LoadingStateCard({
+  lang,
+  activeModel,
+  loadProgress,
+}: {
+  lang: UiLang;
+  activeModel: ModelPreset;
+  loadProgress: LoadProgressState;
+}) {
+  const t = COPY[lang];
+  const displayName = activeModel.shortName || activeModel.label.split('·')[0].trim();
+  const phase = loadProgress.phase;
+  const stageOrder =
+    phase === 'compile' ? 1 : phase === 'gpu_upload' || phase === 'tokenizer_init' ? 2 : 0;
+
+  const steps = [
+    { key: 'download', label: t.loadingPhaseDownload },
+    { key: 'compile', label: t.loadingPhaseCompile },
+    { key: 'gpu_upload', label: t.loadingPhaseGpu },
+  ];
+
+  return (
+    <div className="loading-stage-card" id="model-loading-card">
+      <div className="loading-stage-head">
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+          <span className="loading-icon-badge">
+            <Loader2 size={16} className="spin-icon" style={{ color: 'var(--accent)' }} />
+          </span>
+          <div style={{ minWidth: 0 }}>
+            <div className="loading-stage-title">{t.loadingTitle(displayName)}</div>
+            <div className="loading-stage-meta">
+              {loadProgress.file}
+              {loadProgress.fileCount > 0 ? ` · ${loadProgress.fileIndex}/${loadProgress.fileCount}` : ''}
+              {loadProgress.overallTotal > 0
+                ? ` · ${formatBytes(loadProgress.overallLoaded)} / ${formatBytes(loadProgress.overallTotal)}`
+                : ''}
+            </div>
+          </div>
+        </div>
+        <div className="loading-stage-pct">{loadProgress.overallPct}%</div>
+      </div>
+
+      {loadProgress.queuedPrompt && (
+        <div className="queued-task-pill">
+          <span style={{ color: 'var(--accent)', fontWeight: 600, whiteSpace: 'nowrap', flexShrink: 0 }}>
+            {t.loadingQueued}:
+          </span>
+          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {loadProgress.queuedPrompt}
+          </span>
+        </div>
+      )}
+
+      <div className="loading-bar-track" role="progressbar" aria-valuenow={loadProgress.overallPct} aria-valuemin={0} aria-valuemax={100}>
+        <div className="loading-bar-fill" style={{ width: `${Math.max(2, loadProgress.overallPct)}%` }} />
+      </div>
+
+      <div className="loading-telemetry-row">
+        <span>
+          {phase === 'download' && loadProgress.speedMBps !== null
+            ? `${loadProgress.speedMBps.toFixed(1)} MB/s`
+            : loadProgress.cached
+              ? t.loadingCacheHit
+              : loadProgress.file}
+        </span>
+        {activeModel.sizeLabel && <span>{activeModel.sizeLabel}</span>}
+      </div>
+
+      <div className="loading-steps">
+        {steps.map((s, idx) => {
+          const done = stageOrder > idx;
+          const active = stageOrder === idx;
+          return (
+            <div key={s.key} className={`loading-step ${done ? 'done' : active ? 'active' : ''}`}>
+              {done ? (
+                <Check size={13} style={{ color: 'var(--ok)', flexShrink: 0 }} />
+              ) : active ? (
+                <Loader2 size={13} className="spin-icon" style={{ color: 'var(--accent)', flexShrink: 0 }} />
+              ) : (
+                <Circle size={12} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />
+              )}
+              <span>{s.label}</span>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="loading-note">{t.loadingNote}</div>
+    </div>
+  );
 }
 
 function summarizeToolCall(tc: AgentToolCallRecord, lang: UiLang): string {
@@ -97,8 +227,11 @@ export function ThreadView(props: ThreadViewProps) {
     lang,
     messages,
     status,
+    statusText,
+    loadProgress,
     activeModel,
     termsBlocked,
+    onLoadModel,
     onRunStarter,
     onOpenArtifact,
     onPreviewHtml,
@@ -106,6 +239,7 @@ export function ThreadView(props: ThreadViewProps) {
   } = props;
 
   const t = COPY[lang];
+  const displayName = activeModel.shortName || activeModel.label.split('·')[0].trim();
 
   if (messages.length === 0) {
     const busy = status === 'loading' || status === 'generating';
@@ -114,68 +248,106 @@ export function ThreadView(props: ThreadViewProps) {
     return (
       <div className="thread-scroll">
         <div className="empty-canvas" id="hero-banner">
-          <div className="eyebrow-pill">
-            <span className={`status-dot ${status === 'ready' ? 'ready' : 'busy'}`} style={{ width: 6, height: 6 }} />
-            <span>{t.eyebrow}</span>
-          </div>
+          {status === 'loading' && loadProgress ? (
+            <LoadingStateCard lang={lang} activeModel={activeModel} loadProgress={loadProgress} />
+          ) : (
+            <>
+              <div className="eyebrow-pill">
+                <span
+                  className={`status-dot ${status === 'ready' ? 'ready' : status === 'error' ? 'error' : 'idle'}`}
+                  style={{ width: 6, height: 6 }}
+                />
+                <span>{t.eyebrow}</span>
+              </div>
 
-          <h1 className="empty-headline">{t.heroTitle}</h1>
-          <p className="empty-sub">{t.heroSubtitle}</p>
+              <h1 className="empty-headline">{t.heroTitle}</h1>
+              <p className="empty-sub">{t.heroSubtitle}</p>
 
-          <div className="starter-grid">
-            {starters.map((s) => {
-              if (s.id === 'voice_or_spec') {
-                const useVoice = Boolean(activeModel.capabilities.audioOut);
-                const title = useVoice ? s.titleVoice : s.titleText;
-                const subtitle = useVoice ? s.subtitleVoice : s.subtitleText;
-                const prompt = useVoice ? s.promptVoice : s.promptText;
-                return (
-                  <button
-                    key={s.id}
-                    type="button"
-                    className="starter-card"
-                    disabled={busy || termsBlocked}
-                    onClick={() => onRunStarter(prompt, { generationMode: useVoice ? 'interleaved' : 'text' })}
-                  >
-                    <div className="starter-card-head">
-                      {useVoice ? (
-                        <Volume2 size={15} style={{ color: 'var(--accent)' }} />
-                      ) : (
-                        <FileText size={15} style={{ color: 'var(--accent)' }} />
-                      )}
-                      <span>{title}</span>
+              {(status === 'idle' || status === 'error') && (
+                <div className={`idle-readiness-banner ${status === 'error' ? 'is-error' : ''}`} id="model-idle-banner">
+                  <div className="idle-readiness-copy">
+                    <div className="idle-readiness-title">
+                      <span className={`status-dot ${status === 'error' ? 'error' : 'idle'}`} />
+                      <span>{status === 'error' ? statusText : t.idleBannerTitle}</span>
                     </div>
-                    <div className="starter-card-desc">{subtitle}</div>
-                  </button>
-                );
-              }
-
-              const disabledVision = Boolean(s.requiresVision && !activeModel.capabilities.vision);
-              const Icon =
-                s.id === 'revenue'
-                  ? BarChart3
-                  : s.id === 'vision'
-                    ? Eye
-                    : Layout;
-
-              return (
-                <button
-                  key={s.id}
-                  type="button"
-                  className="starter-card"
-                  disabled={busy || termsBlocked || disabledVision}
-                  title={disabledVision ? 'Switch to LFM3-Omni or Gemma-4 for local vision' : undefined}
-                  onClick={() => onRunStarter(s.prompt)}
-                >
-                  <div className="starter-card-head">
-                    <Icon size={15} style={{ color: 'var(--accent)' }} />
-                    <span>{s.title}</span>
+                    <div className="idle-readiness-desc">
+                      {termsBlocked
+                        ? t.idleBannerTermsHint
+                        : t.idleBannerDesc(displayName, activeModel.sizeLabel)}
+                    </div>
                   </div>
-                  <div className="starter-card-desc">{s.subtitle}</div>
-                </button>
-              );
-            })}
-          </div>
+                  <button
+                    id="btn-hero-load-model"
+                    type="button"
+                    className="load-btn primary"
+                    disabled={termsBlocked}
+                    onClick={onLoadModel}
+                  >
+                    <Download size={13} />
+                    <span>
+                      {t.idleBannerCta}
+                      {activeModel.sizeLabel ? ` (${activeModel.sizeLabel})` : ''}
+                    </span>
+                  </button>
+                </div>
+              )}
+
+              <div className="starter-grid">
+                {starters.map((s) => {
+                  if (s.id === 'voice_or_spec') {
+                    const useVoice = Boolean(activeModel.capabilities.audioOut);
+                    const title = useVoice ? s.titleVoice : s.titleText;
+                    const subtitle = useVoice ? s.subtitleVoice : s.subtitleText;
+                    const prompt = useVoice ? s.promptVoice : s.promptText;
+                    return (
+                      <button
+                        key={s.id}
+                        type="button"
+                        className="starter-card"
+                        disabled={busy || termsBlocked}
+                        onClick={() => onRunStarter(prompt, { generationMode: useVoice ? 'interleaved' : 'text' })}
+                      >
+                        <div className="starter-card-head">
+                          {useVoice ? (
+                            <Volume2 size={15} style={{ color: 'var(--accent)' }} />
+                          ) : (
+                            <FileText size={15} style={{ color: 'var(--accent)' }} />
+                          )}
+                          <span>{title}</span>
+                        </div>
+                        <div className="starter-card-desc">{subtitle}</div>
+                      </button>
+                    );
+                  }
+
+                  const disabledVision = Boolean(s.requiresVision && !activeModel.capabilities.vision);
+                  const Icon =
+                    s.id === 'revenue'
+                      ? BarChart3
+                      : s.id === 'vision'
+                        ? Eye
+                        : Layout;
+
+                  return (
+                    <button
+                      key={s.id}
+                      type="button"
+                      className="starter-card"
+                      disabled={busy || termsBlocked || disabledVision}
+                      title={disabledVision ? 'Switch to LFM3-Omni or Gemma-4 for local vision' : undefined}
+                      onClick={() => onRunStarter(s.prompt)}
+                    >
+                      <div className="starter-card-head">
+                        <Icon size={15} style={{ color: 'var(--accent)' }} />
+                        <span>{s.title}</span>
+                      </div>
+                      <div className="starter-card-desc">{s.subtitle}</div>
+                    </button>
+                  );
+                })}
+              </div>
+            </>
+          )}
         </div>
         <div ref={scrollEndRef} />
       </div>
@@ -336,6 +508,9 @@ export function ThreadView(props: ThreadViewProps) {
             </div>
           );
         })}
+        {status === 'loading' && loadProgress && (
+          <LoadingStateCard lang={lang} activeModel={activeModel} loadProgress={loadProgress} />
+        )}
         <div ref={scrollEndRef} />
       </div>
     </div>

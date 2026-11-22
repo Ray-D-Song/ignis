@@ -244,11 +244,22 @@ export class IgnisEngine {
     const opfsRes = await ensureOpfsModel(modelBaseUrl, modelKey, { onProgress });
     const { dirHandle, manifest, cacheHits, cacheMisses, hasTokenizer } = opfsRes;
     const bp = manifest.blueprint;
+    if (onProgress) {
+      onProgress({
+        phase: 'compile',
+        file: 'WGSL Compute Pipelines',
+        loaded: 0,
+        total: 1,
+        overallLoaded: 0,
+        overallTotal: 1,
+        cached: true,
+      });
+    }
     const { device, pipelines, subgroupSizeGuess, useSubgroups, hasTimestampQuery } = await IgnisEngine._initDeviceAndPipelines(
       kernelBaseUrl,
       { hiddenAct: bp.hidden_act || 'gelu', weightBits: bp.weight_bits || 4, forceNoSubgroups }
     );
-    const gpuShards = await uploadOpfsShardsToGpu(device, dirHandle, manifest);
+    const gpuShards = await uploadOpfsShardsToGpu(device, dirHandle, manifest, undefined, onProgress);
     const embdTable = await OpfsEmbeddingTable.open(dirHandle, manifest.tensors.token_embd, 4096, 'embd.ignis');
     const pleEmbdTable = (bp.has_ple && manifest.tensors.token_embd_ple)
       ? await OpfsEmbeddingTable.open(dirHandle, manifest.tensors.token_embd_ple, 2048, 'ple_embd.ignis')

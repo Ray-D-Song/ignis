@@ -113,6 +113,16 @@ self.onmessage = async (ev) => {
         if (tr.ok) tokBytes = new Uint8Array(await tr.arrayBuffer());
       }
       if (tokBytes) {
+        self.postMessage({
+          type: 'progress',
+          phase: 'tokenizer_init',
+          file: 'ignis_tokenizer.wasm',
+          loaded: 0,
+          total: 1,
+          overallLoaded: 0,
+          overallTotal: 1,
+          cached: true,
+        });
         const wasmBytes = await (await fetch(wasmUrl)).arrayBuffer();
         tokenizer = await IgnisTokenizer.fromBuffers(wasmBytes, tokBytes);
       }
