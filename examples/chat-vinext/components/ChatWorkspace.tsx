@@ -161,7 +161,32 @@ export function ChatWorkspace({
 }) {
   const initialLang: UiLang = isPublicCdn ? 'en' : 'zh';
   const [lang, setLang] = useState<UiLang>(initialLang);
+  const [theme, setTheme] = useState<'dark' | 'light'>('dark');
+  const themeReadyRef = useRef(false);
   const t = COPY[lang];
+
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem('ignis-theme');
+      const next: 'dark' | 'light' = saved === 'light' || saved === 'dark' ? saved : 'dark';
+      setTheme(next);
+      document.documentElement.setAttribute('data-theme', next);
+    } catch {
+      document.documentElement.setAttribute('data-theme', 'dark');
+    } finally {
+      themeReadyRef.current = true;
+    }
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme);
+    if (!themeReadyRef.current) return;
+    try {
+      window.localStorage.setItem('ignis-theme', theme);
+    } catch {
+      // ignore storage errors
+    }
+  }, [theme]);
 
   const defaultModelId = models[0]?.id || CUSTOM_MODEL_ID;
   const [selectedModelId, setSelectedModelId] = useState(defaultModelId);
@@ -193,7 +218,7 @@ export function ChatWorkspace({
 
   // Coding project state
   const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFile[]>(() => createInitialWorkspace());
-  const [selectedFilePath, setSelectedFilePath] = useState<string>('server/stats.mjs');
+  const [selectedFilePath, setSelectedFilePath] = useState<string>('src/App.jsx');
   const [editorMode, setEditorMode] = useState<'code' | 'diff'>('code');
   const [diffOriginals, setDiffOriginals] = useState<Record<string, string>>({});
   const [checkpoints, setCheckpoints] = useState<WorkspaceCheckpoint[]>([]);
@@ -662,9 +687,7 @@ export function ChatWorkspace({
       // still update virtual buffer if container not yet ready
     }
     setWorkspaceFiles((prev) => upsertWorkspaceFile(prev, clean, content, false));
-    if (clean.startsWith('server/') || clean.startsWith('data/')) {
-      setPreviewRefreshSeq((s) => s + 1);
-    }
+    setPreviewRefreshSeq((s) => s + 1);
   };
 
   const handleRevertFile = async (rawPath: string) => {
@@ -685,9 +708,7 @@ export function ChatWorkspace({
       return next;
     });
     setEditorMode('code');
-    if (clean.startsWith('server/') || clean.startsWith('data/')) {
-      setPreviewRefreshSeq((s) => s + 1);
-    }
+    setPreviewRefreshSeq((s) => s + 1);
   };
 
   const handleRollbackCheckpoint = async (checkpointId: string) => {
@@ -718,9 +739,7 @@ export function ChatWorkspace({
     });
     setCheckpoints((prev) => prev.filter((x) => x.id !== checkpointId));
     setEditorMode('code');
-    if (cp.path.startsWith('server/') || cp.path.startsWith('data/')) {
-      setPreviewRefreshSeq((s) => s + 1);
-    }
+    setPreviewRefreshSeq((s) => s + 1);
     pushShellOutput(`\r\n[checkpoint] ${t.checkpointRestored}: ${cp.path}\r\n`);
   };
 
@@ -767,10 +786,10 @@ export function ChatWorkspace({
     }
     setDiffOriginals({});
     setCheckpoints([]);
-    setSelectedFilePath('server/stats.mjs');
+    setSelectedFilePath('src/App.jsx');
     setEditorMode('code');
     setPreviewRefreshSeq((s) => s + 1);
-    pushShellOutput('\r\n[workspace] Starter PulseBoard files restored.\r\n');
+    pushShellOutput('\r\n[workspace] Starter Vite + React files restored.\r\n');
   };
 
   const sendDirectMessage = async (
@@ -1207,7 +1226,10 @@ export function ChatWorkspace({
         ),
       );
       setContextBudget({ peak: result.peakPromptTokens, max: result.maxSeqLen });
-      if (result.checkpoints.some((c) => c.path.startsWith('server/') || c.path.startsWith('data/'))) {
+      if (result.checkpoints.length > 0) {
+        const lastEdited = result.checkpoints[result.checkpoints.length - 1];
+        setSelectedFilePath(lastEdited.path);
+        setEditorMode(lastEdited.existedBefore ? 'diff' : 'code');
         setPreviewRefreshSeq((s) => s + 1);
       }
 
@@ -1362,6 +1384,8 @@ export function ChatWorkspace({
             setStatusText(getReadyLabel(activeModel, nextLang));
           }
         }}
+        theme={theme}
+        onToggleTheme={() => setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'))}
         editorOpen={editorOpen}
         onToggleEditor={() => setEditorOpen((v) => !v)}
         rightPaneOpen={rightPaneOpen}
@@ -1485,6 +1509,7 @@ export function ChatWorkspace({
         {editorOpen && (
           <CodeEditorPane
             lang={lang}
+            theme={theme}
             files={workspaceFiles}
             selectedPath={selectedFilePath}
             editorMode={editorMode}
@@ -1506,6 +1531,7 @@ export function ChatWorkspace({
         {rightPaneOpen && (
           <WorkspacePane
             lang={lang}
+            theme={theme}
             activeTab={workspaceTab}
             onTabChange={setWorkspaceTab}
             onClose={() => setRightPaneOpen(false)}

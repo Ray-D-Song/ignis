@@ -2104,3 +2104,199 @@ details.think-block pre {
     padding: 6px 12px 12px;
   }
 }
+
+/* Light Theme Override */
+:root[data-theme='light'],
+[data-theme='light'] {
+  color-scheme: light;
+  --bg: #f8fafc;
+  --panel: #f1f5f9;
+  --surface: #ffffff;
+  --surface-hover: #e2e8f0;
+  --border: rgba(15, 23, 42, 0.1);
+  --border-strong: rgba(15, 23, 42, 0.22);
+  --text: #0f172a;
+  --text-secondary: #475569;
+  --text-muted: #64748b;
+  --cta-bg: #0f172a;
+  --cta-fg: #ffffff;
+  --accent: #ea580c;
+  --accent-soft: rgba(234, 88, 12, 0.1);
+  --accent-border: rgba(234, 88, 12, 0.35);
+  --ok: #16a34a;
+  --ok-soft: rgba(22, 163, 74, 0.1);
+  --warn: #ca8a04;
+  --warn-soft: rgba(202, 138, 4, 0.1);
+  --danger: #dc2626;
+  --danger-soft: rgba(220, 38, 38, 0.1);
+}
+
+[data-theme='light'] ::-webkit-scrollbar-thumb {
+  background: rgba(15, 23, 42, 0.16);
+}
+
+[data-theme='light'] ::-webkit-scrollbar-thumb:hover {
+  background: rgba(15, 23, 42, 0.28);
+}
+
+[data-theme='light'] .topbar {
+  background: rgba(248, 250, 252, 0.92);
+}
+
+[data-theme='light'] .cap-tag {
+  background: rgba(15, 23, 42, 0.05);
+}
+
+[data-theme='light'] .load-btn.primary:hover:not(:disabled),
+[data-theme='light'] .send-cta:hover:not(:disabled) {
+  background: #1e293b;
+  color: #ffffff;
+}
+
+[data-theme='light'] .status-pill.idle {
+  border-color: rgba(202, 138, 4, 0.36);
+  background: rgba(202, 138, 4, 0.1);
+  color: #854d0e;
+}
+
+[data-theme='light'] .status-pill.loading {
+  color: #9a3412;
+}
+
+[data-theme='light'] .status-pill.error {
+  border-color: rgba(220, 38, 38, 0.36);
+  color: #b91c1c;
+}
+
+[data-theme='light'] .status-pill.ready {
+  border-color: rgba(22, 163, 74, 0.34);
+  background: var(--ok-soft);
+  color: #15803d;
+}
+
+[data-theme='light'] .agent-subbar {
+  background: rgba(241, 245, 249, 0.85);
+}
+
+[data-theme='light'] .diff-pre {
+  background: #f8fafc;
+}
+
+[data-theme='light'] .diff-add {
+  color: #166534;
+  background: rgba(22, 163, 74, 0.1);
+}
+
+[data-theme='light'] .diff-del {
+  color: #b91c1c;
+  background: rgba(220, 38, 38, 0.09);
+}
+
+[data-theme='light'] .diff-hunk {
+  color: #1d4ed8;
+}
+
+[data-theme='light'] .diff-ctx {
+  color: #475569;
+}
+
+[data-theme='light'] .load-progress-strip {
+  background: rgba(15, 23, 42, 0.06);
+}
+
+[data-theme='light'] .idle-readiness-banner {
+  border-color: rgba(202, 138, 4, 0.34);
+  background: linear-gradient(135deg, rgba(202, 138, 4, 0.08), rgba(255, 255, 255, 0.96));
+}
+
+[data-theme='light'] .idle-readiness-banner.is-error {
+  border-color: rgba(220, 38, 38, 0.35);
+  background: linear-gradient(135deg, rgba(220, 38, 38, 0.08), rgba(255, 255, 255, 0.96));
+}
+
+[data-theme='light'] .loading-bar-track {
+  background: rgba(15, 23, 42, 0.08);
+}
+
+[data-theme='light'] .loading-step.done {
+  border-color: rgba(22, 163, 74, 0.34);
+  color: #166534;
+}
+
+[data-theme='light'] .idle-composer-hint {
+  color: #854d0e;
+  background: rgba(202, 138, 4, 0.1);
+  border-color: rgba(202, 138, 4, 0.3);
+}
+
+[data-theme='light'] .tool-call-summary:hover {
+  background: rgba(15, 23, 42, 0.04);
+}
+
+[data-theme='light'] .tool-call-pre {
+  color: #1e293b;
+  background: #f8fafc;
+}
+
+[data-theme='light'] .md-code-wrap {
+  background: #f8fafc;
+}
+
+[data-theme='light'] .feature-badge.ok,
+[data-theme='light'] .hw-pill.ok {
+  color: #15803d;
+}
+
+[data-theme='light'] .feature-badge.info {
+  color: #9a3412;
+}
+
+[data-theme='light'] .feature-badge.err,
+[data-theme='light'] .hw-pill.err,
+[data-theme='light'] .stop-cta {
+  color: #b91c1c;
+}
+
+[data-theme='light'] .hw-pill.warn {
+  color: #854d0e;
+}
+
+[data-theme='light'] .composer-dock:focus-within {
+  border-color: rgba(15, 23, 42, 0.3);
+}
+
+[data-theme='light'] .composer-bar {
+  border-top-color: rgba(15, 23, 42, 0.08);
+}
+
+[data-theme='light'] .mode-indicator {
+  background: rgba(15, 23, 42, 0.04);
+}
+
+[data-theme='light'] .preview-url-bar {
+  background: #f1f5f9;
+}
+
+[data-theme='light'] .preview-iframe,
+[data-theme='light'] .artifact-iframe {
+  background: #ffffff;
+}
+
+[data-theme='light'] .terminal-dock {
+  background: #f8fafc;
+}
+
+[data-theme='light'] .xterm,
+[data-theme='light'] .xterm .xterm-viewport,
+[data-theme='light'] .xterm .xterm-screen {
+  background-color: #f8fafc !important;
+}
+
+[data-theme='light'] .terms-banner {
+  color: #854d0e;
+  border-color: rgba(202, 138, 4, 0.35);
+}
+
+[data-theme='light'] .terms-banner a {
+  color: #9a3412;
+}

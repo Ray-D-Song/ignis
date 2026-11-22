@@ -29,6 +29,15 @@ export function discoverIgnisModels(): ModelPreset[] {
       licenseName: 'Apache-2.0',
     },
     {
+      id: 'spark-1.7b-q8head',
+      folder: 'spark-1.7b-ignis-q8head',
+      shortName: 'Spark-X2.6 1.7B',
+      label: 'Spark-X2.6 1.7B · Ultra-Fast Reasoning',
+      description: 'Lightweight 1.7B local reasoning & coding',
+      sizeLabel: '1.3 GB',
+      licenseName: 'Apache-2.0',
+    },
+    {
       id: 'spark-4b-q4',
       folder: 'spark-4b-ignis-q4',
       shortName: 'Spark-X2.6 4B (Compact)',

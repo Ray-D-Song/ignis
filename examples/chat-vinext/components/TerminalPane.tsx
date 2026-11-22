@@ -8,6 +8,7 @@ import type { InteractiveShellHandle, SandboxBootStatus } from '@/lib/webcontain
 
 interface TerminalPaneProps {
   lang: UiLang;
+  theme?: 'dark' | 'light';
   sandboxStatus: SandboxBootStatus;
   sandboxDetail: string;
   shellChannel: TerminalChannel;
@@ -20,9 +21,36 @@ interface TerminalPaneProps {
   onRestartServer: () => void;
 }
 
+const DARK_TERM_THEME = {
+  background: '#09090b',
+  foreground: '#e4e4e7',
+  cursor: '#f97316',
+  selectionBackground: 'rgba(249, 115, 22, 0.25)',
+  black: '#18181b',
+  green: '#4ade80',
+  yellow: '#facc15',
+  red: '#f87171',
+  blue: '#60a5fa',
+  cyan: '#38bdf8',
+};
+
+const LIGHT_TERM_THEME = {
+  background: '#f8fafc',
+  foreground: '#0f172a',
+  cursor: '#ea580c',
+  selectionBackground: 'rgba(234, 88, 12, 0.22)',
+  black: '#e2e8f0',
+  green: '#16a34a',
+  yellow: '#ca8a04',
+  red: '#dc2626',
+  blue: '#2563eb',
+  cyan: '#0284c7',
+};
+
 export function TerminalPane(props: TerminalPaneProps) {
   const {
     lang,
+    theme = 'dark',
     sandboxStatus,
     sandboxDetail,
     shellChannel,
@@ -35,6 +63,8 @@ export function TerminalPane(props: TerminalPaneProps) {
   const [activeTab, setActiveTab] = useState<'shell' | 'server'>('shell');
   const shellElRef = useRef<HTMLDivElement | null>(null);
   const serverElRef = useRef<HTMLDivElement | null>(null);
+  const themeRef = useRef(theme);
+  themeRef.current = theme;
 
   const shellTermRef = useRef<import('@xterm/xterm').Terminal | null>(null);
   const serverTermRef = useRef<import('@xterm/xterm').Terminal | null>(null);
@@ -54,18 +84,7 @@ export function TerminalPane(props: TerminalPaneProps) {
       ]);
       if (disposed || !shellElRef.current || !serverElRef.current) return;
 
-      const theme = {
-        background: '#09090b',
-        foreground: '#e4e4e7',
-        cursor: '#f97316',
-        selectionBackground: 'rgba(249, 115, 22, 0.25)',
-        black: '#18181b',
-        green: '#4ade80',
-        yellow: '#facc15',
-        red: '#f87171',
-        blue: '#60a5fa',
-        cyan: '#38bdf8',
-      };
+      const initialTheme = themeRef.current === 'light' ? LIGHT_TERM_THEME : DARK_TERM_THEME;
 
       const shellTerm = new Terminal({
         convertEol: true,
@@ -73,7 +92,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         fontSize: 12,
         lineHeight: 1.35,
         cursorBlink: true,
-        theme,
+        theme: initialTheme,
       });
       const shellFit = new FitAddon();
       shellTerm.loadAddon(shellFit);
@@ -90,7 +109,7 @@ export function TerminalPane(props: TerminalPaneProps) {
         fontFamily: "'JetBrains Mono Variable', 'JetBrains Mono', monospace",
         fontSize: 12,
         lineHeight: 1.35,
-        theme,
+        theme: initialTheme,
       });
       const serverFit = new FitAddon();
       serverTerm.loadAddon(serverFit);
@@ -173,6 +192,22 @@ export function TerminalPane(props: TerminalPaneProps) {
       cancelled = true;
     };
   }, [sandboxStatus, onAttachShell]);
+
+  useEffect(() => {
+    const nextTheme = theme === 'light' ? LIGHT_TERM_THEME : DARK_TERM_THEME;
+    try {
+      if (shellTermRef.current) {
+        shellTermRef.current.options.theme = nextTheme;
+        shellTermRef.current.refresh(0, Math.max(0, shellTermRef.current.rows - 1));
+      }
+      if (serverTermRef.current) {
+        serverTermRef.current.options.theme = nextTheme;
+        serverTermRef.current.refresh(0, Math.max(0, serverTermRef.current.rows - 1));
+      }
+    } catch {
+      // ignore unmounted terminal repaint errors
+    }
+  }, [theme]);
 
   useEffect(() => {
     try {

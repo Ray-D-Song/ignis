@@ -151,7 +151,7 @@ async function ensureContainerBooted(
     const { WebContainer } = await import('@webcontainer/api');
     const wc = await WebContainer.boot({
       coep: 'credentialless',
-      workdirName: 'pulseboard',
+      workdirName: 'ignis-app',
     });
     s.instance = wc;
 
@@ -261,7 +261,7 @@ export async function startOrRestartDevServer(callbacks: BootCallbacks = {}): Pr
   }
 
   s.status = 'starting';
-  s.statusDetail = 'Starting Vite 6 + Node API server...';
+  s.statusDetail = 'Starting Vite 6 + React dev server...';
   callbacks.onStatus?.('starting', s.statusDetail);
   callbacks.onServerLog?.('\r\n$ npm run dev\r\n');
 

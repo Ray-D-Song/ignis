@@ -34,6 +34,7 @@ export interface FsmPreset {
 
 interface WorkspacePaneProps {
   lang: UiLang;
+  theme?: 'dark' | 'light';
   activeTab: WorkspaceTab;
   onTabChange: (tab: WorkspaceTab) => void;
   onClose: () => void;
@@ -96,6 +97,7 @@ interface WorkspacePaneProps {
 export function WorkspacePane(props: WorkspacePaneProps) {
   const {
     lang,
+    theme = 'dark',
     activeTab,
     onTabChange,
     onClose,
@@ -245,7 +247,7 @@ export function WorkspacePane(props: WorkspacePaneProps) {
                   className="preview-iframe"
                   src={previewUrl}
                   allow="cross-origin-isolated"
-                  title="PulseBoard WebContainer Full-Stack Preview"
+                  title="Vite + React WebContainer Preview"
                 />
               ) : (
                 <div className="preview-boot-overlay" id="sandbox-boot-overlay">
@@ -262,7 +264,7 @@ export function WorkspacePane(props: WorkspacePaneProps) {
                             : t.sandboxBooting}
                       </div>
                       <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                        {sandboxDetail || 'Vite 6 + React 18 + Node REST API'}
+                        {sandboxDetail || 'Vite 6 + React 18'}
                       </div>
                     </>
                   )}
@@ -272,6 +274,7 @@ export function WorkspacePane(props: WorkspacePaneProps) {
 
             <TerminalPane
               lang={lang}
+              theme={theme}
               sandboxStatus={sandboxStatus}
               sandboxDetail={sandboxDetail}
               shellChannel={shellChannel}

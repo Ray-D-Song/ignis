@@ -2,15 +2,18 @@
 
 import React, { useState } from 'react';
 import {
+  BarChart3,
   Check,
   CheckCircle2,
   ChevronRight,
   Circle,
+  Clock,
   Download,
   FileCode2,
   FileText,
   FolderTree,
   GitCompare,
+  Layers,
   Loader2,
   Search,
   ShieldAlert,
@@ -18,7 +21,6 @@ import {
   Terminal,
   Undo2,
   Volume2,
-  Wrench,
   XCircle,
 } from 'lucide-react';
 import type {
@@ -380,7 +382,7 @@ export function ThreadView(props: ThreadViewProps) {
               </div>
 
               <h1 className="empty-headline">{t.heroTitle}</h1>
-              <p className="empty-sub">{t.heroSubtitle}</p>
+              {t.heroSubtitle ? <p className="empty-sub">{t.heroSubtitle}</p> : null}
 
               {(status === 'idle' || status === 'error') && (
                 <div
@@ -424,10 +426,12 @@ export function ThreadView(props: ThreadViewProps) {
                     onClick={() => onRunStarter(s.prompt)}
                   >
                     <div className="starter-card-head">
-                      {s.id === 'fix_tests' ? (
-                        <Wrench size={15} style={{ color: 'var(--accent)', flexShrink: 0 }} />
-                      ) : s.id === 'add_search' ? (
-                        <Search size={15} style={{ color: 'var(--accent)', flexShrink: 0 }} />
+                      {s.id === 'build_kanban' ? (
+                        <Layers size={15} style={{ color: 'var(--accent)', flexShrink: 0 }} />
+                      ) : s.id === 'build_pomodoro' ? (
+                        <Clock size={15} style={{ color: 'var(--accent)', flexShrink: 0 }} />
+                      ) : s.id === 'build_expense' ? (
+                        <BarChart3 size={15} style={{ color: 'var(--accent)', flexShrink: 0 }} />
                       ) : (
                         <Sparkles size={15} style={{ color: 'var(--accent)', flexShrink: 0 }} />
                       )}
@@ -488,7 +492,7 @@ export function ThreadView(props: ThreadViewProps) {
 
               <div className="assistant-body">
                 <div className="assistant-header">
-                  <span>{m.modelLabel || 'Ignis Code'}</span>
+                  <span>{m.modelLabel || 'Ignis'}</span>
                   {isLastGenerating && !parsed.answer && (!m.toolCalls || m.toolCalls.length === 0) && (
                     <span style={{ color: 'var(--accent)', fontSize: 11.5 }}>●</span>
                   )}

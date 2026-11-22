@@ -2,7 +2,7 @@ export type UiLang = 'en' | 'zh';
 
 export const COPY = {
   en: {
-    brandName: 'Ignis Code',
+    brandName: 'Ignis',
     badgeLocal: 'WebGPU',
     newSession: 'New session',
     modeAgent: 'Agent',
@@ -39,36 +39,35 @@ export const COPY = {
     approvalDeny: 'Deny',
     approvalDenyPlaceholder: 'Optional reason for the agent...',
 
-    eyebrow: 'Pure-Browser Coding Agent IDE',
-    heroTitle: 'Claude Code meets a full-stack WebContainer sandbox, locally.',
-    heroSubtitle:
-      'Local WebGPU inference with WASM FSM tool locking, CodeMirror 6 diff views, interactive Node + Vite 6 full-stack runtime, and zero cloud APIs.',
+    eyebrow: 'WebGPU · WebAssembly · OPFS',
+    heroTitle: 'Ignis: Browser-Native LLM Inference Engine',
+    heroSubtitle: '',
 
     starters: [
       {
-        id: 'fix_tests',
-        title: 'Fix Failing Full-Stack Tests (4/6 → 6/6)',
-        subtitle: 'Run npm test in WebContainer, inspect server/stats.mjs & server/store.mjs, patch both bugs, and re-test.',
+        id: 'build_kanban',
+        title: 'Build an Interactive Kanban Board',
+        subtitle: 'Create a 3-column task board with status transitions, priority tags, and add/delete controls in src/App.jsx.',
         prompt:
-          'Run "npm test" to find the 2 failing API tests, inspect server/stats.mjs and server/store.mjs, fix both bugs with edit_file, and run "npm test" again until all 6 tests pass.',
+          'Read src/App.jsx and src/App.css, then build a clean interactive Kanban task board app in Vite + React with Todo, In Progress, and Done columns, ability to add tasks, move tasks between columns, filter by priority, and delete tasks. Keep code concise (under 85 lines).',
       },
       {
-        id: 'add_search',
-        title: 'Add Full-Stack Issue Search',
-        subtitle: 'Wire keyword filtering across src/App.jsx and test/api.test.mjs, then verify with npm test.',
+        id: 'build_pomodoro',
+        title: 'Build a Pomodoro Focus Timer',
+        subtitle: 'Create a 25/5 focus timer with SVG progress ring, session counter, and task checklist.',
         prompt:
-          'Read src/App.jsx and server/store.mjs, add a search input in src/App.jsx that queries GET /api/issues?q=..., add a search test in test/api.test.mjs, and verify with "npm test".',
+          'Read src/App.jsx and src/App.css, then build a Pomodoro focus timer application with 25m focus / 5m break presets, animated SVG countdown ring, start/pause/reset buttons, completed session counter, and a lightweight focus task list. Keep code concise (under 85 lines).',
       },
       {
-        id: 'harden_api',
-        title: 'Audit API Validation & Error Handling',
-        subtitle: 'Review server/api.mjs and server/store.mjs for edge cases, harden status codes, and verify tests.',
+        id: 'build_expense',
+        title: 'Build a Personal Expense Tracker',
+        subtitle: 'Build an interactive expense dashboard with category filter, quick-add form, and SVG breakdown bars.',
         prompt:
-          'Read server/api.mjs and server/store.mjs, run "npm test", fix any status validation or error handling gaps, and verify all tests pass.',
+          'Read src/App.jsx and src/App.css, then build a personal expense & budget tracker app in React with quick transaction entry, category filters (Food, Travel, Housing, Other), live balance summary cards, and SVG category bar chart breakdown. Keep code concise (under 85 lines).',
       },
     ],
 
-    inputReadyAgent: 'Instruct the coding agent (e.g. "Fix failing tests in server/store.mjs")...',
+    inputReadyAgent: 'Describe an app to build with the local model (e.g. "Build a Kanban board in src/App.jsx")...',
     inputReadyChat: 'Ask about code, architecture, or local WebGPU inference...',
     inputWait: 'Enter a coding task — clicking Run loads the selected local model automatically...',
     inputTermsBlocked: 'Accept Gemma Terms in the model selector before loading...',
@@ -123,7 +122,9 @@ export const COPY = {
     statusIdleShort: 'Not loaded',
     idleBannerTitle: 'Local coding model not loaded yet',
     idleBannerDesc: (name: string, size?: string) =>
-      `Load ${name}${size ? ` (${size})` : ''} into browser WebGPU first — PulseBoard WebContainer is booting in parallel — or click any coding task below.`,
+      `Load ${name}${size ? ` (${size})` : ''} into browser WebGPU first — Vite WebContainer is booting in parallel — or click any app starter below.`,
+    themeLightTitle: 'Switch to light theme',
+    themeDarkTitle: 'Switch to dark theme',
     idleBannerCta: 'Load Model',
     idleBannerTermsHint: 'Open the model menu above to accept Gemma Terms first.',
     loadingTitle: (name: string) => `Loading ${name} into local WebGPU...`,
@@ -145,7 +146,7 @@ export const COPY = {
     synthesizing: 'Synthesizing engineering summary...',
   },
   zh: {
-    brandName: 'Ignis Code',
+    brandName: 'Ignis',
     badgeLocal: 'WebGPU',
     newSession: '新建会话',
     modeAgent: 'Agent',
@@ -182,36 +183,35 @@ export const COPY = {
     approvalDeny: '拒绝',
     approvalDenyPlaceholder: '可选：填写拒绝原因反馈给 Agent...',
 
-    eyebrow: '纯浏览器全栈 Coding Agent IDE',
-    heroTitle: '在浏览器里直接运行 Claude Code + 全栈沙盒。',
-    heroSubtitle:
-      '本地 WebGPU 推理驱动，集成 WASM FSM 结构化工具约束、CodeMirror 6 源码与行级 Diff、xterm 交互终端，以及真实 Vite 6 + React + Node API 全栈环境。',
+    eyebrow: 'WebGPU · WebAssembly · OPFS',
+    heroTitle: 'Ignis: 浏览器原生LLM推理引擎',
+    heroSubtitle: '',
 
     starters: [
       {
-        id: 'fix_tests',
-        title: '测试驱动修复全栈 Bug（4/6 → 6/6）',
-        subtitle: '在 WebContainer 运行 npm test 复现失败用例，读取 server/stats.mjs 与 server/store.mjs 修复并复测全绿。',
+        id: 'build_kanban',
+        title: '构建交互式任务看板应用',
+        subtitle: '在 src/App.jsx 中使用 React 构建支持新增、状态流转与优先级标签的三栏任务看板。',
         prompt:
-          '请先运行 "npm test" 找出 2 个失败的 API 用例，读取 server/stats.mjs 和 server/store.mjs，使用 edit_file 修复这两个 Bug，最后重新运行 "npm test" 确认 6 项测试全部通过。',
+          '请先读取 src/App.jsx 和 src/App.css，然后在 Vite + React 中构建一个美观的交互式三栏任务看板（待办 / 进行中 / 已完成），支持新增任务卡片、切换状态列、优先级标签筛选与删除任务。保持代码精炼（85 行以内）。',
       },
       {
-        id: 'add_search',
-        title: '端到端开发全栈搜索筛选',
-        subtitle: '读取 src/App.jsx 与 test/api.test.mjs，为看板接入关键词搜索并补充单测验证。',
+        id: 'build_pomodoro',
+        title: '构建番茄钟专注计时器',
+        subtitle: '基于 Vite + React 实现 25/5 分钟倒计时、SVG 环形进度条、任务清单与完成计数。',
         prompt:
-          '读取 src/App.jsx 和 server/store.mjs，在 src/App.jsx 增加搜索框调用 GET /api/issues?q=...，并在 test/api.test.mjs 补充搜索测试，最后运行 "npm test" 验证。',
+          '请先读取 src/App.jsx 和 src/App.css，然后构建一个番茄钟专注计时器应用，包含 25 分钟专注 / 5 分钟休息模式切换、SVG 圆形进度条、开始/暂停/重置按钮、已完成番茄数统计以及简易专注任务清单。保持代码精炼（85 行以内）。',
       },
       {
-        id: 'harden_api',
-        title: 'API 边界校验审计与加固',
-        subtitle: '审计 server/api.mjs 与 server/store.mjs 的异常输入与状态码处理并运行回归测试。',
+        id: 'build_expense',
+        title: '构建个人收支记账看板',
+        subtitle: '构建支持快速记一笔、分类汇总统计与可视化柱状图表的 React 记账应用。',
         prompt:
-          '先运行 "npm test" 再读取 server/api.mjs 与 server/store.mjs，修复校验与异常处理问题，确认测试全部通过。',
+          '请先读取 src/App.jsx 和 src/App.css，然后构建一个个人收支记账应用，支持快速添加支出条目、按分类筛选（餐饮/出行/居住/其他）、实时总额汇总卡片与简洁的 SVG 分类统计条形图。保持代码精炼（85 行以内）。',
       },
     ],
 
-    inputReadyAgent: '给本地编码 Agent 下达任务（如「运行 npm test 并修复全部失败用例」）...',
+    inputReadyAgent: '描述你想构建的应用或功能（如「在 src/App.jsx 中构建一个待办看板应用」）...',
     inputReadyChat: '直接询问代码架构、Bug 排查或本地 WebGPU 问题...',
     inputWait: '输入开发任务——点击运行会自动加载当前所选本地模型...',
     inputTermsBlocked: '请先在顶部模型菜单勾选同意 Gemma 使用条款...',
@@ -266,7 +266,9 @@ export const COPY = {
     statusIdleShort: '模型未加载',
     idleBannerTitle: '尚未加载本地编码模型',
     idleBannerDesc: (name: string, size?: string) =>
-      `右侧 WebContainer 全栈沙盒正在并行就绪；点击加载 ${name}${size ? `（${size}）` : ''}，或直接点击下方编码任务卡片自动加载并开始。`,
+      `右侧 Vite WebContainer 正在并行就绪；点击加载 ${name}${size ? `（${size}）` : ''}，或直接点击下方应用模板自动加载并开始构建。`,
+    themeLightTitle: '切换为浅色模式',
+    themeDarkTitle: '切换为深色模式',
     idleBannerCta: '加载模型',
     idleBannerTermsHint: '请先在顶部模型菜单勾选同意 Gemma 使用条款。',
     loadingTitle: (name: string) => `正在加载 ${name} 至本地 WebGPU...`,

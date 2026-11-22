@@ -251,8 +251,28 @@ function compactCommandOutput(raw: string): string {
   return joined.length > 1800 ? `${joined.slice(0, 1800)}\n...[truncated]` : joined;
 }
 
-/** Validate JS/TS/JSON syntax locally in-browser via Lezer / JSON.parse without emitting WebContainer stderr. */
-function validateCodeSyntax(targetPath: string, content: string): string | null {
+/** Collapse common LLM React wrapper duplication (e.g. redundant `export default function App() { return <App />; }`). */
+function normalizeReactModuleContent(targetPath: string, content: string): string {
+  if (!/\.(?:[cm]?jsx?|[cm]?tsx?)$/i.test(targetPath)) return content;
+  const appDecls = content.match(/(?:^|\n)\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+App\b|(?:^|\n)\s*(?:export\s+)?(?:const|let|var|class)\s+App\b/g) || [];
+  if (appDecls.length < 2) return content;
+
+  const wrapperRe = /(\r?\n)\s*export\s+default\s+function\s+App\s*\(\s*\)\s*\{\s*return\s*<\s*App\s*\/?\s*>\s*;?\s*\}\s*;?\s*$/;
+  if (!wrapperRe.test(content)) return content;
+
+  const withoutWrapper = content.replace(wrapperRe, '');
+  if (/\bexport\s+default\b/.test(withoutWrapper)) {
+    return `${withoutWrapper.trimEnd()}\n`;
+  }
+  return `${withoutWrapper.trimEnd()}\n\nexport default App;\n`;
+}
+
+/** Validate JS/TS/JSON syntax, scope duplicates, JSX tags, and imports locally via Lezer without emitting WebContainer stderr. */
+function validateCodeSyntax(
+  targetPath: string,
+  content: string,
+  workspace?: WorkspaceFile[],
+): string | null {
   const lower = targetPath.toLowerCase();
   if (lower.endsWith('.json')) {
     try {
@@ -270,24 +290,184 @@ function validateCodeSyntax(targetPath: string, content: string): string | null 
   else if (lower.endsWith('.js') || lower.endsWith('.mjs') || lower.endsWith('.cjs')) lang = javascriptLanguage;
   if (!lang) return null;
 
+  const getTagName = (tagNode: { firstChild: { name: string; from: number; to: number; nextSibling: unknown } | null }): string => {
+    for (
+      let c = tagNode.firstChild as { name: string; from: number; to: number; nextSibling: unknown } | null;
+      c;
+      c = c.nextSibling as { name: string; from: number; to: number; nextSibling: unknown } | null
+    ) {
+      if (
+        c.name === 'JSXBuiltin' ||
+        c.name === 'JSXIdentifier' ||
+        c.name === 'JSXNamespacedName' ||
+        c.name === 'JSXMemberExpression'
+      ) {
+        return content.slice(c.from, c.to).trim();
+      }
+    }
+    return '';
+  };
+
   const tree = lang.parser.parse(content);
   let errFrom: number | null = null;
+  let customErr: string | null = null;
+  const scopeStack: Array<Set<string>> = [];
+
   tree.iterate({
     enter(node) {
+      if (errFrom !== null) return false;
       if (node.type.isError) {
         errFrom = node.from;
         return false;
       }
+      if (node.name === 'Script' || node.name === 'Block') {
+        scopeStack.push(new Set<string>());
+      }
+      if (node.name === 'VariableDefinition' && scopeStack.length > 0) {
+        let cur = node.node.parent;
+        let inParam = false;
+        let isDecl = false;
+        while (cur && cur.name !== 'Block' && cur.name !== 'Script') {
+          if (cur.name === 'ParamList') {
+            inParam = true;
+            break;
+          }
+          if (
+            cur.name === 'VariableDeclaration' ||
+            cur.name === 'FunctionDeclaration' ||
+            cur.name === 'ClassDeclaration'
+          ) {
+            isDecl = true;
+          }
+          cur = cur.parent;
+        }
+        if (!inParam && isDecl) {
+          const ident = content.slice(node.from, node.to).trim();
+          const currentScope = scopeStack[scopeStack.length - 1];
+          if (ident && currentScope) {
+            if (currentScope.has(ident)) {
+              errFrom = node.from;
+              customErr = `Identifier '${ident}' has already been declared in the same scope.`;
+              return false;
+            }
+            currentScope.add(ident);
+          }
+        }
+      }
+      if (node.name === 'JSXElement') {
+        let openTag: { firstChild: never; from: number } | null = null;
+        let closeTag: { firstChild: never; from: number } | null = null;
+        for (let c = node.node.firstChild; c; c = c.nextSibling) {
+          if (c.name === 'JSXOpenTag') openTag = c as unknown as { firstChild: never; from: number };
+          else if (c.name === 'JSXCloseTag') closeTag = c as unknown as { firstChild: never; from: number };
+        }
+        if (openTag) {
+          const openName = getTagName(openTag);
+          const closeName = closeTag ? getTagName(closeTag) : '';
+          if (!closeTag || openName !== closeName) {
+            errFrom = closeTag ? closeTag.from : openTag.from;
+            customErr = `Mismatched JSX closing tag: <${openName}> closed by ${closeTag ? `</${closeName}>` : 'EOF'}`;
+            return false;
+          }
+        }
+      }
+    },
+    leave(node) {
+      if (node.name === 'Script' || node.name === 'Block') {
+        scopeStack.pop();
+      }
     },
   });
-  if (errFrom === null) return null;
 
-  const linesBefore = content.slice(0, errFrom).split('\n');
-  const errLine = linesBefore.length;
-  const errCol = linesBefore[linesBefore.length - 1].length + 1;
-  const snippet = content.split('\n')[errLine - 1] ?? '';
-  const pointer = `${' '.repeat(Math.max(0, errCol - 1))}^`;
-  return `${targetPath}:${errLine}:${errCol}\n${snippet}\n${pointer}\nSyntaxError: Unexpected token or unbalanced syntax at line ${errLine}, column ${errCol}`;
+  if (errFrom !== null) {
+    const linesBefore = content.slice(0, errFrom).split('\n');
+    const errLine = linesBefore.length;
+    const errCol = linesBefore[linesBefore.length - 1].length + 1;
+    const snippet = content.split('\n')[errLine - 1] ?? '';
+    const pointer = `${' '.repeat(Math.max(0, errCol - 1))}^`;
+    return `${targetPath}:${errLine}:${errCol}\n${snippet}\n${pointer}\nSyntaxError: ${customErr || `Unexpected token or unbalanced syntax at line ${errLine}, column ${errCol}`}`;
+  }
+
+  // Catch duplicate column-0 top-level declarations even across FunctionDeclaration hoisting
+  const topDeclRe = /^(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)|^(?:export\s+)?(?:const|let|var|class)\s+([A-Za-z_$][\w$]*)/gm;
+  const seenTopNames = new Set<string>();
+  let declMatch: RegExpExecArray | null;
+  while ((declMatch = topDeclRe.exec(content)) !== null) {
+    const ident = declMatch[1] || declMatch[2];
+    if (!ident) continue;
+    if (seenTopNames.has(ident)) {
+      return `${targetPath}: SyntaxError: Identifier '${ident}' has already been declared at top level. Define '${ident}' only once and export it with "export default ${ident};".`;
+    }
+    seenTopNames.add(ident);
+  }
+
+  const normalizedLower = targetPath.replace(/\\/g, '/').toLowerCase();
+  if (
+    (normalizedLower === 'src/app.jsx' ||
+      normalizedLower === 'src/app.tsx' ||
+      normalizedLower.endsWith('/app.jsx') ||
+      normalizedLower.endsWith('/app.tsx')) &&
+    !/\bexport\s+default\b/.test(content)
+  ) {
+    return `${targetPath}: SyntaxError: ${targetPath} must include a default export (e.g. "export default function App()" or "export default App;").`;
+  }
+
+  if (workspace && workspace.length > 0) {
+    const pkgFile = workspace.find((f) => normalizeWorkspacePath(f.path) === 'package.json');
+    const installedPkgs = new Set<string>(['react', 'react-dom', 'vite', '@vitejs/plugin-react']);
+    if (pkgFile) {
+      try {
+        const parsedPkg = JSON.parse(pkgFile.content) as {
+          dependencies?: Record<string, string>;
+          devDependencies?: Record<string, string>;
+        };
+        for (const k of Object.keys(parsedPkg.dependencies || {})) installedPkgs.add(k);
+        for (const k of Object.keys(parsedPkg.devDependencies || {})) installedPkgs.add(k);
+      } catch {
+        // fallback to default set
+      }
+    }
+
+    const fileSet = new Set(workspace.map((f) => normalizeWorkspacePath(f.path)));
+    const targetDirParts = normalizeWorkspacePath(targetPath).split('/').slice(0, -1);
+    const importRe = /^\s*import\s+(?:[\s\S]*?\s+from\s+)?['"]([^'"]+)['"]/gm;
+    let impMatch: RegExpExecArray | null;
+    while ((impMatch = importRe.exec(content)) !== null) {
+      const spec = impMatch[1].trim();
+      if (!spec || spec.startsWith('node:')) continue;
+      if (spec.startsWith('.')) {
+        const parts = [...targetDirParts];
+        for (const seg of spec.split('/')) {
+          if (!seg || seg === '.') continue;
+          if (seg === '..') parts.pop();
+          else parts.push(seg);
+        }
+        const base = parts.join('/');
+        const candidates = [
+          base,
+          `${base}.js`,
+          `${base}.jsx`,
+          `${base}.ts`,
+          `${base}.tsx`,
+          `${base}.mjs`,
+          `${base}.json`,
+          `${base}.css`,
+          `${base}/index.js`,
+          `${base}/index.jsx`,
+        ];
+        if (!candidates.some((c) => fileSet.has(c))) {
+          return `${targetPath}: SyntaxError: Cannot resolve relative import '${spec}'. Existing workspace files: ${workspace.map((f) => f.path).join(', ')}`;
+        }
+      } else {
+        const matched = [...installedPkgs].some((pkg) => spec === pkg || spec.startsWith(`${pkg}/`));
+        if (!matched) {
+          return `${targetPath}: SyntaxError: Package '${spec}' is not installed in package.json (only react and react-dom are installed). Write pure React + CSS without external packages.`;
+        }
+      }
+    }
+  }
+
+  return null;
 }
 
 function buildAgentSystemPrompt(workspace: WorkspaceFile[], lang: 'en' | 'zh'): string {
@@ -296,32 +476,32 @@ function buildAgentSystemPrompt(workspace: WorkspaceFile[], lang: 'en' | 'zh'): 
       ? 'Write explanations in Chinese when the user writes in Chinese; keep file paths, code, and commands exact.'
       : 'Keep responses concise and grounded in observed tool outputs.';
 
-  return `You are Ignis Code, a disciplined full-stack software engineering agent running locally inside a WebContainer sandbox.
+  return `You are Ignis, a disciplined frontend/full-stack coding agent running locally inside a WebContainer Vite + React sandbox.
 Output ONE valid JSON action per turn matching the schema.
 
 Tools:
-- run_command {"thought":"...","tool":"run_command","command":"..."}: Run real Node/npm/shell commands (e.g. "npm test", "node --test test/api.test.mjs", "ls -la").
 - read_file {"thought":"...","tool":"read_file","path":"..."}: Read a project file with line numbers.
-- grep_files {"thought":"...","tool":"grep_files","pattern":"..."}: Search regex/substring across project files.
 - list_files {"thought":"...","tool":"list_files","dir":"."}: List files in workspace.
-- edit_file {"thought":"...","tool":"edit_file","path":"...","old_text":"...","new_text":"..."}: Replace an exact existing snippet cleanly (prefer over write_file for edits). Copy exact lines from read_file without line-number prefixes.
+- grep_files {"thought":"...","tool":"grep_files","pattern":"..."}: Search regex/substring across project files.
+- edit_file {"thought":"...","tool":"edit_file","path":"...","old_text":"...","new_text":"..."}: Replace an exact existing snippet cleanly (copy exact lines from read_file without line-number prefixes).
 - write_file {"thought":"...","tool":"write_file","path":"...","content":"..."}: Create a new file or write complete updated file content.
-- finish {"thought":"...","tool":"finish","summary":"..."}: Finish after verifying tests pass.
+- run_command {"thought":"...","tool":"run_command","command":"..."}: Run Node/npm/shell commands (e.g. "npm run build", "ls -la").
+- finish {"thought":"...","tool":"finish","summary":"..."}: Finish after building clean, valid working code.
 
 Examples:
-- {"thought":"Run the test suite to reproduce failures","tool":"run_command","command":"npm test"}
-- {"thought":"Inspect module implementation","tool":"read_file","path":"server/store.mjs"}
-- {"thought":"Fix comparison boundary check","tool":"edit_file","path":"lib/helper.mjs","old_text":"if (count > limit) return false;","new_text":"if (count >= limit) return false;"}
-- {"thought":"Verified all tests pass after edits","tool":"finish","summary":"Patched bug and confirmed npm test passes."}
+- {"thought":"Inspect App entry point first","tool":"read_file","path":"src/App.jsx"}
+- {"thought":"Build interactive React application in src/App.jsx","tool":"write_file","path":"src/App.jsx","content":"import { useState } from 'react';\\n..."}
+- {"thought":"Verify production bundle compiles cleanly","tool":"run_command","command":"npm run build"}
+- {"thought":"Implemented requested React application","tool":"finish","summary":"Built interactive React app in src/App.jsx and src/App.css."}
 
 Project files:
 ${formatWorkspaceTree(workspace)}
 
 Strict engineering rules:
-1. Reproduce issues or inspect relevant files first using run_command / read_file. Never guess file contents.
-2. When editing existing code, use edit_file with exact verbatim old_text (without line-number prefixes like "12 | ").
-3. After ANY code edit, re-run the test suite with run_command (e.g. "npm test") before calling finish.
-4. Never fabricate test passes or command outputs. ${langHint}`;
+1. Inspect existing starter files (e.g. src/App.jsx, src/App.css, package.json) with read_file before editing. Never guess file contents.
+2. When building or replacing a UI view, use write_file on src/App.jsx / src/App.css and keep code concise (under ~85 lines, minimal comments) so the JSON action fits cleanly in one step.
+3. Ensure all JSX/JS/CSS syntax and imports match installed packages in package.json (react, react-dom). Do not import uninstalled packages.
+4. Never fabricate build, file, or command outputs. ${langHint}`;
 }
 
 interface ObservationItem {
@@ -442,6 +622,7 @@ export async function runAgentTurn(opts: {
   let wasAborted = false;
   let lastTestSummary: NodeTestSummary | null = null;
   let editedSinceLastTest = false;
+  let lastCommandFailed = false;
   let approveAllThisRun = false;
 
   const schema = buildAgentActionSchema();
@@ -518,14 +699,15 @@ export async function runAgentTurn(opts: {
       const failingNames = lastTestSummary
         ? lastTestSummary.cases.filter((c) => !c.ok).map((c) => c.name)
         : [];
-      if (editedSinceLastTest) {
-        nudge += ' File edited — run "npm test" via run_command next to verify.';
-      } else if (lastTestSummary && lastTestSummary.failed > 0) {
+      if (lastTestSummary && lastTestSummary.failed > 0) {
         const failDetail = failingNames.length > 0 ? `: ${failingNames.join('; ')}` : '';
-        nudge += ` Still failing (${lastTestSummary.failed} of ${lastTestSummary.total}${failDetail}) — check the exact endpoint/function tested by the failure and patch it cleanly with edit_file.`;
-        if (readPaths.size >= 2) {
-          nudge += ` Already read: [${[...readPaths].join(', ')}] — do NOT call read_file on these again; call edit_file now to patch the bug.`;
-        }
+        nudge += ` Still failing (${lastTestSummary.failed} of ${lastTestSummary.total}${failDetail}) — fix with edit_file and re-run tests.`;
+      } else if (lastCommandFailed) {
+        nudge += ' Last command exited non-zero — inspect the error, fix with edit_file/write_file, and re-run "npm run build" to confirm it succeeds.';
+      } else if (checkpoints.length === 0 && readPaths.size >= 2) {
+        nudge += ' Starter files inspected — call write_file on src/App.jsx now to implement the application (keep code concise, under 85 lines).';
+      } else if (editedSinceLastTest) {
+        nudge += ' File updated cleanly — edit/write any remaining files or call finish when complete.';
       }
     }
 
@@ -543,9 +725,10 @@ export async function runAgentTurn(opts: {
       });
     };
 
+    const reserveGen = maxSeqLen <= 4096 ? 1200 : 2048;
     let fullPrompt = buildStepPrompt(obsTextBlock);
     let enc = await client.encode(fullPrompt);
-    while (enc.ids.length > maxSeqLen - 850 && obsBudget > 1000) {
+    while (enc.ids.length > maxSeqLen - reserveGen && obsBudget > 1000) {
       obsBudget = Math.floor(obsBudget * 0.6);
       obsTextBlock = buildCompactObservationsBlock(observations, 1, obsBudget);
       fullPrompt = buildStepPrompt(obsTextBlock);
@@ -560,7 +743,7 @@ export async function runAgentTurn(opts: {
       images: [],
       audios: [],
       generationMode: 'text',
-      maxNewTokens: Math.min(820, Math.max(256, maxSeqLen - enc.ids.length - 32)),
+      maxNewTokens: Math.min(reserveGen - 32, Math.max(256, maxSeqLen - enc.ids.length - 32)),
       chunkSize: 64,
       sampling: { temperature: 0, topK: 1, topP: 1.0, repetitionPenalty: 1.0 },
       responseFormat: {
@@ -599,6 +782,17 @@ export async function runAgentTurn(opts: {
       };
       traceEntries.push(traceFail);
       callbacks.onTraceEntry?.(traceFail);
+      if (step < maxSteps && !seenSignatures.has('json-trunc-retry')) {
+        seenSignatures.add('json-trunc-retry');
+        observations.push({
+          step,
+          tool: 'write_file',
+          ok: false,
+          full: '[JSON Action Truncated]: Your previous tool call JSON exceeded the step token limit and was cut off. Emit a shorter, more concise write_file (under 75 lines, no comments).',
+          compact: '[Retry]: Previous JSON truncated; emit shorter write_file.',
+        });
+        continue;
+      }
       break;
     }
 
@@ -623,18 +817,23 @@ export async function runAgentTurn(opts: {
 
     if (toolName === 'finish') {
       const stillFailing = Boolean(lastTestSummary && lastTestSummary.failed > 0);
-      if ((editedSinceLastTest || stillFailing) && step < maxSteps && !seenSignatures.has('finish-gate')) {
+      const noEditsYet = checkpoints.length === 0;
+      if ((stillFailing || lastCommandFailed || noEditsYet) && step < maxSteps && !seenSignatures.has('finish-gate')) {
         seenSignatures.add('finish-gate');
         observations.push({
           step,
           tool: 'finish',
           ok: false,
-          full: `[Harness Verification Gate]: Cannot finish yet (${
-            stillFailing
-              ? `${lastTestSummary!.passed}/${lastTestSummary!.total} tests passed, ${lastTestSummary!.failed} STILL FAILING`
-              : 'edits were not verified with npm test'
-          }). Fix the remaining bug(s) using edit_file and run "npm test" via run_command.`,
-          compact: '[Gate]: Tests not all passing; continue fixing & testing.',
+          full: noEditsYet
+            ? '[Harness Verification Gate]: Cannot finish yet — no files have been modified. Call write_file on src/App.jsx to build the requested application first.'
+            : `[Harness Verification Gate]: Cannot finish yet (${
+                stillFailing
+                  ? `${lastTestSummary!.passed}/${lastTestSummary!.total} tests passed, ${lastTestSummary!.failed} STILL FAILING`
+                  : 'last build/command exited non-zero'
+              }). Fix any remaining error and run "npm run build" via run_command before finishing.`,
+          compact: noEditsYet
+            ? '[Gate]: No code changes written yet; use write_file first.'
+            : '[Gate]: Verification command failed; fix & re-verify before finishing.',
         });
         continue;
       }
@@ -812,7 +1011,9 @@ export async function runAgentTurn(opts: {
         const numbered = formatNumberedContent(f.content, 1, undefined, 130);
         output = `${f.path} (lines ${numbered.shownFrom}-${numbered.shownTo} of ${numbered.totalLines}):\n${numbered.text}`;
         compactOut = `Read ${f.path} (${numbered.totalLines} lines)`;
-        callbacks.onOpenFile?.(f.path, 'code');
+        if (checkpoints.length === 0) {
+          callbacks.onOpenFile?.(f.path, 'code');
+        }
       }
     } else if (toolName === 'grep_files') {
       const pat = String(action.pattern || '');
@@ -856,7 +1057,8 @@ export async function runAgentTurn(opts: {
           output = patchRes.error;
           compactOut = `edit_file "${targetPath}" failed to match`;
         } else {
-          const syntaxErr = validateCodeSyntax(targetPath, patchRes.updatedContent);
+          const normalizedUpdated = normalizeReactModuleContent(targetPath, patchRes.updatedContent);
+          const syntaxErr = validateCodeSyntax(targetPath, normalizedUpdated, workspace);
 
           if (syntaxErr !== null) {
             // Guardrail B: reject syntax-breaking edits and keep original file intact
@@ -865,8 +1067,8 @@ export async function runAgentTurn(opts: {
             output = `SyntaxError introduced in ${targetPath} — edit was rolled back automatically:\n${syntaxErr}\n\nCurrent ${targetPath} content:\n${currentNumbered.text}\n\nFix the syntax in your next edit_file call.`;
             compactOut = `Syntax error in ${targetPath} (auto-reverted)`;
           } else {
-            await sandbox.writeFile(targetPath, patchRes.updatedContent);
-            workspace = upsertWorkspaceFile(workspace, targetPath, patchRes.updatedContent, true, {
+            await sandbox.writeFile(targetPath, normalizedUpdated);
+            workspace = upsertWorkspaceFile(workspace, targetPath, normalizedUpdated, true, {
               addedLines: (existing.addedLines || 0) + patchRes.added,
               removedLines: (existing.removedLines || 0) + patchRes.removed,
             });
@@ -880,7 +1082,7 @@ export async function runAgentTurn(opts: {
               path: targetPath,
               existedBefore: true,
               beforeContent: existing.content,
-              afterContent: patchRes.updatedContent,
+              afterContent: normalizedUpdated,
               added: patchRes.added,
               removed: patchRes.removed,
               diffText: patchRes.diffText,
@@ -894,78 +1096,103 @@ export async function runAgentTurn(opts: {
             added = patchRes.added;
             removed = patchRes.removed;
             editedSinceLastTest = true;
+            isAutoRead = true;
 
-            // Clear stale read/command cache signatures since source changed
+            // Clear stale command cache signatures since source changed
             for (const s of [...seenSignatures]) {
-              if (s.startsWith('run_command:') || s.startsWith('read_file:')) {
+              if (s.startsWith('run_command:')) {
                 seenSignatures.delete(s);
               }
             }
 
             // Refresh any cached read_file observation of this path so the model sees current lines
-            const updatedNumbered = formatNumberedContent(patchRes.updatedContent, 1, undefined, 130);
+            const updatedNumbered = formatNumberedContent(normalizedUpdated, 1, undefined, 130);
             for (const prevObs of observations) {
               if ((prevObs.tool === 'read_file' || prevObs.isAutoRead) && prevObs.filePath === targetPath) {
                 prevObs.full = `[Current ${targetPath} after Step ${step} edit (${updatedNumbered.totalLines} lines)]:\n${updatedNumbered.text}`;
               }
             }
 
-            output = `Patched ${targetPath} (+${patchRes.added}/-${patchRes.removed}):\n${patchRes.diffText}`;
+            output = `Patched ${targetPath} (+${patchRes.added}/-${patchRes.removed}):\n${patchRes.diffText}\n\nCurrent ${targetPath} (${updatedNumbered.totalLines} lines):\n${updatedNumbered.text}`;
             compactOut = `Patched ${targetPath} (+${patchRes.added}/-${patchRes.removed})`;
           }
         }
       }
     } else if (toolName === 'write_file') {
       const targetPath = normalizeWorkspacePath(String(action.path || 'untitled.txt'));
-      const content = String(action.content || '');
+      const content = normalizeReactModuleContent(targetPath, String(action.content || ''));
       const existing = readWorkspaceFile(workspace, targetPath);
       const before = existing ? existing.content : '';
-      const diffCounts = computeLineDiff(before, content);
-      const computedDiff = formatUnifiedDiff(targetPath, before, content);
+      const syntaxErr = validateCodeSyntax(targetPath, content, workspace);
+      if (syntaxErr) {
+        ok = false;
+        exitCode = 1;
+        output = `[Syntax Error]: Proposed write to ${targetPath} failed syntax validation and was NOT written to disk:\n${syntaxErr}`;
+        compactOut = `write_file syntax error in ${targetPath}`;
+      } else {
+        const diffCounts = computeLineDiff(before, content);
+        const computedDiff = formatUnifiedDiff(targetPath, before, content);
 
-      await sandbox.writeFile(targetPath, content);
-      readPaths.add(targetPath);
-      workspace = upsertWorkspaceFile(workspace, targetPath, content, true, {
-        addedLines: diffCounts.added,
-        removedLines: diffCounts.removed,
-      });
-      callbacks.onWorkspaceUpdate?.(workspace);
+        await sandbox.writeFile(targetPath, content);
+        readPaths.add(targetPath);
+        workspace = upsertWorkspaceFile(workspace, targetPath, content, true, {
+          addedLines: diffCounts.added,
+          removedLines: diffCounts.removed,
+        });
+        callbacks.onWorkspaceUpdate?.(workspace);
 
-      checkpointId = `ckpt-${step}-${Date.now()}`;
-      const ckpt: WorkspaceCheckpoint = {
-        id: checkpointId,
-        step,
-        tool: 'write_file',
-        path: targetPath,
-        existedBefore: Boolean(existing),
-        beforeContent: before,
-        afterContent: content,
-        added: diffCounts.added,
-        removed: diffCounts.removed,
-        diffText: computedDiff,
-        createdAt: Date.now(),
-      };
-      checkpoints.push(ckpt);
-      callbacks.onCheckpoint?.(ckpt);
-      callbacks.onOpenFile?.(targetPath, existing ? 'diff' : 'code');
+        checkpointId = `ckpt-${step}-${Date.now()}`;
+        const ckpt: WorkspaceCheckpoint = {
+          id: checkpointId,
+          step,
+          tool: 'write_file',
+          path: targetPath,
+          existedBefore: Boolean(existing),
+          beforeContent: before,
+          afterContent: content,
+          added: diffCounts.added,
+          removed: diffCounts.removed,
+          diffText: computedDiff,
+          createdAt: Date.now(),
+        };
+        checkpoints.push(ckpt);
+        callbacks.onCheckpoint?.(ckpt);
+        callbacks.onOpenFile?.(targetPath, existing ? 'diff' : 'code');
 
-      diffText = computedDiff;
-      added = diffCounts.added;
-      removed = diffCounts.removed;
-      editedSinceLastTest = true;
-      for (const s of [...seenSignatures]) {
-        if (s.startsWith('run_command:') || s.startsWith('read_file:')) {
-          seenSignatures.delete(s);
+        diffText = computedDiff;
+        added = diffCounts.added;
+        removed = diffCounts.removed;
+        editedSinceLastTest = true;
+        isAutoRead = true;
+        for (const s of [...seenSignatures]) {
+          if (s.startsWith('run_command:')) {
+            seenSignatures.delete(s);
+          }
         }
-      }
 
-      output = `Wrote ${content.length} chars to ${targetPath}`;
-      compactOut = `Wrote ${targetPath} (${content.length} chars)`;
+        const updatedNumbered = formatNumberedContent(content, 1, undefined, 130);
+        for (const prevObs of observations) {
+          if ((prevObs.tool === 'read_file' || prevObs.isAutoRead) && prevObs.filePath === targetPath) {
+            prevObs.full = `[Current ${targetPath} after Step ${step} write (${updatedNumbered.totalLines} lines)]:\n${updatedNumbered.text}`;
+          }
+        }
+
+        output = `Wrote ${content.length} chars to ${targetPath} (${updatedNumbered.totalLines} lines):\n${updatedNumbered.text}`;
+        compactOut = `Wrote ${targetPath} (${content.length} chars)`;
+      }
     } else if (toolName === 'run_command') {
       const cmd = String(action.command || '').trim() || 'npm test';
       const cmdRes = await sandbox.runCommand(cmd);
       exitCode = cmdRes.exitCode;
       ok = cmdRes.exitCode === 0;
+      lastCommandFailed = cmdRes.exitCode !== 0;
+      if (lastCommandFailed) {
+        for (const s of [...seenSignatures]) {
+          if (s.startsWith('read_file:')) {
+            seenSignatures.delete(s);
+          }
+        }
+      }
       const cleanOut = stripAnsi(cmdRes.output);
       testSummary = cmdRes.testSummary || parseNodeTestOutput(cleanOut);
       if (testSummary) {
@@ -1050,22 +1277,23 @@ export async function runAgentTurn(opts: {
         : '';
     const verifiedLine = lastTestSummary
       ? `Verified latest test result: ${lastTestSummary.passed}/${lastTestSummary.total} tests passed (${lastTestSummary.failed} failed). CRITICAL: NEVER claim tests passed if failed > 0.`
-      : 'Verified latest test result: no test suite summary observed.';
+      : 'Verified command execution log above.';
     const finishNote = finishSummary ? `\n\nAgent Draft Summary:\n${finishSummary}` : '';
-    const synthUserPrompt = `${historyText ? `Prior context:\n${historyText}\n\n` : ''}Original task:\n${userPrompt}${evidenceBlock}\n\n${verifiedLine}${finishNote}\n\nWrite a concise Markdown engineering summary stating exact files changed and exact observed test results.`;
+    const synthUserPrompt = `${historyText ? `Prior context:\n${historyText}\n\n` : ''}Original task:\n${userPrompt}${evidenceBlock}\n\n${verifiedLine}${finishNote}\n\nWrite a concise Markdown summary stating exact files created/modified and observed results.`;
 
     const useThinking = Boolean(capabilities.thinking && enableThinking && !needVoiceSynth);
     const synthPrompt = formatSingleTurnPrompt(archKind, {
       systemPrompt:
-        'You are Ignis Code Assistant. Summarize code changes and observed test/command results accurately in Markdown.',
+        'You are Ignis Assistant. Summarize code changes and observed build/command results accurately in Markdown.',
       userPrompt: synthUserPrompt,
       enableThinking: useThinking,
       effort,
     });
     const thinkPrefix = useThinking ? (archKind === 'gemma4' ? '<|thought|>' : '<think>') : '';
 
+    let streamedSynth = '';
     client.onToken = (ev: { text: string; fullText?: string; tokPerSec?: number }) => {
-      const body = ev.fullText !== undefined ? ev.fullText : ev.text;
+      const body = ev.fullText !== undefined ? ev.fullText : (streamedSynth += ev.text || '');
       callbacks.onFinalToken?.(thinkPrefix ? `${thinkPrefix}${body}` : body, ev.tokPerSec || 0);
     };
 

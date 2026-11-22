@@ -213,10 +213,34 @@ async function main() {
       throw new Error('Expected window.crossOriginIsolated === true under COOP: same-origin + COEP: credentialless');
     }
 
+    const brandWordmark = (await page.locator('.brand-wordmark').innerText()).trim();
+    if (brandWordmark !== 'Ignis') {
+      throw new Error(`Expected brand wordmark 'Ignis', got '${brandWordmark}'`);
+    }
+
     const heroVisible = await page.locator('#hero-banner').isVisible();
     const heroText = heroVisible ? await page.locator('#hero-banner').innerText() : '';
-    if (!heroVisible || /256B|ONNX|SyncAccessHandle/i.test(heroText)) {
+    if (
+      !heroVisible ||
+      !heroText.includes('Ignis: Browser-Native LLM Inference Engine') ||
+      /256B|ONNX|SyncAccessHandle|Claude Code/i.test(heroText)
+    ) {
       throw new Error(`Hero check failed: visible=${heroVisible}, text="${heroText}"`);
+    }
+    if ((await page.locator('.empty-sub').count()) > 0) {
+      throw new Error('Expected empty heroSubtitle to omit .empty-sub');
+    }
+
+    // Verify Dark <-> Light mode toggle works cleanly
+    await page.click('#btn-theme-toggle');
+    const lightThemeAttr = await page.evaluate(() => document.documentElement.getAttribute('data-theme'));
+    if (lightThemeAttr !== 'light') {
+      throw new Error(`Expected light theme after click, got '${lightThemeAttr}'`);
+    }
+    await page.click('#btn-theme-toggle');
+    const darkThemeAttr = await page.evaluate(() => document.documentElement.getAttribute('data-theme'));
+    if (darkThemeAttr !== 'dark') {
+      throw new Error(`Expected dark theme restored after toggle, got '${darkThemeAttr}'`);
     }
 
     if (!(await page.locator('#workspace-pane').isVisible())) {
@@ -241,6 +265,12 @@ async function main() {
     if (selectedModel !== 'spark-4b-q8head') {
       throw new Error(`Expected default CDN preset 'spark-4b-q8head', got '${selectedModel}'`);
     }
+    const cdnOptions = await page.locator('#model-select option').evaluateAll((opts) =>
+      opts.map((o) => o.value),
+    );
+    if (!cdnOptions.includes('spark-1.7b-q8head')) {
+      throw new Error(`Expected CDN model list to include 'spark-1.7b-q8head', got ${JSON.stringify(cdnOptions)}`);
+    }
 
     // 4. Load default Spark-X2.6 4B cross-origin from Server B into OPFS + WebGPU
     await page.click('#btn-load-model');
@@ -251,18 +281,35 @@ async function main() {
     );
     console.log('[status]', await page.locator('#status-text').innerText());
 
-    // Wait for WebContainer PulseBoard full-stack server to boot & render live preview
-    await page.waitForSelector('#preview-iframe', { timeout: 120000 });
+    // Wait for WebContainer Vite + React default starter server to boot & render live preview (diagnostic logging every 15s)
+    const previewDeadline = Date.now() + 240000;
+    let lastOverlayLog = 0;
+    while (true) {
+      if (await page.locator('#preview-iframe').isVisible().catch(() => false)) break;
+      const errBadge = await page.locator('#sandbox-boot-overlay .feature-badge.err').innerText().catch(() => '');
+      if (errBadge) {
+        throw new Error(`WebContainer boot error: ${errBadge}`);
+      }
+      if (Date.now() - lastOverlayLog >= 15000) {
+        const overlayTxt = await page.locator('#sandbox-boot-overlay').innerText().catch(() => '');
+        console.log('[webcontainer-booting]', overlayTxt.replace(/\s+/g, ' ').trim());
+        lastOverlayLog = Date.now();
+      }
+      if (Date.now() >= previewDeadline) {
+        const overlayTxt = await page.locator('#sandbox-boot-overlay').innerText().catch(() => '');
+        throw new Error(`Timed out after 240000ms waiting for #preview-iframe (overlay="${overlayTxt.replace(/\s+/g, ' ').trim()}")`);
+      }
+      await page.waitForTimeout(1000);
+    }
     const previewFrame = page.frameLocator('#preview-iframe');
-    await previewFrame.locator('header h1').waitFor({ timeout: 30000 });
-    const preFixTitle = await previewFrame.locator('header h1').innerText();
-    const preFixRate = await previewFrame.locator('.kpi-card strong.accent').innerText();
-    console.log('[webcontainer-preview before fix]', preFixTitle, 'completionRate=', preFixRate);
-    if (!preFixTitle.includes('PulseBoard')) {
-      throw new Error(`Expected PulseBoard inside #preview-iframe, got "${preFixTitle}"`);
+    await previewFrame.locator('h1').waitFor({ timeout: 30000 });
+    const starterTitle = (await previewFrame.locator('h1').innerText()).trim();
+    console.log('[webcontainer-preview starter]', starterTitle);
+    if (!starterTitle.includes('Vite + React')) {
+      throw new Error(`Expected Vite + React inside #preview-iframe, got "${starterTitle}"`);
     }
 
-    // 5. Ignis Code Agent Harness E2E (FSM tool calls + WebContainer npm test + multi-file bugfix)
+    // 5. Ignis Agent Harness E2E (FSM tool calls + Vite React Kanban app building + HMR live preview)
     await page.locator('.starter-card').first().click();
     await page.waitForFunction(
       () =>
@@ -275,42 +322,45 @@ async function main() {
     const toolCount = await page.locator('.tool-call-card').count();
     const toolSummaries = await page.locator('.tool-call-summary').allInnerTexts();
     const agentAnswer = await page.locator('.msg.assistant .answer-body').last().innerText();
-    const verifierBadge = await page.locator('[data-testid="test-verifier-badge"]').last().innerText();
-    console.log('[agent-harness] tools=', toolCount, 'badge=', verifierBadge, toolSummaries.map((s) => s.replace(/\s+/g, ' ')));
+    console.log('[agent-harness] tools=', toolCount, toolSummaries.map((s) => s.replace(/\s+/g, ' ')));
     console.log('[agent-answer]', agentAnswer.trim().slice(0, 220));
-    if (toolCount < 3) {
-      throw new Error(`Expected at least 3 real FSM tool calls in Agent bugfix run, got ${toolCount}`);
-    }
-    if (!verifierBadge.includes('6/6 PASS')) {
-      throw new Error(`Expected 6/6 PASS from real WebContainer npm test verifier, got "${verifierBadge}"`);
+    if (toolCount < 2) {
+      throw new Error(`Expected at least 2 real FSM tool calls in Agent app-building run, got ${toolCount}`);
     }
     if (agentAnswer.trim().length < 15) {
       throw new Error(`Expected substantive Agent answer, got "${agentAnswer}"`);
     }
 
-    // Assert live PulseBoard preview reflects the fixed stats calculation (50% -> 25%)
-    await page.waitForFunction(
-      () => {
-        const ifr = document.getElementById('preview-iframe');
-        const txt = ifr?.contentDocument?.querySelector('.kpi-card strong.accent')?.textContent || '';
-        return txt.includes('25%');
-      },
-      null,
-      { timeout: 20000 },
-    ).catch(async () => {
-      await previewFrame.locator('.kpi-card strong.accent', { hasText: '25%' }).waitFor({ timeout: 20000 });
-    });
-    const postFixRate = await previewFrame.locator('.kpi-card strong.accent').innerText();
-    console.log('[webcontainer-preview after fix] completionRate=', postFixRate);
-    if (!postFixRate.includes('25%')) {
-      throw new Error(`Expected updated PulseBoard KPI 25% inside #preview-iframe, got "${postFixRate}"`);
+    // Assert live preview reflects updated app content with zero Vite error overlays
+    const previewDeadline2 = Date.now() + 25000;
+    let builtPreviewBody = '';
+    while (Date.now() < previewDeadline2) {
+      builtPreviewBody = (await previewFrame.locator('body').innerText().catch(() => '')).trim();
+      if (builtPreviewBody.length > 0 && !builtPreviewBody.includes('Edit src/App.jsx and save to test HMR')) {
+        break;
+      }
+      await page.waitForTimeout(400);
+    }
+    const viteErrs = await previewFrame.locator('vite-error-overlay').count();
+    console.log('[webcontainer-preview after build]', builtPreviewBody.replace(/\s+/g, ' ').slice(0, 140), 'viteErrs=', viteErrs);
+    if (viteErrs > 0 || !builtPreviewBody || builtPreviewBody.includes('Edit src/App.jsx and save to test HMR')) {
+      const overlayText = await previewFrame.locator('vite-error-overlay').innerText().catch(() => '');
+      const toolPreTexts = await page.locator('.tool-call-pre').allInnerTexts().catch(() => []);
+      console.error('[diagnostic vite-error-overlay]', overlayText);
+      console.error('[diagnostic tool outputs]', toolPreTexts.map((x) => x.slice(0, 500)));
+    }
+    if (!builtPreviewBody || builtPreviewBody.includes('Edit src/App.jsx and save to test HMR')) {
+      throw new Error(`Expected Agent to replace default Vite starter inside #preview-iframe, got "${builtPreviewBody}"`);
+    }
+    if (viteErrs > 0) {
+      throw new Error('Detected Vite error overlay inside #preview-iframe after Agent build');
     }
 
     await page.click('#tab-btn-trace');
     const traceCount = await page.locator('[data-testid="trace-entry"]').count();
     console.log('[trace] entries=', traceCount);
-    if (traceCount < 4) {
-      throw new Error(`Expected >= 4 trace entries after Agent bugfix run, got ${traceCount}`);
+    if (traceCount < 3) {
+      throw new Error(`Expected >= 3 trace entries after Agent run, got ${traceCount}`);
     }
 
     // 6. Showcase 1: Direct JSON Schema FSM on Spark-4B
@@ -350,7 +400,31 @@ async function main() {
       throw new Error(`Unexpected N-gram badge text: "${ngramBadge}"`);
     }
 
-    // 8. Switch to LFM3-Omni 2B for Multimodal Vision VQA (demo-shapes.png)
+    // 8. Switch to Spark-X2.6 1.7B, load cross-origin from Server B, and verify direct generation
+    await page.selectOption('#model-select', 'spark-1.7b-q8head');
+    await page.click('#btn-load-model');
+    await page.waitForFunction(
+      () => document.getElementById('status-text')?.textContent?.includes('Ready · Spark-X2.6 1.7B'),
+      null,
+      { timeout: 120000 },
+    );
+    await page.click('#btn-mode-chat');
+    await page.fill('#chat-input', 'Reply with a short greeting and name one benefit of WebGPU.');
+    await page.click('#btn-send');
+    await page.waitForFunction(
+      () =>
+        document.querySelectorAll('.msg.assistant').length >= 4 &&
+        document.getElementById('status-text')?.textContent?.includes('Ready · Spark-X2.6 1.7B'),
+      null,
+      { timeout: 90000 },
+    );
+    const spark17Out = await page.locator('.msg.assistant .answer-body').last().innerText();
+    console.log('[spark-1.7b chat]', spark17Out.trim().slice(0, 140));
+    if (spark17Out.trim().length < 5 || spark17Out.includes('\uFFFD')) {
+      throw new Error(`Unexpected Spark-1.7B chat output: "${spark17Out}"`);
+    }
+
+    // 9. Switch to LFM3-Omni 2B for Multimodal Vision VQA (demo-shapes.png)
     await page.selectOption('#model-select', 'lfm3-omni-2b');
     await page.click('#btn-load-model');
     await page.waitForFunction(
@@ -361,7 +435,7 @@ async function main() {
     await page.click('#showcase-vqa');
     await page.waitForFunction(
       () =>
-        document.querySelectorAll('.msg.assistant').length >= 4 &&
+        document.querySelectorAll('.msg.assistant').length >= 5 &&
         document.getElementById('status-text')?.textContent?.includes('Ready · LFM3'),
       null,
       { timeout: 90000 },
@@ -372,7 +446,7 @@ async function main() {
       throw new Error(`Expected Omni VQA answer to describe red/blue/square, got: "${vqaAnswer}"`);
     }
 
-    // 9. Clear OPFS Cache
+    // 10. Clear OPFS Cache
     await page.click('#btn-clear-opfs');
     await page.waitForFunction(
       () => document.getElementById('status-text')?.textContent?.includes('OPFS cache cleared'),
@@ -384,7 +458,7 @@ async function main() {
       throw new Error(`Console/page errors detected: ${errors.join(' | ')}`);
     }
 
-    console.log('[PASS] Static Cloudflare Pages + Cross-Origin R2 Ignis Code E2E verified (COEP credentialless + WebContainer PulseBoard + Spark-4B 6/6 Bugfix + JSON FSM + N-gram + LFM3 VQA + Clear OPFS)!');
+    console.log('[PASS] Static Cloudflare Pages + Cross-Origin R2 Ignis E2E verified (COEP credentialless + Vite Starter + Light Theme + Spark-4B Kanban Build + JSON FSM + N-gram + Spark-1.7B + LFM3 VQA + Clear OPFS)!');
   } finally {
     if (context) await context.close();
     pagesSrv.server.closeAllConnections?.();

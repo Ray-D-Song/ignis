@@ -19,6 +19,7 @@ import type { WorkspaceFile } from '@/lib/workspace-fs';
 
 interface CodeEditorPaneProps {
   lang: UiLang;
+  theme?: 'dark' | 'light';
   files: WorkspaceFile[];
   selectedPath: string;
   editorMode: 'code' | 'diff';
@@ -131,6 +132,7 @@ function FileIcon({ kind }: { kind: WorkspaceFile['kind'] }) {
 export function CodeEditorPane(props: CodeEditorPaneProps) {
   const {
     lang,
+    theme = 'dark',
     files,
     selectedPath,
     editorMode,
@@ -276,6 +278,71 @@ export function CodeEditorPane(props: CodeEditorPaneProps) {
         { tag: cm.tags.bool, color: '#f472b6' },
       ]);
 
+      const lightTheme = cm.EditorView.theme(
+        {
+          '&': {
+            backgroundColor: '#ffffff',
+            color: '#0f172a',
+            height: '100%',
+            fontSize: '12px',
+            fontFamily: "var(--font-mono)",
+          },
+          '.cm-scroller': {
+            overflow: 'auto',
+            fontFamily: "var(--font-mono)",
+            lineHeight: '1.52',
+          },
+          '.cm-content': {
+            padding: '10px 0',
+            caretColor: '#ea580c',
+          },
+          '.cm-gutters': {
+            backgroundColor: '#f8fafc',
+            color: '#94a3b8',
+            borderRight: '1px solid rgba(15, 23, 42, 0.08)',
+            minWidth: '38px',
+          },
+          '.cm-activeLineGutter': {
+            backgroundColor: '#f1f5f9',
+            color: '#334155',
+          },
+          '.cm-activeLine': {
+            backgroundColor: 'rgba(15, 23, 42, 0.03)',
+          },
+          '&.cm-focused .cm-selectionBackground, .cm-selectionBackground': {
+            backgroundColor: 'rgba(234, 88, 12, 0.16)',
+          },
+          '.cm-matchingBracket': {
+            backgroundColor: 'rgba(234, 88, 12, 0.2)',
+            outline: '1px solid rgba(234, 88, 12, 0.45)',
+          },
+          '.cm-changedLine': {
+            backgroundColor: 'rgba(22, 163, 74, 0.08)',
+          },
+          '.cm-deletedChunk': {
+            backgroundColor: 'rgba(220, 38, 38, 0.08)',
+          },
+        },
+        { dark: false },
+      );
+
+      const lightHighlight = cm.HighlightStyle.define([
+        { tag: cm.tags.keyword, color: '#c2410c' },
+        { tag: [cm.tags.name, cm.tags.deleted, cm.tags.character, cm.tags.macroName], color: '#0f172a' },
+        { tag: [cm.tags.propertyName, cm.tags.attributeName], color: '#0369a1' },
+        { tag: [cm.tags.function(cm.tags.variableName), cm.tags.labelName], color: '#1d4ed8' },
+        { tag: [cm.tags.color, cm.tags.constant(cm.tags.name), cm.tags.standard(cm.tags.name)], color: '#b45309' },
+        { tag: [cm.tags.definition(cm.tags.name), cm.tags.separator], color: '#0f172a' },
+        { tag: [cm.tags.typeName, cm.tags.className, cm.tags.number, cm.tags.changed, cm.tags.annotation, cm.tags.modifier], color: '#9a3412' },
+        { tag: [cm.tags.operator, cm.tags.operatorKeyword], color: '#475569' },
+        { tag: [cm.tags.string, cm.tags.special(cm.tags.string)], color: '#15803d' },
+        { tag: [cm.tags.meta, cm.tags.comment], color: '#64748b', fontStyle: 'italic' },
+        { tag: cm.tags.bool, color: '#be185d' },
+      ]);
+
+      const activeCmTheme = theme === 'light' ? lightTheme : darkTheme;
+      const activeCmHighlight = theme === 'light' ? lightHighlight : darkHighlight;
+
       const saveShortcut = cm.keymap.of([
         {
           key: 'Mod-s',
@@ -305,8 +372,8 @@ export function CodeEditorPane(props: CodeEditorPaneProps) {
           cm.indentWithTab,
         ]),
         langExt,
-        darkTheme,
-        cm.syntaxHighlighting(darkHighlight),
+        activeCmTheme,
+        cm.syntaxHighlighting(activeCmHighlight),
         cm.EditorView.updateListener.of((upd) => {
           if (upd.docChanged) {
             const val = upd.state.doc.toString();
@@ -345,7 +412,7 @@ export function CodeEditorPane(props: CodeEditorPaneProps) {
         viewRef.current = null;
       }
     };
-  }, [activePath, activeContent, effectiveMode, diffBase]);
+  }, [activePath, activeContent, effectiveMode, diffBase, theme]);
 
   const handleDownload = () => {
     if (!activeFile) return;

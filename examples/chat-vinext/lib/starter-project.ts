@@ -4,13 +4,14 @@ export interface StarterFileSpec {
 }
 
 const PACKAGE_JSON = `{
-  "name": "pulseboard-fullstack",
-  "version": "1.0.0",
+  "name": "ignis-vite-react-app",
   "private": true,
+  "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "node server.mjs",
-    "test": "node --test test/api.test.mjs"
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
   },
   "dependencies": {
     "react": "^18.3.1",
@@ -30,287 +31,17 @@ export default defineConfig({
   plugins: [react()],
   server: {
     host: true,
+    port: 3000,
   },
 });
 `;
 
-const SERVER_MJS = `import http from 'node:http';
-import { createServer as createViteServer } from 'vite';
-
-const PORT = Number(process.env.PORT || 3000);
-let viteRef = null;
-
-const server = http.createServer(async (req, res) => {
-  const url = req.url || '/';
-  if (url.startsWith('/api/')) {
-    const started = Date.now();
-    try {
-      const { handleApi } = await viteRef.ssrLoadModule('/server/api.mjs');
-      await handleApi(req, res);
-    } catch (err) {
-      if (!res.headersSent) {
-        res.statusCode = 500;
-        res.setHeader('Content-Type', 'application/json; charset=utf-8');
-        res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
-      }
-    }
-    console.log(\`\${req.method || 'GET'} \${url} \${res.statusCode} \${Date.now() - started}ms\`);
-    return;
-  }
-
-  viteRef.middlewares(req, res);
-});
-
-viteRef = await createViteServer({
-  server: {
-    middlewareMode: true,
-    hmr: { server },
-  },
-  appType: 'spa',
-});
-
-server.listen(PORT, () => {
-  console.log(\`PulseBoard full-stack server listening on http://localhost:\${PORT}\`);
-});
-`;
-
-const STORE_MJS = `import fs from 'node:fs/promises';
-import path from 'node:path';
-
-export const DEFAULT_DATA_FILE = path.resolve(process.cwd(), 'data', 'issues.json');
-export const VALID_STATUSES = ['open', 'in_progress', 'done'];
-export const VALID_PRIORITIES = ['low', 'medium', 'high'];
-
-export async function readIssues(dataFile = DEFAULT_DATA_FILE) {
-  const raw = await fs.readFile(dataFile, 'utf-8');
-  return JSON.parse(raw);
-}
-
-export async function writeIssues(issues, dataFile = DEFAULT_DATA_FILE) {
-  await fs.mkdir(path.dirname(dataFile), { recursive: true });
-  await fs.writeFile(dataFile, JSON.stringify(issues, null, 2) + '\\n', 'utf-8');
-}
-
-export async function listIssues(filters = {}, dataFile = DEFAULT_DATA_FILE) {
-  let items = await readIssues(dataFile);
-  if (filters.status && filters.status !== 'all') {
-    items = items.filter((item) => item.status === filters.status);
-  }
-  if (filters.priority && filters.priority !== 'all') {
-    items = items.filter((item) => item.priority === filters.priority);
-  }
-  if (filters.q) {
-    const q = String(filters.q).trim().toLowerCase();
-    items = items.filter((item) => item.title.includes(q));
-  }
-  return items;
-}
-
-export async function createIssue(input, dataFile = DEFAULT_DATA_FILE) {
-  const title = String(input?.title || '').trim();
-  if (!title) {
-    throw new Error('Title is required');
-  }
-  const status = input?.status || 'open';
-  if (!VALID_STATUSES.includes(status)) {
-    throw new Error('Invalid status');
-  }
-  const priority = input?.priority || 'medium';
-  if (!VALID_PRIORITIES.includes(priority)) {
-    throw new Error('Invalid priority');
-  }
-
-  const issues = await readIssues(dataFile);
-  const nextId = issues.reduce((max, x) => Math.max(max, Number(x.id) || 0), 0) + 1;
-  const created = {
-    id: nextId,
-    title,
-    status,
-    priority,
-    assignee: String(input?.assignee || 'unassigned').trim() || 'unassigned',
-    createdAt: new Date().toISOString().slice(0, 10),
-  };
-  issues.unshift(created);
-  await writeIssues(issues, dataFile);
-  return created;
-}
-
-export async function updateIssue(id, patch, dataFile = DEFAULT_DATA_FILE) {
-  const numId = Number(id);
-  const issues = await readIssues(dataFile);
-  const idx = issues.findIndex((item) => item.id === numId);
-  if (idx === -1) return null;
-
-  if (patch?.status !== undefined && !VALID_STATUSES.includes(patch.status)) {
-    throw new Error('Invalid status');
-  }
-  if (patch?.priority !== undefined && !VALID_PRIORITIES.includes(patch.priority)) {
-    throw new Error('Invalid priority');
-  }
-
-  const current = issues[idx];
-  const updated = {
-    ...current,
-    ...(patch?.title !== undefined ? { title: String(patch.title).trim() || current.title } : {}),
-    ...(patch?.status !== undefined ? { status: patch.status } : {}),
-    ...(patch?.priority !== undefined ? { priority: patch.priority } : {}),
-    ...(patch?.assignee !== undefined ? { assignee: String(patch.assignee).trim() || 'unassigned' } : {}),
-  };
-  issues[idx] = updated;
-  await writeIssues(issues, dataFile);
-  return updated;
-}
-
-export async function deleteIssue(id, dataFile = DEFAULT_DATA_FILE) {
-  const numId = Number(id);
-  const issues = await readIssues(dataFile);
-  const next = issues.filter((item) => item.id !== numId);
-  if (next.length === issues.length) return false;
-  await writeIssues(next, dataFile);
-  return true;
-}
-`;
-
-const STATS_MJS = `export function getStats(issues) {
-  const total = issues.length;
-  const open = issues.filter((i) => i.status === 'open').length;
-  const inProgress = issues.filter((i) => i.status === 'in_progress').length;
-  const done = issues.filter((i) => i.status !== 'open').length;
-  const completionRate = total === 0 ? 0 : Math.round((done / total) * 100);
-  return { total, open, inProgress, done, completionRate };
-}
-`;
-
-const API_MJS = `import {
-  DEFAULT_DATA_FILE,
-  createIssue,
-  deleteIssue,
-  listIssues,
-  readIssues,
-  updateIssue,
-} from './store.mjs';
-import { getStats } from './stats.mjs';
-
-function sendJson(res, statusCode, payload) {
-  res.statusCode = statusCode;
-  res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  res.end(JSON.stringify(payload));
-}
-
-async function readJsonBody(req) {
-  let raw = '';
-  for await (const chunk of req) {
-    raw += chunk;
-  }
-  if (!raw.trim()) return {};
-  return JSON.parse(raw);
-}
-
-export function createApiHandler(dataFile = DEFAULT_DATA_FILE) {
-  return async function handleApi(req, res) {
-    const parsedUrl = new URL(req.url || '/', 'http://localhost');
-    const pathname = parsedUrl.pathname;
-    const method = (req.method || 'GET').toUpperCase();
-
-    try {
-      if (method === 'GET' && pathname === '/api/health') {
-        return sendJson(res, 200, { ok: true, service: 'pulseboard-api' });
-      }
-
-      if (method === 'GET' && pathname === '/api/stats') {
-        const issues = await readIssues(dataFile);
-        return sendJson(res, 200, getStats(issues));
-      }
-
-      if (method === 'GET' && pathname === '/api/issues') {
-        const issues = await listIssues(
-          {
-            status: parsedUrl.searchParams.get('status') || undefined,
-            priority: parsedUrl.searchParams.get('priority') || undefined,
-            q: parsedUrl.searchParams.get('q') || undefined,
-          },
-          dataFile,
-        );
-        return sendJson(res, 200, { issues });
-      }
-
-      if (method === 'POST' && pathname === '/api/issues') {
-        const body = await readJsonBody(req);
-        const created = await createIssue(body, dataFile);
-        return sendJson(res, 201, { issue: created });
-      }
-
-      const idMatch = pathname.match(/^\\/api\\/issues\\/(\\d+)$/);
-      if (idMatch) {
-        const id = Number(idMatch[1]);
-        if (method === 'PATCH') {
-          const body = await readJsonBody(req);
-          const updated = await updateIssue(id, body, dataFile);
-          if (!updated) return sendJson(res, 404, { error: 'Issue not found' });
-          return sendJson(res, 200, { issue: updated });
-        }
-        if (method === 'DELETE') {
-          const deleted = await deleteIssue(id, dataFile);
-          if (!deleted) return sendJson(res, 404, { error: 'Issue not found' });
-          return sendJson(res, 200, { deleted: true, id });
-        }
-      }
-
-      return sendJson(res, 404, { error: 'Not found' });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const isBadRequest =
-        msg === 'Title is required' || msg === 'Invalid status' || msg === 'Invalid priority';
-      return sendJson(res, isBadRequest ? 400 : 500, { error: msg });
-    }
-  };
-}
-
-export const handleApi = createApiHandler();
-`;
-
-const ISSUES_JSON = `[
-  {
-    "id": 104,
-    "title": "Validate WebGPU storage buffer alignment on Intel Arc",
-    "status": "open",
-    "priority": "high",
-    "assignee": "lin",
-    "createdAt": "2026-11-18"
-  },
-  {
-    "id": 103,
-    "title": "Stream OPFS shard CRC verification without blocking UI",
-    "status": "in_progress",
-    "priority": "high",
-    "assignee": "maya",
-    "createdAt": "2026-11-17"
-  },
-  {
-    "id": 102,
-    "title": "Clamp sliding-window KV cache offsets after reset",
-    "status": "open",
-    "priority": "medium",
-    "assignee": "alex",
-    "createdAt": "2026-11-15"
-  },
-  {
-    "id": 101,
-    "title": "Wire COEP credentialless headers in preview static build",
-    "status": "done",
-    "priority": "low",
-    "assignee": "lin",
-    "createdAt": "2026-11-12"
-  }
-]
-`;
-
-const INDEX_HTML = `<!DOCTYPE html>
+const INDEX_HTML = `<!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>PulseBoard — Full-Stack Issue Tracker</title>
+    <title>Vite + React</title>
   </head>
   <body>
     <div id="root"></div>
@@ -319,378 +50,219 @@ const INDEX_HTML = `<!DOCTYPE html>
 </html>
 `;
 
-const MAIN_JSX = `import React from 'react';
+const MAIN_JSX = `import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
+import './index.css';
 import App from './App.jsx';
-import './styles.css';
 
 createRoot(document.getElementById('root')).render(
-  <React.StrictMode>
+  <StrictMode>
     <App />
-  </React.StrictMode>,
+  </StrictMode>,
 );
 `;
 
-const APP_JSX = `import React, { useCallback, useEffect, useState } from 'react';
+const APP_JSX = `import { useState } from 'react';
+import './App.css';
 
-const NEXT_STATUS = {
-  open: 'in_progress',
-  in_progress: 'done',
-  done: 'open',
-};
+function ViteLogo() {
+  return (
+    <svg className="logo" viewBox="0 0 256 257" aria-hidden="true">
+      <defs>
+        <linearGradient id="viteGradA" x1="-.828%" x2="57.636%" y1="7.652%" y2="78.411%">
+          <stop offset="0%" stopColor="#41D1FF" />
+          <stop offset="100%" stopColor="#BD34FE" />
+        </linearGradient>
+        <linearGradient id="viteGradB" x1="43.376%" x2="50.316%" y1="2.242%" y2="89.03%">
+          <stop offset="0%" stopColor="#FFEA83" />
+          <stop offset="8.333%" stopColor="#FFDD35" />
+          <stop offset="100%" stopColor="#FFA800" />
+        </linearGradient>
+      </defs>
+      <path
+        fill="url(#viteGradA)"
+        d="M255.153 37.938L134.897 252.976c-2.483 4.44-8.862 4.466-11.382.048L.875 37.958c-2.746-4.814 1.371-10.646 6.827-9.67l120.385 21.517a6.537 6.537 0 0 0 2.322-.004l117.867-21.483c5.438-.991 9.574 4.796 6.877 9.62Z"
+      />
+      <path
+        fill="url(#viteGradB)"
+        d="M185.432.063L96.44 17.501a3.268 3.268 0 0 0-2.634 3.014l-5.474 92.456a3.268 3.268 0 0 0 3.997 3.378l24.777-5.718c2.318-.535 4.413 1.507 3.936 3.838l-7.361 36.047c-.495 2.426 1.782 4.5 4.151 3.78l15.304-4.649c2.372-.72 4.652 1.36 4.15 3.788l-11.698 56.621c-.732 3.542 3.979 5.473 5.943 2.437l1.313-2.028l72.516-144.72c1.215-2.423-.88-5.186-3.54-4.672l-25.505 4.922c-2.396.462-4.435-1.77-3.759-4.114l16.646-57.705c.677-2.35-1.37-4.583-3.769-4.113Z"
+      />
+    </svg>
+  );
+}
 
-const STATUS_LABEL = {
-  open: 'Open',
-  in_progress: 'In Progress',
-  done: 'Done',
-};
+function ReactLogo() {
+  return (
+    <svg className="logo react" viewBox="-11.5 -10.23174 23 20.46348" aria-hidden="true">
+      <circle cx="0" cy="0" r="2.05" fill="#61dafb" />
+      <g stroke="#61dafb" strokeWidth="1" fill="none">
+        <ellipse rx="11" ry="4.2" />
+        <ellipse rx="11" ry="4.2" transform="rotate(60)" />
+        <ellipse rx="11" ry="4.2" transform="rotate(120)" />
+      </g>
+    </svg>
+  );
+}
 
 export default function App() {
-  const [issues, setIssues] = useState([]);
-  const [stats, setStats] = useState({ total: 0, open: 0, inProgress: 0, done: 0, completionRate: 0 });
-  const [statusFilter, setStatusFilter] = useState('all');
-  const [title, setTitle] = useState('');
-  const [priority, setPriority] = useState('medium');
-  const [assignee, setAssignee] = useState('lin');
-  const [error, setError] = useState('');
-
-  const loadData = useCallback(async () => {
-    try {
-      const qs = statusFilter !== 'all' ? \`?status=\${encodeURIComponent(statusFilter)}\` : '';
-      const [issuesRes, statsRes] = await Promise.all([
-        fetch(\`/api/issues\${qs}\`),
-        fetch('/api/stats'),
-      ]);
-      const issuesJson = await issuesRes.json();
-      const statsJson = await statsRes.json();
-      setIssues(issuesJson.issues || []);
-      setStats(statsJson);
-      setError('');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load issues');
-    }
-  }, [statusFilter]);
-
-  useEffect(() => {
-    loadData();
-  }, [loadData]);
-
-  const handleCreate = async (e) => {
-    e.preventDefault();
-    if (!title.trim()) return;
-    const res = await fetch('/api/issues', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title, priority, assignee }),
-    });
-    if (!res.ok) {
-      const data = await res.json();
-      setError(data.error || 'Create failed');
-      return;
-    }
-    setTitle('');
-    await loadData();
-  };
-
-  const cycleStatus = async (issue) => {
-    const next = NEXT_STATUS[issue.status] || 'open';
-    const res = await fetch(\`/api/issues/\${issue.id}\`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status: next }),
-    });
-    if (res.ok) await loadData();
-  };
-
-  const handleDelete = async (id) => {
-    const res = await fetch(\`/api/issues/\${id}\`, { method: 'DELETE' });
-    if (res.ok) await loadData();
-  };
+  const [count, setCount] = useState(0);
 
   return (
-    <div className="shell">
-      <header className="topbar">
-        <div>
-          <h1>PulseBoard</h1>
-          <p>Vite 6 + React 18 + Node REST API running inside WebContainer</p>
-        </div>
-        <span className="pill">/api/stats live</span>
-      </header>
-
-      <section className="kpi-grid">
-        <div className="kpi-card">
-          <span>Total</span>
-          <strong>{stats.total}</strong>
-        </div>
-        <div className="kpi-card">
-          <span>Open</span>
-          <strong>{stats.open}</strong>
-        </div>
-        <div className="kpi-card">
-          <span>Done</span>
-          <strong>{stats.done}</strong>
-        </div>
-        <div className="kpi-card">
-          <span>Completion</span>
-          <strong className="accent">{stats.completionRate}%</strong>
-        </div>
-      </section>
-
-      <form className="create-row" onSubmit={handleCreate}>
-        <input
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-          placeholder="Add a new engineering issue..."
-        />
-        <select value={priority} onChange={(e) => setPriority(e.target.value)}>
-          <option value="low">low</option>
-          <option value="medium">medium</option>
-          <option value="high">high</option>
-        </select>
-        <input
-          className="assignee"
-          value={assignee}
-          onChange={(e) => setAssignee(e.target.value)}
-          placeholder="owner"
-        />
-        <button type="submit">Create</button>
-      </form>
-
-      {error && <div className="error-box">{error}</div>}
-
-      <div className="filter-row">
-        {['all', 'open', 'in_progress', 'done'].map((st) => (
-          <button
-            key={st}
-            type="button"
-            className={statusFilter === st ? 'active' : ''}
-            onClick={() => setStatusFilter(st)}
-          >
-            {st === 'all' ? 'All' : STATUS_LABEL[st]}
-          </button>
-        ))}
+    <div className="vite-root">
+      <div>
+        <a href="https://vite.dev" target="_blank" rel="noreferrer">
+          <ViteLogo />
+        </a>
+        <a href="https://react.dev" target="_blank" rel="noreferrer">
+          <ReactLogo />
+        </a>
       </div>
-
-      <ul className="issue-list">
-        {issues.map((issue) => (
-          <li key={issue.id} className="issue-item">
-            <div className="issue-main">
-              <span className="issue-id">#{issue.id}</span>
-              <span className="issue-title">{issue.title}</span>
-              <span className={\`tag priority-\${issue.priority}\`}>{issue.priority}</span>
-              <span className="assignee-tag">@{issue.assignee}</span>
-            </div>
-            <div className="issue-actions">
-              <button type="button" className={\`status-btn \${issue.status}\`} onClick={() => cycleStatus(issue)}>
-                {STATUS_LABEL[issue.status] || issue.status}
-              </button>
-              <button type="button" className="del-btn" onClick={() => handleDelete(issue.id)}>
-                Delete
-              </button>
-            </div>
-          </li>
-        ))}
-      </ul>
+      <h1>Vite + React</h1>
+      <div className="card">
+        <button type="button" onClick={() => setCount((c) => c + 1)}>
+          count is {count}
+        </button>
+        <p>
+          Edit <code>src/App.jsx</code> and save to test HMR
+        </p>
+      </div>
+      <p className="read-the-docs">
+        Click on the Vite and React logos to learn more
+      </p>
     </div>
   );
 }
 `;
 
-const STYLES_CSS = `:root {
-  color-scheme: dark;
-  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+const APP_CSS = `.vite-root {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 2rem;
+  text-align: center;
 }
-* { box-sizing: border-box; }
-body {
-  margin: 0;
-  background: #09090b;
-  color: #fafafa;
-  font-size: 13px;
+
+.logo {
+  height: 6em;
+  width: 6em;
+  padding: 1.5em;
+  will-change: filter;
+  transition: filter 300ms;
 }
-.shell { max-width: 720px; margin: 0 auto; padding: 18px 16px 28px; }
-.topbar {
-  display: flex; align-items: center; justify-content: space-between;
-  margin-bottom: 14px; gap: 10px;
+
+.logo:hover {
+  filter: drop-shadow(0 0 2em #646cffaa);
 }
-.topbar h1 { margin: 0; font-size: 18px; letter-spacing: -0.02em; }
-.topbar p { margin: 2px 0 0; color: #a1a1aa; font-size: 12px; }
-.pill {
-  padding: 3px 9px; border-radius: 999px; font-size: 11px;
-  background: rgba(34, 197, 94, 0.12); color: #86efac;
-  border: 1px solid rgba(34, 197, 94, 0.3);
+
+.logo.react:hover {
+  filter: drop-shadow(0 0 2em #61dafbaa);
 }
-.kpi-grid {
-  display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 14px;
+
+@keyframes logo-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
 }
-.kpi-card {
-  background: #111113; border: 1px solid rgba(255,255,255,0.08);
-  border-radius: 10px; padding: 10px 12px;
+
+@media (prefers-reduced-motion: no-preference) {
+  a:nth-of-type(2) .logo {
+    animation: logo-spin infinite 20s linear;
+  }
 }
-.kpi-card span { display: block; color: #71717a; font-size: 11px; }
-.kpi-card strong { font-size: 20px; font-weight: 650; }
-.kpi-card strong.accent { color: #f97316; }
-.create-row {
-  display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px;
+
+.card {
+  padding: 2em;
 }
-.create-row input, .create-row select {
-  background: #111113; color: #fafafa;
-  border: 1px solid rgba(255,255,255,0.12); border-radius: 8px;
-  padding: 7px 10px; font-size: 12.5px; min-width: 0;
-}
-.create-row input:first-child { flex: 1 1 180px; }
-.create-row .assignee { width: 80px; }
-.create-row button {
-  background: #fafafa; color: #09090b; border: none; border-radius: 8px;
-  padding: 7px 12px; font-weight: 600; cursor: pointer;
-}
-.filter-row { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
-.filter-row button {
-  background: #111113; color: #a1a1aa; border: 1px solid rgba(255,255,255,0.08);
-  border-radius: 999px; padding: 4px 10px; font-size: 12px; cursor: pointer;
-}
-.filter-row button.active {
-  background: #18181b; color: #fafafa; border-color: rgba(255,255,255,0.22);
-}
-.issue-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 7px; }
-.issue-item {
-  display: flex; align-items: center; justify-content: space-between; gap: 10px;
-  padding: 10px 12px; background: #111113; border: 1px solid rgba(255,255,255,0.08);
-  border-radius: 10px;
-}
-.issue-main { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
-.issue-id { color: #71717a; font-family: monospace; }
-.issue-title { font-weight: 500; }
-.tag {
-  font-size: 10.5px; padding: 1px 6px; border-radius: 5px;
-  border: 1px solid rgba(255,255,255,0.12); text-transform: uppercase;
-}
-.priority-high { color: #fca5a5; background: rgba(239,68,68,0.12); }
-.priority-medium { color: #fde68a; background: rgba(234,179,8,0.12); }
-.priority-low { color: #93c5fd; background: rgba(59,130,246,0.12); }
-.assignee-tag { color: #71717a; font-size: 11.5px; }
-.issue-actions { display: flex; gap: 6px; flex-shrink: 0; }
-.status-btn, .del-btn {
-  border-radius: 7px; padding: 4px 9px; font-size: 11.5px; cursor: pointer;
-  border: 1px solid rgba(255,255,255,0.12); background: #18181b; color: #fafafa;
-}
-.status-btn.done { border-color: rgba(34,197,94,0.35); color: #86efac; }
-.status-btn.in_progress { border-color: rgba(249,115,22,0.4); color: #fdba74; }
-.del-btn { color: #a1a1aa; }
-.error-box {
-  margin-bottom: 10px; padding: 8px 10px; border-radius: 8px;
-  background: rgba(239,68,68,0.12); border: 1px solid rgba(239,68,68,0.35); color: #fca5a5;
+
+.read-the-docs {
+  color: #888;
 }
 `;
 
-const API_TEST_MJS = `import test, { after, before } from 'node:test';
-import assert from 'node:assert/strict';
-import fs from 'node:fs/promises';
-import http from 'node:http';
-import os from 'node:os';
-import path from 'node:path';
-import { createApiHandler } from '../server/api.mjs';
+const INDEX_CSS = `:root {
+  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
 
-let server;
-let baseUrl;
-let tmpDir;
-let dataFile;
+  color-scheme: light dark;
+  color: rgba(255, 255, 255, 0.87);
+  background-color: #242424;
 
-before(async () => {
-  tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pulseboard-test-'));
-  dataFile = path.join(tmpDir, 'issues.json');
-  const seed = await fs.readFile(path.resolve(process.cwd(), 'data', 'issues.json'), 'utf-8');
-  await fs.writeFile(dataFile, seed, 'utf-8');
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
 
-  const handler = createApiHandler(dataFile);
-  server = http.createServer(handler);
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const addr = server.address();
-  baseUrl = \`http://127.0.0.1:\${addr.port}\`;
-});
+a {
+  font-weight: 500;
+  color: #646cff;
+  text-decoration: inherit;
+}
 
-after(async () => {
-  if (server) await new Promise((resolve) => server.close(resolve));
-  if (tmpDir) await fs.rm(tmpDir, { recursive: true, force: true });
-});
+a:hover {
+  color: #535bf2;
+}
 
-test('GET /api/health returns ok', async () => {
-  const res = await fetch(\`\${baseUrl}/api/health\`);
-  assert.equal(res.status, 200);
-  const body = await res.json();
-  assert.equal(body.ok, true);
-});
+body {
+  margin: 0;
+  display: flex;
+  place-items: center;
+  min-width: 320px;
+  min-height: 100vh;
+}
 
-test('GET /api/issues returns seeded issues', async () => {
-  const res = await fetch(\`\${baseUrl}/api/issues\`);
-  assert.equal(res.status, 200);
-  const body = await res.json();
-  assert.equal(body.issues.length, 4);
-});
+h1 {
+  font-size: 3.2em;
+  line-height: 1.1;
+}
 
-test('GET /api/stats counts only done issues in completionRate', async () => {
-  const res = await fetch(\`\${baseUrl}/api/stats\`);
-  assert.equal(res.status, 200);
-  const stats = await res.json();
-  // Seeded: 2 open, 1 in_progress, 1 done => done=1, completionRate=25
-  assert.equal(stats.done, 1, \`Expected stats.done=1 (got \${stats.done})\`);
-  assert.equal(stats.completionRate, 25, \`Expected completionRate=25 (got \${stats.completionRate})\`);
-});
+button {
+  border-radius: 8px;
+  border: 1px solid transparent;
+  padding: 0.6em 1.2em;
+  font-size: 1em;
+  font-weight: 500;
+  font-family: inherit;
+  background-color: #1a1a1a;
+  color: inherit;
+  cursor: pointer;
+  transition: border-color 0.25s;
+}
 
-test('POST /api/issues creates an issue and rejects empty title', async () => {
-  const bad = await fetch(\`\${baseUrl}/api/issues\`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ title: '   ' }),
-  });
-  assert.equal(bad.status, 400);
+button:hover {
+  border-color: #646cff;
+}
 
-  const ok = await fetch(\`\${baseUrl}/api/issues\`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ title: 'Add keyboard shortcut hint', priority: 'low', assignee: 'maya' }),
-  });
-  assert.equal(ok.status, 201);
-  const created = await ok.json();
-  assert.equal(created.issue.title, 'Add keyboard shortcut hint');
-});
+button:focus,
+button:focus-visible {
+  outline: 4px auto -webkit-focus-ring-color;
+}
 
-test('PATCH /api/issues/:id updates issue status to done', async () => {
-  const res = await fetch(\`\${baseUrl}/api/issues/104\`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ status: 'done' }),
-  });
-  assert.equal(res.status, 200);
-  const data = await res.json();
-  assert.equal(data.issue.status, 'done');
-});
-
-test('GET /api/issues?q=webgpu matches title case-insensitively', async () => {
-  const res = await fetch(\`\${baseUrl}/api/issues?q=webgpu\`);
-  assert.equal(res.status, 200);
-  const body = await res.json();
-  assert.equal(
-    body.issues.length,
-    1,
-    \`Expected 1 issue matching "webgpu" case-insensitively (got \${body.issues.length})\`,
-  );
-  assert.equal(body.issues[0].id, 104);
-});
+@media (prefers-color-scheme: light) {
+  :root {
+    color: #213547;
+    background-color: #ffffff;
+  }
+  a:hover {
+    color: #747bff;
+  }
+  button {
+    background-color: #f9f9f9;
+  }
+}
 `;
 
 export const STARTER_PROJECT_FILES: StarterFileSpec[] = [
   { path: 'package.json', content: PACKAGE_JSON },
   { path: 'vite.config.js', content: VITE_CONFIG_JS },
-  { path: 'server.mjs', content: SERVER_MJS },
-  { path: 'server/stats.mjs', content: STATS_MJS },
-  { path: 'server/store.mjs', content: STORE_MJS },
-  { path: 'server/api.mjs', content: API_MJS },
-  { path: 'data/issues.json', content: ISSUES_JSON },
   { path: 'index.html', content: INDEX_HTML },
   { path: 'src/main.jsx', content: MAIN_JSX },
   { path: 'src/App.jsx', content: APP_JSX },
-  { path: 'src/styles.css', content: STYLES_CSS },
-  { path: 'test/api.test.mjs', content: API_TEST_MJS },
+  { path: 'src/App.css', content: APP_CSS },
+  { path: 'src/index.css', content: INDEX_CSS },
 ];
 
 export type WebContainerTree = Record<string, unknown>;

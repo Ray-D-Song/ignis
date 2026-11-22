@@ -125,10 +125,48 @@ async function main() {
     }
     await page.click('#tab-btn-preview');
 
-    // Verify default selected model is Spark-4B Q8Head
+    // Verify branding, simplified hero, Light Mode toggle, and Vite + React default starter
+    const brandText = (await page.locator('.brand-wordmark').innerText()).trim();
+    if (brandText !== 'Ignis') {
+      throw new Error(`Expected brand wordmark 'Ignis', got '${brandText}'`);
+    }
+    const heroHeadline = (await page.locator('.empty-headline').innerText()).trim();
+    if (!heroHeadline.includes('Ignis: 浏览器原生LLM推理引擎')) {
+      throw new Error(`Expected simplified hero headline, got '${heroHeadline}'`);
+    }
+    if ((await page.locator('.empty-sub').count()) > 0) {
+      throw new Error('Expected empty heroSubtitle to not render .empty-sub');
+    }
+
+    const initialTheme = await page.evaluate(() => document.documentElement.getAttribute('data-theme'));
+    if (initialTheme !== 'dark') {
+      throw new Error(`Expected initial theme 'dark', got '${initialTheme}'`);
+    }
+    await page.click('#btn-theme-toggle');
+    const lightTheme = await page.evaluate(() => ({
+      attr: document.documentElement.getAttribute('data-theme'),
+      stored: window.localStorage.getItem('ignis-theme'),
+      bg: getComputedStyle(document.body).backgroundColor,
+    }));
+    if (lightTheme.attr !== 'light' || lightTheme.stored !== 'light' || lightTheme.bg === 'rgb(9, 9, 11)') {
+      throw new Error(`Expected light theme active after toggle, got ${JSON.stringify(lightTheme)}`);
+    }
+    await page.click('#btn-theme-toggle');
+    const restoredDark = await page.evaluate(() => document.documentElement.getAttribute('data-theme'));
+    if (restoredDark !== 'dark') {
+      throw new Error(`Expected toggle back to 'dark', got '${restoredDark}'`);
+    }
+
+    // Verify default selected model is Spark-4B Q8Head & Spark-1.7B is selectable
     const selectedVal = await page.locator('#model-select').inputValue();
     if (selectedVal !== 'spark-4b-q8head') {
       throw new Error(`Expected default model spark-4b-q8head, got ${selectedVal}`);
+    }
+    const modelOptions = await page.locator('#model-select option').evaluateAll((opts) =>
+      opts.map((o) => o.value),
+    );
+    if (!modelOptions.includes('spark-1.7b-q8head')) {
+      throw new Error(`Expected model selector to include 'spark-1.7b-q8head', got ${JSON.stringify(modelOptions)}`);
     }
 
     // Click Load Model and wait until ready
@@ -140,11 +178,37 @@ async function main() {
     );
     console.log('[status]', await page.locator('#status-text').innerText());
 
-    // Wait for WebContainer PulseBoard live preview
-    await page.waitForSelector('#preview-iframe', { timeout: 120000 });
-    await page.frameLocator('#preview-iframe').locator('header h1').waitFor({ timeout: 30000 });
+    // Wait for WebContainer Vite + React default starter live preview (diagnostic logging every 15s)
+    const previewDeadline = Date.now() + 240000;
+    let lastOverlayLog = 0;
+    while (true) {
+      if (await page.locator('#preview-iframe').isVisible().catch(() => false)) break;
+      const errBadge = await page.locator('#sandbox-boot-overlay .feature-badge.err').innerText().catch(() => '');
+      if (errBadge) {
+        throw new Error(`WebContainer boot error: ${errBadge}`);
+      }
+      if (Date.now() - lastOverlayLog >= 15000) {
+        const overlayTxt = await page.locator('#sandbox-boot-overlay').innerText().catch(() => '');
+        console.log('[webcontainer-booting]', overlayTxt.replace(/\s+/g, ' ').trim());
+        lastOverlayLog = Date.now();
+      }
+      if (Date.now() >= previewDeadline) {
+        const overlayTxt = await page.locator('#sandbox-boot-overlay').innerText().catch(() => '');
+        throw new Error(`Timed out after 240000ms waiting for #preview-iframe (overlay="${overlayTxt.replace(/\s+/g, ' ').trim()}")`);
+      }
+      await page.waitForTimeout(1000);
+    }
+    const previewFrame = page.frameLocator('#preview-iframe');
+    await previewFrame.locator('h1').waitFor({ timeout: 30000 });
+    const starterTitle = (await previewFrame.locator('h1').innerText()).trim();
+    console.log('[webcontainer-preview starter]', starterTitle);
+    if (!starterTitle.includes('Vite + React')) {
+      throw new Error(`Expected default Vite + React app inside #preview-iframe, got "${starterTitle}"`);
+    }
+    await previewFrame.locator('button').first().click();
+    await previewFrame.locator('button', { hasText: 'count is 1' }).waitFor({ timeout: 5000 });
 
-    // Enable HITL Approval gate & run Coding Starter 1 on Spark-X2.6 4B
+    // Enable HITL Approval gate & run App-Building Starter 1 (Kanban Board) on Spark-X2.6 4B
     await page.click('#btn-mode-agent');
     await page.click('#btn-approval-policy');
     const policyLabel = await page.locator('#btn-approval-policy').innerText();
@@ -158,7 +222,8 @@ async function main() {
     if (shotDir) fs.mkdirSync(shotDir, { recursive: true });
 
     let approvalCount = 0;
-    const deadline = Date.now() + 240000;
+    let doneReached = false;
+    const deadline = Date.now() + 300000;
     while (Date.now() < deadline) {
       const approvalVisible = await page.locator('#approval-card').isVisible().catch(() => false);
       if (approvalVisible) {
@@ -176,8 +241,14 @@ async function main() {
         const st = document.getElementById('status-text')?.textContent || '';
         return document.querySelectorAll('.msg.assistant').length >= 1 && st.includes('就绪 · Spark');
       }).catch(() => false);
-      if (done) break;
+      if (done) {
+        doneReached = true;
+        break;
+      }
       await page.waitForTimeout(400);
+    }
+    if (!doneReached) {
+      throw new Error('Timed out after 300000ms waiting for Spark Agent turn + synthesis to finish');
     }
     if (approvalCount < 1) {
       throw new Error('Expected at least 1 HITL #approval-card prompt during Spark Agent turn');
@@ -185,31 +256,50 @@ async function main() {
 
     const sparkTools = await page.locator('.tool-call-card').count();
     const toolSummaries = await page.locator('.tool-call-summary').allInnerTexts();
-    const verifierBadge = await page.locator('[data-testid="test-verifier-badge"]').last().innerText();
     const agentOut = await page.locator('.msg.assistant .answer-body').last().innerText();
-    console.log('[spark-agent] tools=', sparkTools, 'badge=', verifierBadge, toolSummaries.map((s) => s.replace(/\s+/g, ' ')));
+    console.log('[spark-agent] tools=', sparkTools, toolSummaries.map((s) => s.replace(/\s+/g, ' ')));
     console.log('[spark-agent-answer]', agentOut.trim().slice(0, 180));
-    if (sparkTools < 3 || !verifierBadge.includes('6/6 PASS')) {
+    if (agentOut.trim().length < 10) {
+      throw new Error(`Expected substantive Agent answer, got "${agentOut}"`);
+    }
+    if (sparkTools < 2) {
       await page.click('#tab-btn-trace').catch(() => {});
       const traces = await page.locator('[data-testid="trace-entry"]').allInnerTexts().catch(() => []);
       console.log('[spark-agent-traces]', traces.map((x) => x.replace(/\s+/g, ' ')));
-    }
-    if (sparkTools < 3) {
-      throw new Error(`Expected >= 3 tool calls on Spark Agent bugfix run, got ${sparkTools}`);
-    }
-    if (!verifierBadge.includes('6/6 PASS')) {
-      throw new Error(`Expected 6/6 PASS from real WebContainer test verifier, got "${verifierBadge}"`);
+      throw new Error(`Expected >= 2 tool calls on Spark Agent app-building run, got ${sparkTools}`);
     }
 
-    // Verify CodeMirror 6 Diff View & Revert File button
+    // Verify CodeMirror 6 Diff View & updated Vite live preview without overlay errors
     if (await page.locator('#btn-editor-diff').isVisible()) {
       await page.click('#btn-editor-diff');
     } else {
       throw new Error('Expected #btn-editor-diff to be visible after agent code edits');
     }
     await page.locator('#code-editor-pane .cm-editor .cm-changedLine').first().waitFor({ timeout: 15000 });
+    const previewDeadline2 = Date.now() + 20000;
+    let builtPreviewBody = '';
+    while (Date.now() < previewDeadline2) {
+      builtPreviewBody = (await previewFrame.locator('body').innerText().catch(() => '')).trim();
+      if (builtPreviewBody.length > 0 && !builtPreviewBody.includes('Edit src/App.jsx and save to test HMR')) {
+        break;
+      }
+      await page.waitForTimeout(400);
+    }
+    const viteErrCount = await previewFrame.locator('vite-error-overlay').count();
+    console.log('[webcontainer-preview after build]', builtPreviewBody.replace(/\s+/g, ' ').slice(0, 140), 'viteErr=', viteErrCount);
+    if (!builtPreviewBody || builtPreviewBody.includes('Edit src/App.jsx and save to test HMR')) {
+      throw new Error(`Expected Agent to replace default Vite starter inside #preview-iframe, got "${builtPreviewBody}"`);
+    }
+    if (viteErrCount > 0) {
+      throw new Error('Detected Vite error overlay after Agent built app');
+    }
     if (shotDir) {
-      await page.screenshot({ path: path.join(shotDir, '02-bugfix-6of6-diff-desktop.png') });
+      await page.screenshot({ path: path.join(shotDir, '02-agent-diff-dark-desktop.png') });
+      await page.click('#btn-theme-toggle');
+      await page.waitForTimeout(300);
+      await page.screenshot({ path: path.join(shotDir, '03-agent-diff-light-desktop.png') });
+      await page.click('#btn-theme-toggle');
+      await page.waitForTimeout(200);
     }
     await page.click('#btn-revert-file');
     await page.locator('#btn-revert-file').waitFor({ state: 'detached', timeout: 10000 });
@@ -270,13 +360,13 @@ async function main() {
     if (shotDir) {
       await page.setViewportSize({ width: 390, height: 844 });
       await page.waitForTimeout(250);
-      await page.screenshot({ path: path.join(shotDir, '03-mobile-390x844.png') });
+      await page.screenshot({ path: path.join(shotDir, '04-mobile-390x844.png') });
     }
 
     if (errors.length > 0) {
       throw new Error(`Browser console/page errors: ${errors.join(' | ')}`);
     }
-    console.log('[PASS] Ignis Code vinext IDE (Spark-X2.6-4B HITL 6/6 Bugfix + Diff/Revert + Multi-Turn Direct Chat) verified!');
+    console.log('[PASS] Ignis vinext IDE (Vite + React starter, Dark/Light theme, Spark-4B HITL Kanban build + Diff/Revert + Multi-Turn Direct Chat) verified!');
   } catch (err) {
     failed = true;
     throw err;

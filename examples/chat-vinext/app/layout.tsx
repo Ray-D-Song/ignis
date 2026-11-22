@@ -5,13 +5,13 @@ import '@xterm/xterm/css/xterm.css';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'Ignis Code — Pure-Browser Full-Stack Coding Agent IDE',
+  title: 'Ignis — Browser-Native LLM Inference Engine',
   description:
-    'Run an autonomous Coding Agent harness in your browser with WebGPU local inference, StackBlitz WebContainers, CodeMirror 6 diffs, and a live Vite 6 + React + Node API workspace.',
+    'Browser-native LLM inference engine powered by WebGPU, WebAssembly, and OPFS with an interactive Vite + React WebContainer playground.',
   openGraph: {
-    title: 'Ignis Code — Pure-Browser Full-Stack Coding Agent IDE',
+    title: 'Ignis — Browser-Native LLM Inference Engine',
     description:
-      'Pure-browser WebGPU coding agent harness with WebContainers Node.js sandbox, schema-locked tool calls, live diffs, and full-stack preview.',
+      'Browser-native WebGPU LLM inference engine with WASM FSM structured decoding, CodeMirror 6, and a live Vite + React WebContainer sandbox.',
     type: 'website',
   },
 };

@@ -10,10 +10,12 @@ import {
   Eye,
   Loader2,
   Mic,
+  Moon,
   PanelRight,
   RefreshCw,
   ShieldAlert,
   ShieldCheck,
+  Sun,
   Volume2,
 } from 'lucide-react';
 import type { ApprovalPolicy } from '@/lib/agent-harness';
@@ -25,6 +27,8 @@ export const CUSTOM_MODEL_ID = '__custom__';
 interface TopBarProps {
   lang: UiLang;
   onToggleLang: () => void;
+  theme: 'dark' | 'light';
+  onToggleTheme: () => void;
   editorOpen: boolean;
   onToggleEditor: () => void;
   rightPaneOpen: boolean;
@@ -63,6 +67,8 @@ export function TopBar(props: TopBarProps) {
   const {
     lang,
     onToggleLang,
+    theme,
+    onToggleTheme,
     editorOpen,
     onToggleEditor,
     rightPaneOpen,
@@ -326,6 +332,18 @@ export function TopBar(props: TopBarProps) {
           title="Switch language"
         >
           {lang === 'en' ? '中文' : 'EN'}
+        </button>
+
+        <button
+          id="btn-theme-toggle"
+          type="button"
+          className="icon-btn"
+          onClick={onToggleTheme}
+          title={theme === 'dark' ? t.themeLightTitle : t.themeDarkTitle}
+          aria-label={theme === 'dark' ? t.themeLightTitle : t.themeDarkTitle}
+          aria-pressed={theme === 'light'}
+        >
+          {theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
         </button>
 
         <button
