@@ -1,16 +1,17 @@
 import type { Metadata } from 'next';
 import '@fontsource-variable/inter';
 import '@fontsource-variable/jetbrains-mono';
+import '@xterm/xterm/css/xterm.css';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'Ignis — Browser Agent Runtime',
+  title: 'Ignis Code — Pure-Browser Full-Stack Coding Agent IDE',
   description:
-    'Run an autonomous local agent with schema-locked tool calls, a sandboxed workspace, and live artifact previews directly inside your browser via WebGPU.',
+    'Run an autonomous Coding Agent harness in your browser with WebGPU local inference, StackBlitz WebContainers, CodeMirror 6 diffs, and a live Vite 6 + React + Node API workspace.',
   openGraph: {
-    title: 'Ignis — Browser Agent Runtime',
+    title: 'Ignis Code — Pure-Browser Full-Stack Coding Agent IDE',
     description:
-      'Autonomous pure-browser WebGPU agent harness with sandboxed JS execution, structured tool calls, and multimodal perception.',
+      'Pure-browser WebGPU coding agent harness with WebContainers Node.js sandbox, schema-locked tool calls, live diffs, and full-stack preview.',
     type: 'website',
   },
 };

@@ -1,34 +1,30 @@
 'use client';
 
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import {
   Activity,
-  Code2,
   Cpu,
-  Download,
-  FileCode2,
-  Layout,
+  ExternalLink,
+  Globe,
+  Loader2,
   RefreshCw,
-  RotateCcw,
-  Save,
   Trash2,
+  Undo2,
   X,
 } from 'lucide-react';
 import type { detectDeviceProfile } from '../../../runtime/device-profile.mjs';
-
-type IgnisDeviceProfile = Awaited<ReturnType<typeof detectDeviceProfile>>;
-import {
-  buildArtifactSrcDoc,
-  type AgentArtifact,
-  type AgentTraceEntry,
-} from '@/lib/agent-harness';
+import type { AgentTraceEntry } from '@/lib/agent-harness';
 import { COPY, type UiLang } from '@/lib/i18n';
 import type { ModelPreset } from '@/lib/model-paths';
 import type { ArchKind, OmniGenMode } from '@/lib/prompt-templates';
-import { parseCsvRows, type WorkspaceFile } from '@/lib/workspace-fs';
-import { MarkdownContent } from './MarkdownContent';
+import type { TerminalChannel } from '@/lib/terminal-channel';
+import type { InteractiveShellHandle, SandboxBootStatus } from '@/lib/webcontainer-manager';
+import type { WorkspaceCheckpoint } from '@/lib/workspace-fs';
+import { TerminalPane } from './TerminalPane';
 
-export type WorkspaceTab = 'preview' | 'files' | 'trace' | 'runtime';
+type IgnisDeviceProfile = Awaited<ReturnType<typeof detectDeviceProfile>>;
+
+export type WorkspaceTab = 'preview' | 'trace' | 'runtime';
 
 export interface FsmPreset {
   id: string;
@@ -42,16 +38,23 @@ interface WorkspacePaneProps {
   onTabChange: (tab: WorkspaceTab) => void;
   onClose: () => void;
 
-  artifact: AgentArtifact | null;
-  onClearArtifact: () => void;
-
-  workspaceFiles: WorkspaceFile[];
-  selectedFilePath: string;
-  onSelectFilePath: (path: string) => void;
-  onSaveFileContent: (path: string, content: string) => void;
-  onResetWorkspace: () => void;
+  sandboxStatus: SandboxBootStatus;
+  sandboxDetail: string;
+  previewUrl: string | null;
+  previewRefreshSeq?: number;
+  shellChannel: TerminalChannel;
+  serverChannel: TerminalChannel;
+  onAttachShell: (
+    cols: number,
+    rows: number,
+    onData: (chunk: string) => void,
+  ) => Promise<InteractiveShellHandle>;
+  onRestartServer: () => void;
 
   traceEntries: AgentTraceEntry[];
+  checkpoints: WorkspaceCheckpoint[];
+  onRollbackCheckpoint: (checkpointId: string) => void;
+  contextBudget: { peak: number; max: number };
 
   deviceProfile: IgnisDeviceProfile | null;
   gpuCaps: string;
@@ -96,14 +99,18 @@ export function WorkspacePane(props: WorkspacePaneProps) {
     activeTab,
     onTabChange,
     onClose,
-    artifact,
-    onClearArtifact,
-    workspaceFiles,
-    selectedFilePath,
-    onSelectFilePath,
-    onSaveFileContent,
-    onResetWorkspace,
+    sandboxStatus,
+    sandboxDetail,
+    previewUrl,
+    previewRefreshSeq = 0,
+    shellChannel,
+    serverChannel,
+    onAttachShell,
+    onRestartServer,
     traceEntries,
+    checkpoints,
+    onRollbackCheckpoint,
+    contextBudget,
     deviceProfile,
     gpuCaps,
     stats,
@@ -134,27 +141,10 @@ export function WorkspacePane(props: WorkspacePaneProps) {
   } = props;
 
   const t = COPY[lang];
-  const [artifactSubTab, setArtifactSubTab] = useState<'render' | 'source'>('render');
-  const [iframeRefreshKey, setIframeRefreshKey] = useState(0);
+  const [previewKey, setPreviewKey] = useState(0);
 
-  const selectedFile =
-    workspaceFiles.find((f) => f.path === selectedFilePath) || workspaceFiles[0] || null;
-  const [draftContent, setDraftContent] = useState(selectedFile?.content || '');
-
-  useEffect(() => {
-    setDraftContent(selectedFile?.content || '');
-  }, [selectedFile?.path, selectedFile?.content]);
-
-  const downloadHtml = () => {
-    if (!artifact) return;
-    const html = buildArtifactSrcDoc(artifact.html, artifact.title);
-    const url = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${artifact.title.toLowerCase().replace(/[^a-z0-9]+/g, '-') || 'artifact'}.html`;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
+  const budgetPct =
+    contextBudget.max > 0 ? Math.min(100, Math.round((contextBudget.peak / contextBudget.max) * 100)) : 0;
 
   return (
     <aside className="workspace-pane" id="workspace-pane">
@@ -168,19 +158,8 @@ export function WorkspacePane(props: WorkspacePaneProps) {
             className={`pane-tab ${activeTab === 'preview' ? 'active' : ''}`}
             onClick={() => onTabChange('preview')}
           >
-            <Layout size={13} />
+            <Globe size={13} />
             <span>{t.tabs.preview}</span>
-          </button>
-          <button
-            id="tab-btn-files"
-            type="button"
-            role="tab"
-            aria-selected={activeTab === 'files'}
-            className={`pane-tab ${activeTab === 'files' ? 'active' : ''}`}
-            onClick={() => onTabChange('files')}
-          >
-            <FileCode2 size={13} />
-            <span>{t.tabs.files}</span>
           </button>
           <button
             id="tab-btn-trace"
@@ -221,252 +200,138 @@ export function WorkspacePane(props: WorkspacePaneProps) {
 
       <div className="pane-body">
         {activeTab === 'preview' && (
-          <>
-            {artifact ? (
-              <>
-                <div className="artifact-header">
-                  <div style={{ minWidth: 0 }}>
-                    <div
-                      style={{
-                        fontSize: 13,
-                        fontWeight: 600,
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                        whiteSpace: 'nowrap',
-                      }}
-                    >
-                      {artifact.title}
-                    </div>
-                  </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                    <div className="segmented" style={{ width: 'auto' }}>
-                      <button
-                        type="button"
-                        className={artifactSubTab === 'render' ? 'active' : ''}
-                        style={{ padding: '0 8px', height: 24, fontSize: 11.5 }}
-                        onClick={() => setArtifactSubTab('render')}
-                      >
-                        {t.previewTabRender}
-                      </button>
-                      <button
-                        type="button"
-                        className={artifactSubTab === 'source' ? 'active' : ''}
-                        style={{ padding: '0 8px', height: 24, fontSize: 11.5 }}
-                        onClick={() => setArtifactSubTab('source')}
-                      >
-                        <Code2 size={11} />
-                        {t.previewTabCode}
-                      </button>
-                    </div>
-                    <button
-                      type="button"
-                      className="icon-btn"
-                      style={{ height: 26, padding: '0 6px' }}
-                      onClick={() => setIframeRefreshKey((k) => k + 1)}
-                      title={t.refreshArtifact}
-                    >
-                      <RefreshCw size={12} />
-                    </button>
-                    <button
-                      type="button"
-                      className="icon-btn"
-                      style={{ height: 26, padding: '0 6px' }}
-                      onClick={downloadHtml}
-                      title={t.downloadArtifact}
-                    >
-                      <Download size={12} />
-                    </button>
-                    <button
-                      type="button"
-                      className="icon-btn"
-                      style={{ height: 26, padding: '0 6px' }}
-                      onClick={onClearArtifact}
-                      title="Show workspace file preview"
-                    >
-                      <X size={12} />
-                    </button>
-                  </div>
-                </div>
-                {artifactSubTab === 'render' ? (
-                  <iframe
-                    key={`${artifact.id}-${iframeRefreshKey}`}
-                    className="artifact-iframe"
-                    sandbox="allow-scripts"
-                    title={artifact.title}
-                    srcDoc={buildArtifactSrcDoc(artifact.html, artifact.title)}
+          <div className="preview-split-col">
+            <div className="preview-frame-box">
+              <div className="preview-url-bar">
+                <div className="preview-url-pill">
+                  <span
+                    className={`status-dot ${
+                      previewUrl ? 'ready' : sandboxStatus === 'error' ? 'error' : 'busy'
+                    }`}
                   />
-                ) : (
-                  <div style={{ padding: 14, overflow: 'auto', flex: 1 }}>
-                    <pre className="tool-call-pre" style={{ maxHeight: 'none' }}>
-                      {artifact.html}
-                    </pre>
-                  </div>
-                )}
-              </>
-            ) : selectedFile ? (
-              <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 10, flex: 1 }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12.5, fontWeight: 600 }}>
-                    {selectedFile.path}
-                  </span>
+                  <span>{previewUrl || 'http://localhost:3000'}</span>
+                </div>
+                <div style={{ display: 'flex', gap: 4 }}>
                   <button
+                    id="btn-refresh-preview"
                     type="button"
                     className="icon-btn"
-                    style={{ height: 26, fontSize: 11.5 }}
-                    onClick={() => onTabChange('files')}
+                    style={{ height: 24, padding: '0 6px' }}
+                    disabled={!previewUrl}
+                    onClick={() => setPreviewKey((k) => k + 1)}
+                    title={t.refreshPreview}
                   >
-                    Edit
+                    <RefreshCw size={12} />
                   </button>
-                </div>
-
-                {selectedFile.kind === 'csv' && (
-                  <div style={{ overflowX: 'auto' }}>
-                    {(() => {
-                      const rows = parseCsvRows(selectedFile.content);
-                      if (rows.length === 0) return null;
-                      const [header, ...body] = rows;
-                      return (
-                        <div className="answer-body">
-                          <table>
-                            <thead>
-                              <tr>
-                                {header.map((h, i) => (
-                                  <th key={i}>{h}</th>
-                                ))}
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {body.map((r, ri) => (
-                                <tr key={ri}>
-                                  {r.map((c, ci) => (
-                                    <td key={ci}>{c}</td>
-                                  ))}
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
-                      );
-                    })()}
-                  </div>
-                )}
-
-                {selectedFile.kind === 'markdown' && (
-                  <MarkdownContent content={selectedFile.content} />
-                )}
-
-                {selectedFile.kind === 'image' && selectedFile.assetUrl && (
-                  <div style={{ display: 'flex', justifyContent: 'center', padding: 12, background: 'var(--bg)', borderRadius: 10, border: '1px solid var(--border)' }}>
-                    <img
-                      src={selectedFile.assetUrl}
-                      alt={selectedFile.path}
-                      style={{ maxWidth: '100%', maxHeight: 340, borderRadius: 6 }}
-                    />
-                  </div>
-                )}
-
-                {selectedFile.kind === 'audio' && selectedFile.assetUrl && (
-                  <div style={{ padding: 14, background: 'var(--bg)', borderRadius: 10, border: '1px solid var(--border)' }}>
-                    <audio controls src={selectedFile.assetUrl} style={{ width: '100%' }} />
-                  </div>
-                )}
-
-                {selectedFile.kind === 'html' && (
-                  <iframe
-                    className="artifact-iframe"
-                    sandbox="allow-scripts"
-                    title={selectedFile.path}
-                    srcDoc={buildArtifactSrcDoc(selectedFile.content, selectedFile.path)}
-                  />
-                )}
-
-                {(selectedFile.kind === 'json' || selectedFile.kind === 'text') && (
-                  <pre className="tool-call-pre" style={{ maxHeight: 'none', flex: 1 }}>
-                    {selectedFile.content}
-                  </pre>
-                )}
-              </div>
-            ) : (
-              <div style={{ margin: 'auto', padding: 28, textAlign: 'center', maxWidth: 320 }}>
-                <div style={{ fontWeight: 600, marginBottom: 6 }}>{t.previewEmptyTitle}</div>
-                <div style={{ fontSize: 12.5, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
-                  {t.previewEmptyBody}
+                  {previewUrl && (
+                    <a
+                      href={previewUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="icon-btn"
+                      style={{ height: 24, padding: '0 6px' }}
+                      title={t.openPreviewExternal}
+                    >
+                      <ExternalLink size={12} />
+                    </a>
+                  )}
                 </div>
               </div>
-            )}
-          </>
-        )}
 
-        {activeTab === 'files' && (
-          <div className="file-editor-wrap">
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-              <select
-                className="ui-select"
-                value={selectedFile?.path || ''}
-                onChange={(e) => onSelectFilePath(e.target.value)}
-              >
-                {workspaceFiles.map((f) => (
-                  <option key={f.path} value={f.path}>
-                    {f.path}
-                    {f.modifiedByAgent ? ' ●' : ''}
-                  </option>
-                ))}
-              </select>
-              <button
-                type="button"
-                className="icon-btn"
-                onClick={onResetWorkspace}
-                title={t.filesReset}
-              >
-                <RotateCcw size={13} />
-              </button>
+              {previewUrl ? (
+                <iframe
+                  id="preview-iframe"
+                  key={`${previewUrl}-${previewKey}-${previewRefreshSeq}`}
+                  className="preview-iframe"
+                  src={previewUrl}
+                  allow="cross-origin-isolated"
+                  title="PulseBoard WebContainer Full-Stack Preview"
+                />
+              ) : (
+                <div className="preview-boot-overlay" id="sandbox-boot-overlay">
+                  {sandboxStatus === 'error' ? (
+                    <span className="feature-badge err">{t.sandboxError}: {sandboxDetail}</span>
+                  ) : (
+                    <>
+                      <Loader2 size={20} className="spin-icon" style={{ color: 'var(--accent)' }} />
+                      <div style={{ fontWeight: 600, fontSize: 13 }}>
+                        {sandboxStatus === 'installing'
+                          ? t.sandboxInstalling
+                          : sandboxStatus === 'starting'
+                            ? t.sandboxStarting
+                            : t.sandboxBooting}
+                      </div>
+                      <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                        {sandboxDetail || 'Vite 6 + React 18 + Node REST API'}
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
             </div>
 
-            {selectedFile?.assetUrl ? (
-              <div className="inspector-card">
-                <div className="inspector-title">{selectedFile.kind.toUpperCase()} ASSET</div>
-                {selectedFile.kind === 'image' && (
-                  <img
-                    src={selectedFile.assetUrl}
-                    alt={selectedFile.path}
-                    style={{ maxWidth: '100%', maxHeight: 300, borderRadius: 6 }}
-                  />
-                )}
-                {selectedFile.kind === 'audio' && (
-                  <audio controls src={selectedFile.assetUrl} style={{ width: '100%' }} />
-                )}
-                <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>{selectedFile.content}</div>
-              </div>
-            ) : (
-              <>
-                <textarea
-                  className="file-editor-area"
-                  value={draftContent}
-                  onChange={(e) => setDraftContent(e.target.value)}
-                />
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <span style={{ fontSize: 11.5, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
-                    {draftContent.length} chars
-                  </span>
-                  <button
-                    type="button"
-                    className="load-btn primary"
-                    disabled={!selectedFile || draftContent === selectedFile.content}
-                    onClick={() => selectedFile && onSaveFileContent(selectedFile.path, draftContent)}
-                  >
-                    <Save size={13} />
-                    <span>{t.filesSave}</span>
-                  </button>
-                </div>
-              </>
-            )}
+            <TerminalPane
+              lang={lang}
+              sandboxStatus={sandboxStatus}
+              sandboxDetail={sandboxDetail}
+              shellChannel={shellChannel}
+              serverChannel={serverChannel}
+              onAttachShell={onAttachShell}
+              onRestartServer={onRestartServer}
+            />
           </div>
         )}
 
         {activeTab === 'trace' && (
           <div className="trace-timeline" id="trace-timeline">
+            <div className="inspector-card">
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span className="inspector-title">{t.contextBudget}</span>
+                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11.5, color: 'var(--text-secondary)' }}>
+                  {contextBudget.peak.toLocaleString()} / {contextBudget.max.toLocaleString()} tok ({budgetPct}%)
+                </span>
+              </div>
+              <div className="loading-bar-track" style={{ height: 6 }}>
+                <div
+                  className="loading-bar-fill"
+                  style={{
+                    width: `${budgetPct}%`,
+                    animation: 'none',
+                    background: budgetPct > 85 ? 'var(--danger)' : 'var(--accent)',
+                  }}
+                />
+              </div>
+            </div>
+
+            {checkpoints.length > 0 && (
+              <div className="inspector-card">
+                <div className="inspector-title">Checkpoints ({checkpoints.length})</div>
+                {checkpoints.map((cp) => (
+                  <div key={cp.id} className="checkpoint-row">
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text)' }}>
+                        #{cp.step} · {cp.path}
+                      </div>
+                      <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                        +{cp.added} / -{cp.removed} lines
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      className="icon-btn"
+                      style={{ height: 24, fontSize: 11.5 }}
+                      onClick={() => onRollbackCheckpoint(cp.id)}
+                    >
+                      <Undo2 size={11} />
+                      <span>{t.checkpointRollback}</span>
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
             {traceEntries.length === 0 ? (
-              <div style={{ margin: '48px auto', textAlign: 'center', maxWidth: 320, color: 'var(--text-secondary)', fontSize: 12.5, lineHeight: 1.55 }}>
+              <div style={{ margin: '36px auto', textAlign: 'center', maxWidth: 320, color: 'var(--text-secondary)', fontSize: 12.5, lineHeight: 1.55 }}>
                 {t.traceEmpty}
               </div>
             ) : (

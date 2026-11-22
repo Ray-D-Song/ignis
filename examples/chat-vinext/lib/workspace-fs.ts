@@ -1,95 +1,76 @@
-export type WorkspaceFileKind = 'csv' | 'markdown' | 'json' | 'html' | 'text' | 'image' | 'audio';
+import { computeLineDiff, formatUnifiedDiff } from './diff';
+import { STARTER_PROJECT_FILES } from './starter-project';
+
+export type WorkspaceFileKind =
+  | 'js'
+  | 'jsx'
+  | 'ts'
+  | 'tsx'
+  | 'json'
+  | 'css'
+  | 'html'
+  | 'markdown'
+  | 'text';
 
 export interface WorkspaceFile {
   path: string;
   kind: WorkspaceFileKind;
   content: string;
-  assetUrl?: string;
   modifiedByAgent?: boolean;
+  addedLines?: number;
+  removedLines?: number;
   updatedAt: number;
 }
 
-const INITIAL_CSV = `month,region,revenue_usd,active_users,churn_pct
-2026-10,North America,48200,1920,2.1
-2026-10,Europe,29400,1180,1.9
-2026-11,North America,53600,2190,1.8
-2026-11,Europe,33100,1340,1.7
-2026-12,North America,61900,2540,1.5
-2026-12,Europe,38800,1590,1.6
-`;
-
-const INITIAL_SPEC = `# Pulse Edge Analytics — Q4 Release Brief
-
-## Product Goal
-Ship an offline-capable telemetry and cohort workbench running directly inside customer browsers with zero data egress.
-
-## Target Milestones
-1. **Browser Sandbox Core**: Execute CSV & JSON aggregations inside an isolated Web Worker within 100 ms.
-2. **Interactive Artifacts**: Render responsive charts, KPI grids, and interactive estimators with dark-theme parity.
-3. **Structured Output Lock**: Guarantee valid tool invocation schemas on edge devices with sub-millisecond logit masking.
-4. **Multimodal Briefings**: Inspect uploaded screenshots locally and synthesize spoken summaries on supported hardware.
-
-## Success Metrics
-- Server dependency: **0 API roundtrips**
-- Interactive responsiveness: **< 25 ms per frame**
-- Q4 revenue benchmark target: **$250,000+**
-`;
+export interface WorkspaceCheckpoint {
+  id: string;
+  step: number;
+  tool: 'edit_file' | 'write_file' | 'manual';
+  path: string;
+  existedBefore: boolean;
+  beforeContent: string;
+  afterContent: string;
+  added: number;
+  removed: number;
+  diffText: string;
+  createdAt: number;
+}
 
 export function inferFileKind(filePath: string): WorkspaceFileKind {
   const lower = filePath.toLowerCase();
-  if (lower.endsWith('.csv')) return 'csv';
-  if (lower.endsWith('.md') || lower.endsWith('.markdown')) return 'markdown';
+  if (lower.endsWith('.jsx')) return 'jsx';
+  if (lower.endsWith('.tsx')) return 'tsx';
+  if (lower.endsWith('.ts') || lower.endsWith('.mts') || lower.endsWith('.cts')) return 'ts';
+  if (lower.endsWith('.js') || lower.endsWith('.mjs') || lower.endsWith('.cjs')) return 'js';
   if (lower.endsWith('.json')) return 'json';
+  if (lower.endsWith('.css')) return 'css';
   if (lower.endsWith('.html') || lower.endsWith('.htm') || lower.endsWith('.svg')) return 'html';
-  if (lower.endsWith('.png') || lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.webp')) {
-    return 'image';
-  }
-  if (lower.endsWith('.wav') || lower.endsWith('.mp3')) return 'audio';
+  if (lower.endsWith('.md') || lower.endsWith('.markdown')) return 'markdown';
   return 'text';
 }
 
 export function normalizeWorkspacePath(raw: string): string {
-  return raw.trim().replace(/^\/+/, '').replace(/^workspace\//, '');
+  return raw
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '')
+    .replace(/^\/+/, '')
+    .replace(/^workspace\//, '');
 }
 
 export function createInitialWorkspace(): WorkspaceFile[] {
   const now = Date.now();
-  return [
-    {
-      path: 'revenue_q4.csv',
-      kind: 'csv',
-      content: INITIAL_CSV,
-      updatedAt: now,
-    },
-    {
-      path: 'product_spec.md',
-      kind: 'markdown',
-      content: INITIAL_SPEC,
-      updatedAt: now,
-    },
-    {
-      path: 'demo-shapes.png',
-      kind: 'image',
-      content: '[Binary PNG sample: red and blue geometric shapes]',
-      assetUrl: '/samples/demo-shapes.png',
-      updatedAt: now,
-    },
-    {
-      path: 'demo-tone.wav',
-      kind: 'audio',
-      content: '[Binary WAV audio sample: 16 kHz calibration tone]',
-      assetUrl: '/samples/demo-tone.wav',
-      updatedAt: now,
-    },
-  ];
+  return STARTER_PROJECT_FILES.map((f) => ({
+    path: f.path,
+    kind: inferFileKind(f.path),
+    content: f.content,
+    updatedAt: now,
+  }));
 }
 
 export function formatWorkspaceTree(files: WorkspaceFile[]): string {
   return files
-    .map((f) => {
-      if (f.assetUrl) return `- ${f.path} (${f.kind} media asset)`;
-      return `- ${f.path} (${f.kind}, ${f.content.length} chars)`;
-    })
+    .map((f) => `- ${f.path} (${f.content.split(/\r?\n/).length} lines)`)
     .join('\n');
 }
 
@@ -103,6 +84,7 @@ export function upsertWorkspaceFile(
   rawPath: string,
   content: string,
   modifiedByAgent = false,
+  diffStats?: { addedLines?: number; removedLines?: number },
 ): WorkspaceFile[] {
   const cleanPath = normalizeWorkspacePath(rawPath) || 'untitled.txt';
   const kind = inferFileKind(cleanPath);
@@ -111,43 +93,178 @@ export function upsertWorkspaceFile(
     kind,
     content,
     modifiedByAgent,
+    addedLines: diffStats?.addedLines,
+    removedLines: diffStats?.removedLines,
     updatedAt: Date.now(),
   };
   const idx = files.findIndex((f) => normalizeWorkspacePath(f.path) === cleanPath);
   if (idx === -1) {
-    return [...files, nextEntry];
+    return [...files, nextEntry].sort((a, b) => a.path.localeCompare(b.path));
   }
   const copy = [...files];
   copy[idx] = { ...copy[idx], ...nextEntry };
   return copy;
 }
 
-export function parseCsvRows(content: string): string[][] {
-  return content
-    .trim()
-    .split(/\r?\n/)
-    .filter((line) => line.trim().length > 0)
-    .map((line) => {
-      const cells: string[] = [];
-      let cur = '';
-      let inQuotes = false;
-      for (let i = 0; i < line.length; i++) {
-        const ch = line[i];
-        if (ch === '"') {
-          if (inQuotes && line[i + 1] === '"') {
-            cur += '"';
-            i++;
-          } else {
-            inQuotes = !inQuotes;
-          }
-        } else if (ch === ',' && !inQuotes) {
-          cells.push(cur.trim());
-          cur = '';
-        } else {
-          cur += ch;
-        }
+export function formatNumberedContent(
+  content: string,
+  startLine = 1,
+  endLine?: number,
+  maxLines = 140,
+): { text: string; totalLines: number; shownFrom: number; shownTo: number; truncated: boolean } {
+  const lines = content.replace(/\r\n/g, '\n').split('\n');
+  const totalLines = lines.length;
+  const from = Math.max(1, startLine);
+  const desiredEnd = endLine ? Math.min(totalLines, Math.max(from, endLine)) : Math.min(totalLines, from + maxLines - 1);
+  const clampedEnd = Math.min(desiredEnd, from + maxLines - 1);
+  const slice = lines.slice(from - 1, clampedEnd);
+  const width = String(clampedEnd).length;
+  const numbered = slice
+    .map((line, i) => `${String(from + i).padStart(width, ' ')} | ${line}`)
+    .join('\n');
+  return {
+    text: numbered,
+    totalLines,
+    shownFrom: from,
+    shownTo: clampedEnd,
+    truncated: clampedEnd < totalLines,
+  };
+}
+
+export function grepWorkspaceFiles(
+  files: WorkspaceFile[],
+  pattern: string,
+  pathPrefix?: string,
+  maxMatches = 30,
+): string[] {
+  const q = pattern.trim();
+  if (!q) return [];
+  const prefix = pathPrefix ? normalizeWorkspacePath(pathPrefix) : '';
+
+  let re: RegExp | null = null;
+  try {
+    re = new RegExp(q, 'i');
+  } catch {
+    re = null;
+  }
+  const lowerQ = q.toLowerCase();
+  const hits: string[] = [];
+
+  for (const f of files) {
+    if (prefix && !normalizeWorkspacePath(f.path).startsWith(prefix)) continue;
+    const lines = f.content.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const matched = re ? re.test(line) : line.toLowerCase().includes(lowerQ);
+      if (matched) {
+        hits.push(`${f.path}:${i + 1}: ${line.trimEnd().slice(0, 140)}`);
+        if (hits.length >= maxMatches) return hits;
       }
-      cells.push(cur.trim());
-      return cells;
-    });
+    }
+  }
+  return hits;
+}
+
+export type EditPatchResult =
+  | {
+      ok: true;
+      updatedContent: string;
+      added: number;
+      removed: number;
+      diffText: string;
+    }
+  | {
+      ok: false;
+      error: string;
+    };
+
+export function applyEditPatch(
+  filePath: string,
+  original: string,
+  oldText: string,
+  newText: string,
+): EditPatchResult {
+  const normOrig = original.replace(/\r\n/g, '\n');
+  const normOld = oldText.replace(/\r\n/g, '\n');
+  const normNew = newText.replace(/\r\n/g, '\n');
+
+  if (!normOld) {
+    return { ok: false, error: 'old_text cannot be empty' };
+  }
+  if (normOld === normNew) {
+    return {
+      ok: false,
+      error: 'No-op edit rejected: new_text is identical to old_text. Provide the fixed replacement code.',
+    };
+  }
+
+  // 1. Exact substring match (must be unique)
+  const firstIdx = normOrig.indexOf(normOld);
+  if (firstIdx !== -1) {
+    const secondIdx = normOrig.indexOf(normOld, firstIdx + normOld.length);
+    if (secondIdx !== -1) {
+      return {
+        ok: false,
+        error: 'old_text matched multiple locations; include 1-2 surrounding lines to make it unique.',
+      };
+    }
+    const updatedContent =
+      normOrig.slice(0, firstIdx) + normNew + normOrig.slice(firstIdx + normOld.length);
+    const { added, removed } = computeLineDiff(normOrig, updatedContent);
+    const diffText = formatUnifiedDiff(filePath, normOrig, updatedContent);
+    return { ok: true, updatedContent, added, removed, diffText };
+  }
+
+  // 2. Unambiguous trimmed-line fallback for minor indentation drift from small models
+  const origLines = normOrig.split('\n');
+  const oldLines = normOld.split('\n');
+  while (oldLines.length > 1 && oldLines[oldLines.length - 1] === '') oldLines.pop();
+
+  const matches: number[] = [];
+  for (let i = 0; i <= origLines.length - oldLines.length; i++) {
+    let allMatch = true;
+    for (let k = 0; k < oldLines.length; k++) {
+      if (origLines[i + k].trim() !== oldLines[k].trim()) {
+        allMatch = false;
+        break;
+      }
+    }
+    if (allMatch) matches.push(i);
+  }
+
+  if (matches.length === 1) {
+    const startLine = matches[0];
+    const nextLines = [
+      ...origLines.slice(0, startLine),
+      ...normNew.split('\n'),
+      ...origLines.slice(startLine + oldLines.length),
+    ];
+    const updatedContent = nextLines.join('\n');
+    const { added, removed } = computeLineDiff(normOrig, updatedContent);
+    const diffText = formatUnifiedDiff(filePath, normOrig, updatedContent);
+    return { ok: true, updatedContent, added, removed, diffText };
+  }
+
+  // 3. Provide helpful line-numbered hint around closest anchor line
+  const anchor = oldLines.map((l) => l.trim()).find((l) => l.length >= 6) || '';
+  if (anchor) {
+    const hintIdx = origLines.findIndex((l) => l.includes(anchor));
+    if (hintIdx !== -1) {
+      const from = Math.max(0, hintIdx - 4);
+      const to = Math.min(origLines.length, hintIdx + 8);
+      const snippet = origLines
+        .slice(from, to)
+        .map((l, k) => `${from + k + 1} | ${l}`)
+        .join('\n');
+      return {
+        ok: false,
+        error: `old_text did not match verbatim in ${filePath}. Closest lines:\n${snippet}`,
+      };
+    }
+  }
+
+  return {
+    ok: false,
+    error: `old_text not found in ${filePath}. Re-read ${filePath} and copy exact lines.`,
+  };
 }

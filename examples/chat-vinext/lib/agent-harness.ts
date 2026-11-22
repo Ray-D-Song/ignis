@@ -1,21 +1,55 @@
-import type { IgnisClient } from '../../../runtime/ignis-client.mjs';
-import { formatSingleTurnPrompt, splitThinking, type ArchKind, type OmniGenMode } from './prompt-templates';
-import { executeSandboxedJs } from './sandbox-js';
 import {
+  javascriptLanguage,
+  jsxLanguage,
+  tsxLanguage,
+  typescriptLanguage,
+} from '@codemirror/lang-javascript';
+import type { IgnisClient } from '../../../runtime/ignis-client.mjs';
+import { computeLineDiff, formatUnifiedDiff } from './diff';
+import { formatSingleTurnPrompt, splitThinking, type ArchKind, type OmniGenMode } from './prompt-templates';
+import {
+  parseNodeTestOutput,
+  stripAnsi,
+  type CommandExecResult,
+  type NodeTestSummary,
+} from './webcontainer-manager';
+import {
+  applyEditPatch,
+  formatNumberedContent,
   formatWorkspaceTree,
+  grepWorkspaceFiles,
   normalizeWorkspacePath,
   readWorkspaceFile,
   upsertWorkspaceFile,
+  type WorkspaceCheckpoint,
   type WorkspaceFile,
 } from './workspace-fs';
 
 export type AgentToolName =
+  | 'list_files'
   | 'read_file'
+  | 'grep_files'
+  | 'edit_file'
   | 'write_file'
-  | 'run_js'
-  | 'render_artifact'
-  | 'inspect_image'
+  | 'run_command'
   | 'finish';
+
+export type ApprovalPolicy = 'auto' | 'ask';
+
+export interface ApprovalRequest {
+  id: string;
+  step: number;
+  tool: 'edit_file' | 'write_file' | 'run_command';
+  thought: string;
+  target: string;
+  preview: string;
+  added?: number;
+  removed?: number;
+}
+
+export type ApprovalDecision =
+  | { approved: true; approveAll?: boolean }
+  | { approved: false; reason?: string };
 
 export interface AgentToolCallRecord {
   id: string;
@@ -27,23 +61,23 @@ export interface AgentToolCallRecord {
   ok: boolean;
   durationMs: number;
   fsmMedianMs: number | null;
-}
-
-export interface AgentArtifact {
-  id: string;
-  title: string;
-  html: string;
-  createdAt: number;
+  diffText?: string;
+  added?: number;
+  removed?: number;
+  exitCode?: number;
+  testSummary?: NodeTestSummary | null;
+  checkpointId?: string;
 }
 
 export interface AgentTraceEntry {
   id: string;
-  phase: 'perception' | 'decision' | 'tool' | 'synthesis';
+  phase: 'perception' | 'decision' | 'tool' | 'approval' | 'synthesis';
   step: number;
   title: string;
   detail: string;
   durationMs: number;
   fsmMedianMs?: number | null;
+  promptTokens?: number;
   ok: boolean;
 }
 
@@ -62,15 +96,23 @@ export interface PendingAudioInput {
   name: string;
 }
 
+export interface CodingSandboxAdapter {
+  writeFile: (path: string, content: string) => Promise<void>;
+  readFile?: (path: string) => Promise<string | null>;
+  listFiles?: () => Promise<WorkspaceFile[]>;
+  runCommand: (command: string) => Promise<CommandExecResult>;
+}
+
 export interface AgentTurnCallbacks {
   onStatusText?: (text: string) => void;
   onToolStepStart?: (step: number, maxSteps: number) => void;
   onToolStepComplete?: (record: AgentToolCallRecord) => void;
   onTraceEntry?: (entry: AgentTraceEntry) => void;
   onWorkspaceUpdate?: (files: WorkspaceFile[]) => void;
-  onArtifact?: (artifact: AgentArtifact) => void;
+  onCheckpoint?: (checkpoint: WorkspaceCheckpoint) => void;
+  onApprovalRequest?: (req: ApprovalRequest) => Promise<ApprovalDecision>;
+  onOpenFile?: (path: string, mode?: 'code' | 'diff') => void;
   onFinalToken?: (fullRenderedText: string, liveTps: number) => void;
-  loadWorkspaceImage?: (assetUrl: string, name: string) => Promise<PendingImageInput>;
 }
 
 export interface AgentTurnResult {
@@ -78,154 +120,97 @@ export interface AgentTurnResult {
   toolCalls: AgentToolCallRecord[];
   traceEntries: AgentTraceEntry[];
   workspaceFiles: WorkspaceFile[];
-  artifact: AgentArtifact | null;
+  checkpoints: WorkspaceCheckpoint[];
+  testSummary: NodeTestSummary | null;
   audioUrl?: string;
   totalPromptTokens: number;
   totalGeneratedTokens: number;
+  peakPromptTokens: number;
+  maxSeqLen: number;
   decodeTokPerSec: number;
   prefillMs: number;
   curPos: number;
   aborted: boolean;
 }
 
-export function buildAgentActionSchema(capabilities: { vision: boolean }): Record<string, unknown> {
-  const branches: Array<Record<string, unknown>> = [
-    {
-      type: 'object',
-      properties: {
-        thought: { type: 'string' },
-        tool: { const: 'read_file' },
-        path: { type: 'string' },
+export function buildAgentActionSchema(): Record<string, unknown> {
+  return {
+    oneOf: [
+      {
+        type: 'object',
+        properties: {
+          thought: { type: 'string' },
+          tool: { const: 'list_files' },
+          dir: { type: 'string' },
+        },
+        required: ['thought', 'tool', 'dir'],
+        additionalProperties: false,
       },
-      required: ['thought', 'tool', 'path'],
-      additionalProperties: false,
-    },
-    {
-      type: 'object',
-      properties: {
-        thought: { type: 'string' },
-        tool: { const: 'write_file' },
-        path: { type: 'string' },
-        content: { type: 'string' },
+      {
+        type: 'object',
+        properties: {
+          thought: { type: 'string' },
+          tool: { const: 'read_file' },
+          path: { type: 'string' },
+        },
+        required: ['thought', 'tool', 'path'],
+        additionalProperties: false,
       },
-      required: ['thought', 'tool', 'path', 'content'],
-      additionalProperties: false,
-    },
-    {
-      type: 'object',
-      properties: {
-        thought: { type: 'string' },
-        tool: { const: 'run_js' },
-        code: { type: 'string' },
+      {
+        type: 'object',
+        properties: {
+          thought: { type: 'string' },
+          tool: { const: 'grep_files' },
+          pattern: { type: 'string' },
+        },
+        required: ['thought', 'tool', 'pattern'],
+        additionalProperties: false,
       },
-      required: ['thought', 'tool', 'code'],
-      additionalProperties: false,
-    },
-    {
-      type: 'object',
-      properties: {
-        thought: { type: 'string' },
-        tool: { const: 'render_artifact' },
-        title: { type: 'string' },
-        html: { type: 'string' },
+      {
+        type: 'object',
+        properties: {
+          thought: { type: 'string' },
+          tool: { const: 'edit_file' },
+          path: { type: 'string' },
+          old_text: { type: 'string' },
+          new_text: { type: 'string' },
+        },
+        required: ['thought', 'tool', 'path', 'old_text', 'new_text'],
+        additionalProperties: false,
       },
-      required: ['thought', 'tool', 'title', 'html'],
-      additionalProperties: false,
-    },
-    {
-      type: 'object',
-      properties: {
-        thought: { type: 'string' },
-        tool: { const: 'finish' },
-        summary: { type: 'string' },
+      {
+        type: 'object',
+        properties: {
+          thought: { type: 'string' },
+          tool: { const: 'write_file' },
+          path: { type: 'string' },
+          content: { type: 'string' },
+        },
+        required: ['thought', 'tool', 'path', 'content'],
+        additionalProperties: false,
       },
-      required: ['thought', 'tool', 'summary'],
-      additionalProperties: false,
-    },
-  ];
-
-  if (capabilities.vision) {
-    branches.splice(4, 0, {
-      type: 'object',
-      properties: {
-        thought: { type: 'string' },
-        tool: { const: 'inspect_image' },
-        path: { type: 'string' },
-        question: { type: 'string' },
+      {
+        type: 'object',
+        properties: {
+          thought: { type: 'string' },
+          tool: { const: 'run_command' },
+          command: { type: 'string' },
+        },
+        required: ['thought', 'tool', 'command'],
+        additionalProperties: false,
       },
-      required: ['thought', 'tool', 'path', 'question'],
-      additionalProperties: false,
-    });
-  }
-
-  return { oneOf: branches };
-}
-
-export function buildArtifactSrcDoc(rawHtml: string, title = 'Artifact'): string {
-  const trimmed = rawHtml.trim();
-  const baseStyle = `
-<style>
-  *, *::before, *::after { box-sizing: border-box; }
-  :root {
-    color-scheme: dark;
-    --bg: #09090b;
-    --panel: #111113;
-    --surface: #18181b;
-    --border: rgba(255,255,255,0.1);
-    --text: #fafafa;
-    --muted: #a1a1aa;
-    --accent: #f97316;
-  }
-  html, body {
-    margin: 0;
-    padding: 0;
-    background: var(--bg);
-    color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
-    font-size: 14px;
-    line-height: 1.55;
-    -webkit-font-smoothing: antialiased;
-  }
-  body { padding: 20px; }
-  h1, h2, h3 { margin: 0 0 10px; letter-spacing: -0.02em; font-weight: 600; }
-  p { margin: 0 0 10px; color: var(--muted); }
-  .card, section, article {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 14px 16px;
-  }
-  .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin-bottom: 14px; }
-  table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 13px; }
-  th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); }
-  th { color: var(--muted); font-weight: 500; font-size: 12px; }
-  input[type="range"] { accent-color: var(--accent); width: 100%; }
-  button {
-    background: #fafafa; color: #09090b; border: none; border-radius: 7px;
-    padding: 7px 12px; font-weight: 600; cursor: pointer; font-size: 13px;
-  }
-  svg { max-width: 100%; height: auto; display: block; }
-</style>`;
-
-  if (/<html[\s>]/i.test(trimmed) || /^<!doctype/i.test(trimmed)) {
-    if (/<head[\s>]/i.test(trimmed)) {
-      return trimmed.replace(/<head([\s>])/i, `<head$1${baseStyle}`);
-    }
-    return trimmed;
-  }
-
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>${title.replace(/</g, '&lt;')}</title>
-${baseStyle}
-</head>
-<body>
-${trimmed}
-</body>
-</html>`;
+      {
+        type: 'object',
+        properties: {
+          thought: { type: 'string' },
+          tool: { const: 'finish' },
+          summary: { type: 'string' },
+        },
+        required: ['thought', 'tool', 'summary'],
+        additionalProperties: false,
+      },
+    ],
+  };
 }
 
 function median(values?: number[]): number | null {
@@ -243,47 +228,173 @@ function summarizeArgs(args: Record<string, unknown>): Record<string, unknown> {
   return out;
 }
 
-function buildAgentSystemPrompt(
-  workspace: WorkspaceFile[],
-  capabilities: { vision: boolean },
-  lang: 'en' | 'zh',
-): string {
-  const inspectLine = capabilities.vision
-    ? `\n- inspect_image {"thought":"...","tool":"inspect_image","path":"<image_file>","question":"..."}: Run local vision understanding on an image file.`
-    : '';
-  const langHint = lang === 'zh'
-    ? 'Respond concisely and accurately in Chinese when the user asks in Chinese.'
-    : 'Respond concisely and accurately.';
+function compactCommandOutput(raw: string): string {
+  const lines = raw.split('\n');
+  const kept: string[] = [];
+  let skipStackBlock = false;
+  for (const line of lines) {
+    if (/^\s*at\s+(?:async\s+)?(?:Test\.|TestContext|process\.|node:internal)/.test(line)) {
+      continue;
+    }
+    if (/^\s*\{\s*$/.test(line) && kept.length > 0 && kept[kept.length - 1].includes('at ')) {
+      skipStackBlock = true;
+      continue;
+    }
+    if (skipStackBlock) {
+      if (/^\s*\}\s*$/.test(line)) skipStackBlock = false;
+      else if (/^\s*(actual|expected):/.test(line)) kept.push(line);
+      continue;
+    }
+    kept.push(line);
+  }
+  const joined = kept.join('\n').trim();
+  return joined.length > 1800 ? `${joined.slice(0, 1800)}\n...[truncated]` : joined;
+}
 
-  return `You are Ignis Agent running inside an isolated browser WebGPU workspace.
+/** Validate JS/TS/JSON syntax locally in-browser via Lezer / JSON.parse without emitting WebContainer stderr. */
+function validateCodeSyntax(targetPath: string, content: string): string | null {
+  const lower = targetPath.toLowerCase();
+  if (lower.endsWith('.json')) {
+    try {
+      JSON.parse(content);
+      return null;
+    } catch (e) {
+      return `${targetPath}: JSON SyntaxError: ${e instanceof Error ? e.message : String(e)}`;
+    }
+  }
+
+  let lang: typeof javascriptLanguage | null = null;
+  if (lower.endsWith('.tsx')) lang = tsxLanguage;
+  else if (lower.endsWith('.ts') || lower.endsWith('.mts') || lower.endsWith('.cts')) lang = typescriptLanguage;
+  else if (lower.endsWith('.jsx')) lang = jsxLanguage;
+  else if (lower.endsWith('.js') || lower.endsWith('.mjs') || lower.endsWith('.cjs')) lang = javascriptLanguage;
+  if (!lang) return null;
+
+  const tree = lang.parser.parse(content);
+  let errFrom: number | null = null;
+  tree.iterate({
+    enter(node) {
+      if (node.type.isError) {
+        errFrom = node.from;
+        return false;
+      }
+    },
+  });
+  if (errFrom === null) return null;
+
+  const linesBefore = content.slice(0, errFrom).split('\n');
+  const errLine = linesBefore.length;
+  const errCol = linesBefore[linesBefore.length - 1].length + 1;
+  const snippet = content.split('\n')[errLine - 1] ?? '';
+  const pointer = `${' '.repeat(Math.max(0, errCol - 1))}^`;
+  return `${targetPath}:${errLine}:${errCol}\n${snippet}\n${pointer}\nSyntaxError: Unexpected token or unbalanced syntax at line ${errLine}, column ${errCol}`;
+}
+
+function buildAgentSystemPrompt(workspace: WorkspaceFile[], lang: 'en' | 'zh'): string {
+  const langHint =
+    lang === 'zh'
+      ? 'Write explanations in Chinese when the user writes in Chinese; keep file paths, code, and commands exact.'
+      : 'Keep responses concise and grounded in observed tool outputs.';
+
+  return `You are Ignis Code, a disciplined full-stack software engineering agent running locally inside a WebContainer sandbox.
 Output ONE valid JSON action per turn matching the schema.
 
 Tools:
-- read_file {"thought":"...","tool":"read_file","path":"<filename>"}
-- write_file {"thought":"...","tool":"write_file","path":"<filename>","content":"..."}
-- run_js {"thought":"...","tool":"run_js","code":"..."}: Browser Web Worker sandbox (NO require, NO fs, NO import). Pre-injected global: \`workspace.read(path)\`, \`workspace.parseCsv(path)\` -> \`{ headers, rows, records }\`, \`workspace.write(path, text)\`, \`console.log(...)\`. Keep code short (< 8 lines) and ONLY compute numbers/data; never put SVG/HTML inside run_js.
-  Example run_js: {"thought":"Sum revenue and average churn from CSV","tool":"run_js","code":"const { records } = workspace.parseCsv('revenue_q4.csv'); const total = records.reduce((s,r)=>s+r.revenue_usd,0); const byRegion = {}; records.forEach(r=>byRegion[r.region]=(byRegion[r.region]||0)+r.revenue_usd); const avgChurn = records.reduce((s,r)=>s+r.churn_pct,0)/records.length; return { rowCount: records.length, total, byRegion, avgChurn: Number(avgChurn.toFixed(2)) };"}
-- render_artifact {"thought":"...","tool":"render_artifact","title":"...","html":"..."}: Render a live dark-mode HTML/SVG UI preview (host already styles .grid, .card, table, th, td, button, h1-h3, svg on #09090b dark background). Keep HTML compact (< 1200 chars), zero external URLs or CDNs.
-  Example render_artifact: {"thought":"Render KPI cards and bar chart with exact computed figures","tool":"render_artifact","title":"Q4 Revenue Dashboard","html":"<div class='grid'><div class='card'><small>Total Q4</small><h2>$265,000</h2></div><div class='card'><small>Avg Churn</small><h2>1.77%</h2></div></div><svg viewBox='0 0 360 120'><rect x='20' y='20' width='180' height='26' rx='4' fill='#f97316'/><text x='208' y='38' fill='#fafafa' font-size='12'>North America $163,700</text><rect x='20' y='64' width='112' height='26' rx='4' fill='#52525b'/><text x='140' y='82' fill='#fafafa' font-size='12'>Europe $101,300</text></svg>"}${inspectLine}
-- finish {"thought":"...","tool":"finish","summary":"..."}: End tool execution once gathered results are ready.
+- run_command {"thought":"...","tool":"run_command","command":"..."}: Run real Node/npm/shell commands (e.g. "npm test", "node --test test/api.test.mjs", "ls -la").
+- read_file {"thought":"...","tool":"read_file","path":"..."}: Read a project file with line numbers.
+- grep_files {"thought":"...","tool":"grep_files","pattern":"..."}: Search regex/substring across project files.
+- list_files {"thought":"...","tool":"list_files","dir":"."}: List files in workspace.
+- edit_file {"thought":"...","tool":"edit_file","path":"...","old_text":"...","new_text":"..."}: Replace an exact existing snippet cleanly (prefer over write_file for edits). Copy exact lines from read_file without line-number prefixes.
+- write_file {"thought":"...","tool":"write_file","path":"...","content":"..."}: Create a new file or write complete updated file content.
+- finish {"thought":"...","tool":"finish","summary":"..."}: Finish after verifying tests pass.
 
-Workspace files:
+Examples:
+- {"thought":"Run the test suite to reproduce failures","tool":"run_command","command":"npm test"}
+- {"thought":"Inspect module implementation","tool":"read_file","path":"server/store.mjs"}
+- {"thought":"Fix comparison boundary check","tool":"edit_file","path":"lib/helper.mjs","old_text":"if (count > limit) return false;","new_text":"if (count >= limit) return false;"}
+- {"thought":"Verified all tests pass after edits","tool":"finish","summary":"Patched bug and confirmed npm test passes."}
+
+Project files:
 ${formatWorkspaceTree(workspace)}
 
-Strict rules:
-1. Read target workspace files first if not yet in observations.
-2. Never use Node.js \`require('fs')\` or invent numbers. Use \`workspace.parseCsv()\` or \`workspace.read()\` inside \`run_js\` for exact arithmetic, then use those exact numbers in \`render_artifact\` and \`finish\`.
-3. Never repeat an identical tool call twice. Keep each tool step concise.
-4. ${langHint}`;
+Strict engineering rules:
+1. Reproduce issues or inspect relevant files first using run_command / read_file. Never guess file contents.
+2. When editing existing code, use edit_file with exact verbatim old_text (without line-number prefixes like "12 | ").
+3. After ANY code edit, re-run the test suite with run_command (e.g. "npm test") before calling finish.
+4. Never fabricate test passes or command outputs. ${langHint}`;
+}
+
+interface ObservationItem {
+  step: number;
+  tool: string;
+  filePath?: string;
+  isAutoRead?: boolean;
+  ok: boolean;
+  full: string;
+  compact: string;
+}
+
+function buildCompactObservationsBlock(
+  observations: ObservationItem[],
+  maxRecentDetail = 5,
+  charBudget = 7200,
+): string {
+  if (observations.length === 0) return '';
+  // Keep latest read_file for up to 5 distinct files plus latest run_command test output
+  const keptReadIndices: number[] = [];
+  const seenReadPaths = new Set<string>();
+  let lastCmdIdx = -1;
+  for (let i = observations.length - 1; i >= 0; i--) {
+    const obs = observations[i];
+    if (lastCmdIdx === -1 && obs.tool === 'run_command') {
+      lastCmdIdx = i;
+    }
+    if (keptReadIndices.length < 5 && ((obs.tool === 'read_file' && obs.ok) || obs.isAutoRead)) {
+      const key = obs.filePath || String(i);
+      if (!seenReadPaths.has(key)) {
+        seenReadPaths.add(key);
+        keptReadIndices.push(i);
+      }
+    }
+  }
+  const keptReadSet = new Set(keptReadIndices);
+  if (lastCmdIdx !== -1) {
+    keptReadSet.add(lastCmdIdx);
+  }
+
+  const selected = observations.map((obs, i) => {
+    const isRecent = i >= observations.length - maxRecentDetail || keptReadSet.has(i);
+    return isRecent ? obs.full : obs.compact;
+  });
+  let joined = selected.join('\n\n');
+  let shrinkIdx = 0;
+  while (joined.length > charBudget && shrinkIdx < selected.length - 1) {
+    if (!keptReadSet.has(shrinkIdx)) {
+      selected[shrinkIdx] = observations[shrinkIdx].compact;
+      joined = selected.join('\n\n');
+    }
+    shrinkIdx++;
+  }
+  for (let k = keptReadIndices.length - 1; k >= 0 && joined.length > charBudget; k--) {
+    const idx = keptReadIndices[k];
+    if (idx < observations.length - 2) {
+      selected[idx] = observations[idx].compact;
+      joined = selected.join('\n\n');
+    }
+  }
+  return joined;
 }
 
 export async function runAgentTurn(opts: {
   client: IgnisClient;
   archKind: ArchKind;
+  maxSeqLen: number;
   capabilities: { vision: boolean; audioIn: boolean; audioOut: boolean; thinking: boolean };
   userPrompt: string;
   historyText?: string;
   workspaceFiles: WorkspaceFile[];
+  sandbox: CodingSandboxAdapter;
+  approvalPolicy?: ApprovalPolicy;
   attachedImage?: PendingImageInput | null;
   attachedAudio?: PendingAudioInput | null;
   generationMode: OmniGenMode;
@@ -297,14 +408,17 @@ export async function runAgentTurn(opts: {
   const {
     client,
     archKind,
+    maxSeqLen,
     capabilities,
     userPrompt,
     historyText = '',
+    sandbox,
+    approvalPolicy = 'auto',
     attachedImage = null,
     attachedAudio = null,
     generationMode,
     maxNewTokens,
-    maxSteps = 5,
+    maxSteps = 8,
     lang,
     enableThinking = false,
     effort = 'low',
@@ -314,25 +428,31 @@ export async function runAgentTurn(opts: {
   let workspace = [...opts.workspaceFiles];
   const toolCalls: AgentToolCallRecord[] = [];
   const traceEntries: AgentTraceEntry[] = [];
-  let latestArtifact: AgentArtifact | null = null;
+  const checkpoints: WorkspaceCheckpoint[] = [];
   const seenSignatures = new Set<string>();
-  const observations: string[] = [];
+  const readPaths = new Set<string>();
+  const observations: ObservationItem[] = [];
 
   let totalPromptTokens = 0;
   let totalGeneratedTokens = 0;
+  let peakPromptTokens = 0;
   let totalDecodeMs = 0;
   let totalPrefillMs = 0;
   let lastCurPos = 0;
   let wasAborted = false;
+  let lastTestSummary: NodeTestSummary | null = null;
+  let editedSinceLastTest = false;
+  let approveAllThisRun = false;
 
-  const schema = buildAgentActionSchema({ vision: capabilities.vision });
+  const schema = buildAgentActionSchema();
 
-  // Step 0: Multimodal Perception when user directly attached media
+  // Step 0: Multimodal Perception when user attached UI screenshot or voice memo
   if ((attachedImage && capabilities.vision) || (attachedAudio && capabilities.audioIn)) {
     const tPerc0 = performance.now();
     await client.reset();
     const percPrompt = formatSingleTurnPrompt(archKind, {
-      systemPrompt: 'Describe the attached media concisely and accurately so a tool-using agent can act on it.',
+      systemPrompt:
+        'Describe the attached software screenshot or voice instruction concisely so a coding agent can inspect files and fix or implement it.',
       userPrompt,
       includeImageTag: Boolean(attachedImage && capabilities.vision),
       includeAudioTag: Boolean(attachedAudio && capabilities.audioIn),
@@ -340,9 +460,10 @@ export async function runAgentTurn(opts: {
     const enc = await client.encode(percPrompt);
     const percRes = await client.generate({
       promptIds: enc.ids,
-      images: attachedImage && capabilities.vision
-        ? [{ data: attachedImage.data, width: attachedImage.width, height: attachedImage.height, channels: attachedImage.channels }]
-        : [],
+      images:
+        attachedImage && capabilities.vision
+          ? [{ data: attachedImage.data, width: attachedImage.width, height: attachedImage.height, channels: attachedImage.channels }]
+          : [],
       audios: attachedAudio && capabilities.audioIn ? [attachedAudio.pcm16k] : [],
       generationMode: 'text',
       maxNewTokens: 160,
@@ -352,14 +473,22 @@ export async function runAgentTurn(opts: {
     });
     const dur = performance.now() - tPerc0;
     const obsText = (percRes.generatedText || '').trim();
-    totalPromptTokens += percRes.promptLen || enc.ids.length;
+    const percTokens = percRes.promptLen || enc.ids.length;
+    totalPromptTokens += percTokens;
+    peakPromptTokens = Math.max(peakPromptTokens, percTokens);
     totalGeneratedTokens += percRes.generatedIds.length;
     totalDecodeMs += percRes.decodeMs || 0;
     totalPrefillMs += percRes.prefillMs || 0;
     lastCurPos = percRes.curPos || lastCurPos;
     wasAborted = Boolean(percRes.aborted);
 
-    observations.push(`[Attached Media Perception]: ${obsText}`);
+    observations.push({
+      step: 0,
+      tool: 'perception',
+      ok: Boolean(obsText),
+      full: `[Attached Media Perception]: ${obsText}`,
+      compact: `[Attached Media Perception]: ${obsText.slice(0, 220)}`,
+    });
     const entry: AgentTraceEntry = {
       id: `trace-perc-${Date.now()}`,
       phase: 'perception',
@@ -367,6 +496,7 @@ export async function runAgentTurn(opts: {
       title: 'Multimodal Perception',
       detail: obsText || '(No observation produced)',
       durationMs: dur,
+      promptTokens: percTokens,
       ok: Boolean(obsText),
     };
     traceEntries.push(entry);
@@ -375,46 +505,76 @@ export async function runAgentTurn(opts: {
 
   let finishSummary = '';
 
-  // Steps 1..maxSteps: Schema-Locked Tool Selection & Execution
+  // Steps 1..maxSteps: Schema-Locked Tool Selection & WebContainer Execution
   for (let step = 1; step <= maxSteps && !wasAborted; step++) {
     callbacks.onToolStepStart?.(step, maxSteps);
-    const sysPrompt = buildAgentSystemPrompt(workspace, capabilities, lang);
-    const historyBlock = historyText ? `Prior conversation context:\n${historyText}\n\n` : '';
-    const toolProgressHint = toolCalls.length > 0
-      ? `\nTools already executed: ${toolCalls.map((c) => c.tool).join(' -> ')}. Do NOT call ${toolCalls[toolCalls.length - 1].tool} again unless fixing an error; move to the next required tool (such as render_artifact, write_file, or finish).`
-      : '';
-    const obsBlock = observations.length > 0
-      ? `\n\nCompleted observations so far:\n${observations.join('\n\n')}${toolProgressHint}\n\nPick the next required tool action or call "finish" if ready:`
-      : '\n\nChoose the best first tool action (JSON only):';
+    const sysPrompt = buildAgentSystemPrompt(workspace, lang);
+    const historyBlock = historyText ? `Prior context:\n${historyText}\n\n` : '';
 
-    const stepUserPrompt = `${historyBlock}User task:\n${userPrompt}${obsBlock}`;
-    const fullPrompt = formatSingleTurnPrompt(archKind, {
-      systemPrompt: sysPrompt,
-      userPrompt: stepUserPrompt,
-      enableThinking: false,
-    });
+    let nudge = '';
+    if (toolCalls.length > 0) {
+      const seq = toolCalls.map((c) => `${c.tool}${c.ok ? '' : '(err)'}`).join(' -> ');
+      nudge = `\nExecuted so far: ${seq}.`;
+      const failingNames = lastTestSummary
+        ? lastTestSummary.cases.filter((c) => !c.ok).map((c) => c.name)
+        : [];
+      if (editedSinceLastTest) {
+        nudge += ' File edited — run "npm test" via run_command next to verify.';
+      } else if (lastTestSummary && lastTestSummary.failed > 0) {
+        const failDetail = failingNames.length > 0 ? `: ${failingNames.join('; ')}` : '';
+        nudge += ` Still failing (${lastTestSummary.failed} of ${lastTestSummary.total}${failDetail}) — check the exact endpoint/function tested by the failure and patch it cleanly with edit_file.`;
+        if (readPaths.size >= 2) {
+          nudge += ` Already read: [${[...readPaths].join(', ')}] — do NOT call read_file on these again; call edit_file now to patch the bug.`;
+        }
+      }
+    }
 
+    // Fit observations strictly within model maxSeqLen budget
+    let obsBudget = maxSeqLen <= 4096 ? 7200 : 15500;
+    let obsTextBlock = buildCompactObservationsBlock(observations, maxSeqLen <= 4096 ? 4 : 6, obsBudget);
+    const buildStepPrompt = (obsStr: string) => {
+      const obsSection = obsStr
+        ? `\n\nObservations:\n${obsStr}${nudge}\n\nChoose the next JSON tool action (or call "finish" once verified):`
+        : '\n\nChoose your first JSON tool action:';
+      return formatSingleTurnPrompt(archKind, {
+        systemPrompt: sysPrompt,
+        userPrompt: `${historyBlock}Task:\n${userPrompt}${obsSection}`,
+        enableThinking: false,
+      });
+    };
+
+    let fullPrompt = buildStepPrompt(obsTextBlock);
+    let enc = await client.encode(fullPrompt);
+    while (enc.ids.length > maxSeqLen - 850 && obsBudget > 1000) {
+      obsBudget = Math.floor(obsBudget * 0.6);
+      obsTextBlock = buildCompactObservationsBlock(observations, 1, obsBudget);
+      fullPrompt = buildStepPrompt(obsTextBlock);
+      enc = await client.encode(fullPrompt);
+    }
+
+    peakPromptTokens = Math.max(peakPromptTokens, enc.ids.length);
     await client.reset();
-    const enc = await client.encode(fullPrompt);
     const tDecStart = performance.now();
     const stepRes = await client.generate({
       promptIds: enc.ids,
       images: [],
       audios: [],
       generationMode: 'text',
-      maxNewTokens: 1024,
+      maxNewTokens: Math.min(820, Math.max(256, maxSeqLen - enc.ids.length - 32)),
       chunkSize: 64,
       sampling: { temperature: 0, topK: 1, topP: 1.0, repetitionPenalty: 1.0 },
       responseFormat: {
         type: 'json_schema',
-        json_schema: { name: 'ignis_agent_action', schema, strict: true },
+        json_schema: { name: 'ignis_coding_action', schema, strict: true },
       },
       stopOnEos: true,
     });
 
-    totalPromptTokens += stepRes.promptLen || enc.ids.length;
+    const promptLen = stepRes.promptLen || enc.ids.length;
+    totalPromptTokens += promptLen;
+    peakPromptTokens = Math.max(peakPromptTokens, promptLen);
     totalGeneratedTokens += stepRes.generatedIds.length;
-    totalDecodeMs += stepRes.decodeMs || (performance.now() - tDecStart);
+    totalDecodeMs += stepRes.decodeMs || performance.now() - tDecStart;
     totalPrefillMs += stepRes.prefillMs || 0;
     lastCurPos = stepRes.curPos || lastCurPos;
     wasAborted = Boolean(stepRes.aborted);
@@ -434,6 +594,7 @@ export async function runAgentTurn(opts: {
         detail: rawJson.slice(0, 320),
         durationMs: stepRes.decodeMs || 0,
         fsmMedianMs: fsmMs,
+        promptTokens: promptLen,
         ok: false,
       };
       traceEntries.push(traceFail);
@@ -450,125 +611,373 @@ export async function runAgentTurn(opts: {
       id: `trace-dec-${step}-${Date.now()}`,
       phase: 'decision',
       step,
-      title: `FSM Decision -> ${toolName}`,
+      title: `FSM -> ${toolName}`,
       detail: thought ? `${thought}\n${JSON.stringify(cleanArgs)}` : JSON.stringify(cleanArgs),
       durationMs: stepRes.decodeMs || 0,
       fsmMedianMs: fsmMs,
+      promptTokens: promptLen,
       ok: true,
     };
     traceEntries.push(decisionTrace);
     callbacks.onTraceEntry?.(decisionTrace);
 
     if (toolName === 'finish') {
+      const stillFailing = Boolean(lastTestSummary && lastTestSummary.failed > 0);
+      if ((editedSinceLastTest || stillFailing) && step < maxSteps && !seenSignatures.has('finish-gate')) {
+        seenSignatures.add('finish-gate');
+        observations.push({
+          step,
+          tool: 'finish',
+          ok: false,
+          full: `[Harness Verification Gate]: Cannot finish yet (${
+            stillFailing
+              ? `${lastTestSummary!.passed}/${lastTestSummary!.total} tests passed, ${lastTestSummary!.failed} STILL FAILING`
+              : 'edits were not verified with npm test'
+          }). Fix the remaining bug(s) using edit_file and run "npm test" via run_command.`,
+          compact: '[Gate]: Tests not all passing; continue fixing & testing.',
+        });
+        continue;
+      }
       finishSummary = String(action.summary || '').trim();
       break;
     }
+    seenSignatures.delete('finish-gate');
 
     if (seenSignatures.has(sig)) {
-      observations.push(`[Harness Guard] Tool ${toolName} with identical arguments was already executed. Moving to final answer.`);
-      break;
+      if (toolName === 'read_file') {
+        const targetPath = normalizeWorkspacePath(String(action.path || ''));
+        const f = readWorkspaceFile(workspace, targetPath);
+        if (f) {
+          const numbered = formatNumberedContent(f.content, 1, undefined, 130);
+          observations.push({
+            step,
+            tool: toolName,
+            filePath: targetPath,
+            isAutoRead: true,
+            ok: false,
+            full: `[Harness Guard]: ${targetPath} was already read (content shown below). Do NOT call read_file again — call edit_file now with exact old_text and new_text:\n${numbered.text}`,
+            compact: `[Guard]: ${targetPath} already read — call edit_file now.`,
+          });
+          if (step >= maxSteps - 1) break;
+          continue;
+        }
+      }
+      observations.push({
+        step,
+        tool: toolName,
+        ok: false,
+        full: `[Harness Guard]: Tool ${toolName} with identical arguments was already executed. Choose a different file, command, or edit.`,
+        compact: `[Guard]: Repeated ${toolName} skipped.`,
+      });
+      if (step >= maxSteps - 1) break;
+      continue;
     }
     seenSignatures.add(sig);
+
+    // Pre-check HITL Approval Gate for side-effecting tools
+    // Skip prompting when Guardrail A will intercept an unread edit_file into an auto-read
+    const targetEditPath = toolName === 'edit_file' ? normalizeWorkspacePath(String(action.path || '')) : '';
+    const unreadBeforeEdit = toolName === 'edit_file' && !readPaths.has(targetEditPath);
+    let deniedReason: string | null = null;
+    if (
+      approvalPolicy === 'ask' &&
+      !approveAllThisRun &&
+      callbacks.onApprovalRequest &&
+      ((toolName === 'edit_file' && !unreadBeforeEdit) ||
+        toolName === 'write_file' ||
+        toolName === 'run_command')
+    ) {
+      let target = '';
+      let preview = '';
+      let added = 0;
+      let removed = 0;
+
+      if (toolName === 'edit_file') {
+        target = normalizeWorkspacePath(String(action.path || ''));
+        const f = readWorkspaceFile(workspace, target);
+        if (f) {
+          const sim = applyEditPatch(
+            target,
+            f.content,
+            String(action.old_text || ''),
+            String(action.new_text || ''),
+          );
+          if (sim.ok) {
+            preview = sim.diffText;
+            added = sim.added;
+            removed = sim.removed;
+          } else {
+            preview = `old_text:\n${String(action.old_text || '')}\n\nnew_text:\n${String(action.new_text || '')}`;
+          }
+        } else {
+          preview = `Missing file: ${target}`;
+        }
+      } else if (toolName === 'write_file') {
+        target = normalizeWorkspacePath(String(action.path || ''));
+        const existing = readWorkspaceFile(workspace, target);
+        const nextContent = String(action.content || '');
+        preview = existing
+          ? formatUnifiedDiff(target, existing.content, nextContent)
+          : nextContent.slice(0, 1200);
+      } else {
+        target = 'jsh';
+        preview = `$ ${String(action.command || '')}`;
+      }
+
+      const tAppr0 = performance.now();
+      const decision = await callbacks.onApprovalRequest({
+        id: `appr-${step}-${Date.now()}`,
+        step,
+        tool: toolName,
+        thought,
+        target,
+        preview,
+        added,
+        removed,
+      });
+      const apprDur = performance.now() - tAppr0;
+
+      if (decision.approved) {
+        if (decision.approveAll) approveAllThisRun = true;
+        const apprTrace: AgentTraceEntry = {
+          id: `trace-appr-${step}-${Date.now()}`,
+          phase: 'approval',
+          step,
+          title: `Approved -> ${toolName} (${target})`,
+          detail: approveAllThisRun ? 'Approved (all remaining for turn)' : 'Approved by user',
+          durationMs: apprDur,
+          ok: true,
+        };
+        traceEntries.push(apprTrace);
+        callbacks.onTraceEntry?.(apprTrace);
+      } else {
+        deniedReason = decision.reason || 'User denied this action.';
+        const denyTrace: AgentTraceEntry = {
+          id: `trace-deny-${step}-${Date.now()}`,
+          phase: 'approval',
+          step,
+          title: `Denied -> ${toolName} (${target})`,
+          detail: deniedReason,
+          durationMs: apprDur,
+          ok: false,
+        };
+        traceEntries.push(denyTrace);
+        callbacks.onTraceEntry?.(denyTrace);
+      }
+    }
 
     // Execute Tool
     const tTool0 = performance.now();
     let ok = true;
     let output = '';
+    let compactOut = '';
+    let diffText: string | undefined;
+    let added: number | undefined;
+    let removed: number | undefined;
+    let exitCode: number | undefined;
+    let testSummary: NodeTestSummary | null = null;
+    let checkpointId: string | undefined;
+    let isAutoRead = false;
 
-    if (toolName === 'read_file') {
-      const targetPath = String(action.path || '');
-      const f = readWorkspaceFile(workspace, targetPath);
-      if (!f) {
-        ok = false;
-        output = `File "${targetPath}" not found. Available: ${workspace.map((x) => x.path).join(', ')}`;
-      } else if (f.assetUrl) {
-        output = `${f.path} is a ${f.kind} media file (${f.assetUrl}).${
-          f.kind === 'image' && capabilities.vision ? ' Use inspect_image to analyze it visually.' : ''
-        }`;
-      } else {
-        output = f.content;
-      }
-    } else if (toolName === 'write_file') {
-      const targetPath = normalizeWorkspacePath(String(action.path || 'output.txt'));
-      const content = String(action.content || '');
-      workspace = upsertWorkspaceFile(workspace, targetPath, content, true);
-      callbacks.onWorkspaceUpdate?.(workspace);
-      output = `Wrote ${content.length} chars to ${targetPath}`;
-    } else if (toolName === 'run_js') {
-      const code = String(action.code || '');
-      const execRes = await executeSandboxedJs(code, workspace);
-      ok = execRes.ok;
-      for (const [wPath, wContent] of Object.entries(execRes.writtenFiles)) {
-        workspace = upsertWorkspaceFile(workspace, wPath, wContent, true);
-      }
-      if (Object.keys(execRes.writtenFiles).length > 0) {
+    if (deniedReason !== null) {
+      ok = false;
+      output = `[User Denied ${toolName}]: ${deniedReason}. Adjust your approach or call finish.`;
+      compactOut = `[Denied ${toolName}]: ${deniedReason}`;
+    } else if (toolName === 'list_files') {
+      if (sandbox.listFiles) {
+        workspace = await sandbox.listFiles();
         callbacks.onWorkspaceUpdate?.(workspace);
       }
-      const parts: string[] = [];
-      if (execRes.logs.length > 0) parts.push(`Console:\n${execRes.logs.join('\n')}`);
-      if (execRes.result) parts.push(`Return: ${execRes.result}`);
-      if (Object.keys(execRes.writtenFiles).length > 0) {
-        parts.push(`Modified files: ${Object.keys(execRes.writtenFiles).join(', ')}`);
+      const dirPrefix = normalizeWorkspacePath(String(action.dir || ''));
+      const matched = workspace.filter((f) => !dirPrefix || dirPrefix === '.' || f.path.startsWith(dirPrefix));
+      output = formatWorkspaceTree(matched) || '(empty directory)';
+      compactOut = `Listed ${matched.length} files`;
+    } else if (toolName === 'read_file') {
+      const targetPath = normalizeWorkspacePath(String(action.path || ''));
+      let f = readWorkspaceFile(workspace, targetPath);
+      if (!f && sandbox.readFile) {
+        const disk = await sandbox.readFile(targetPath);
+        if (disk !== null) {
+          workspace = upsertWorkspaceFile(workspace, targetPath, disk, false);
+          callbacks.onWorkspaceUpdate?.(workspace);
+          f = readWorkspaceFile(workspace, targetPath);
+        }
       }
-      if (!execRes.ok && execRes.error) parts.push(`Error: ${execRes.error}`);
-      output = parts.join('\n\n') || '(Executed cleanly with no output)';
-    } else if (toolName === 'render_artifact') {
-      const artTitle = String(action.title || 'Interactive Artifact').trim();
-      const rawHtml = String(action.html || '').trim();
-      const safeName = `${artTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'artifact'}.html`;
-      workspace = upsertWorkspaceFile(workspace, safeName, rawHtml, true);
+      if (!f) {
+        ok = false;
+        output = `File "${targetPath}" not found. Project files:\n${formatWorkspaceTree(workspace)}`;
+        compactOut = `read_file "${targetPath}" missing`;
+      } else {
+        readPaths.add(normalizeWorkspacePath(f.path));
+        const numbered = formatNumberedContent(f.content, 1, undefined, 130);
+        output = `${f.path} (lines ${numbered.shownFrom}-${numbered.shownTo} of ${numbered.totalLines}):\n${numbered.text}`;
+        compactOut = `Read ${f.path} (${numbered.totalLines} lines)`;
+        callbacks.onOpenFile?.(f.path, 'code');
+      }
+    } else if (toolName === 'grep_files') {
+      const pat = String(action.pattern || '');
+      const hits = grepWorkspaceFiles(workspace, pat);
+      output = hits.length > 0 ? hits.join('\n') : `No matches found for "${pat}".`;
+      compactOut = `grep "${pat}": ${hits.length} hit(s)`;
+    } else if (toolName === 'edit_file') {
+      const targetPath = normalizeWorkspacePath(String(action.path || ''));
+      let existing = readWorkspaceFile(workspace, targetPath);
+      if (!existing && sandbox.readFile) {
+        const disk = await sandbox.readFile(targetPath);
+        if (disk !== null) {
+          workspace = upsertWorkspaceFile(workspace, targetPath, disk, false);
+          callbacks.onWorkspaceUpdate?.(workspace);
+          existing = readWorkspaceFile(workspace, targetPath);
+        }
+      }
+      if (!existing) {
+        ok = false;
+        output = `Cannot edit "${targetPath}": file not found.`;
+        compactOut = `edit_file "${targetPath}" missing`;
+      } else if (!readPaths.has(targetPath)) {
+        // Guardrail A: force reading unread files before accepting blind patches
+        readPaths.add(targetPath);
+        seenSignatures.delete(sig);
+        isAutoRead = true;
+        const numbered = formatNumberedContent(existing.content, 1, undefined, 200);
+        ok = false;
+        output = `[Harness Guard]: You must read ${targetPath} before editing it. Here is the current content of ${targetPath} (lines ${numbered.shownFrom}-${numbered.shownTo} of ${numbered.totalLines}):\n${numbered.text}\nNow call edit_file with exact old_text.`;
+        compactOut = `Auto-read ${targetPath} before edit`;
+        callbacks.onOpenFile?.(targetPath, 'code');
+      } else {
+        const patchRes = applyEditPatch(
+          targetPath,
+          existing.content,
+          String(action.old_text || ''),
+          String(action.new_text || ''),
+        );
+        if (!patchRes.ok) {
+          ok = false;
+          output = patchRes.error;
+          compactOut = `edit_file "${targetPath}" failed to match`;
+        } else {
+          const syntaxErr = validateCodeSyntax(targetPath, patchRes.updatedContent);
+
+          if (syntaxErr !== null) {
+            // Guardrail B: reject syntax-breaking edits and keep original file intact
+            const currentNumbered = formatNumberedContent(existing.content, 1, undefined, 130);
+            ok = false;
+            output = `SyntaxError introduced in ${targetPath} — edit was rolled back automatically:\n${syntaxErr}\n\nCurrent ${targetPath} content:\n${currentNumbered.text}\n\nFix the syntax in your next edit_file call.`;
+            compactOut = `Syntax error in ${targetPath} (auto-reverted)`;
+          } else {
+            await sandbox.writeFile(targetPath, patchRes.updatedContent);
+            workspace = upsertWorkspaceFile(workspace, targetPath, patchRes.updatedContent, true, {
+              addedLines: (existing.addedLines || 0) + patchRes.added,
+              removedLines: (existing.removedLines || 0) + patchRes.removed,
+            });
+            callbacks.onWorkspaceUpdate?.(workspace);
+
+            checkpointId = `ckpt-${step}-${Date.now()}`;
+            const ckpt: WorkspaceCheckpoint = {
+              id: checkpointId,
+              step,
+              tool: 'edit_file',
+              path: targetPath,
+              existedBefore: true,
+              beforeContent: existing.content,
+              afterContent: patchRes.updatedContent,
+              added: patchRes.added,
+              removed: patchRes.removed,
+              diffText: patchRes.diffText,
+              createdAt: Date.now(),
+            };
+            checkpoints.push(ckpt);
+            callbacks.onCheckpoint?.(ckpt);
+            callbacks.onOpenFile?.(targetPath, 'diff');
+
+            diffText = patchRes.diffText;
+            added = patchRes.added;
+            removed = patchRes.removed;
+            editedSinceLastTest = true;
+
+            // Clear stale read/command cache signatures since source changed
+            for (const s of [...seenSignatures]) {
+              if (s.startsWith('run_command:') || s.startsWith('read_file:')) {
+                seenSignatures.delete(s);
+              }
+            }
+
+            // Refresh any cached read_file observation of this path so the model sees current lines
+            const updatedNumbered = formatNumberedContent(patchRes.updatedContent, 1, undefined, 130);
+            for (const prevObs of observations) {
+              if ((prevObs.tool === 'read_file' || prevObs.isAutoRead) && prevObs.filePath === targetPath) {
+                prevObs.full = `[Current ${targetPath} after Step ${step} edit (${updatedNumbered.totalLines} lines)]:\n${updatedNumbered.text}`;
+              }
+            }
+
+            output = `Patched ${targetPath} (+${patchRes.added}/-${patchRes.removed}):\n${patchRes.diffText}`;
+            compactOut = `Patched ${targetPath} (+${patchRes.added}/-${patchRes.removed})`;
+          }
+        }
+      }
+    } else if (toolName === 'write_file') {
+      const targetPath = normalizeWorkspacePath(String(action.path || 'untitled.txt'));
+      const content = String(action.content || '');
+      const existing = readWorkspaceFile(workspace, targetPath);
+      const before = existing ? existing.content : '';
+      const diffCounts = computeLineDiff(before, content);
+      const computedDiff = formatUnifiedDiff(targetPath, before, content);
+
+      await sandbox.writeFile(targetPath, content);
+      readPaths.add(targetPath);
+      workspace = upsertWorkspaceFile(workspace, targetPath, content, true, {
+        addedLines: diffCounts.added,
+        removedLines: diffCounts.removed,
+      });
       callbacks.onWorkspaceUpdate?.(workspace);
 
-      const artifact: AgentArtifact = {
-        id: `art-${Date.now()}-${step}`,
-        title: artTitle,
-        html: rawHtml,
+      checkpointId = `ckpt-${step}-${Date.now()}`;
+      const ckpt: WorkspaceCheckpoint = {
+        id: checkpointId,
+        step,
+        tool: 'write_file',
+        path: targetPath,
+        existedBefore: Boolean(existing),
+        beforeContent: before,
+        afterContent: content,
+        added: diffCounts.added,
+        removed: diffCounts.removed,
+        diffText: computedDiff,
         createdAt: Date.now(),
       };
-      latestArtifact = artifact;
-      callbacks.onArtifact?.(artifact);
-      output = `Rendered live artifact "${artTitle}" (${rawHtml.length} chars) and saved snapshot to ${safeName}`;
-    } else if (toolName === 'inspect_image') {
-      const targetPath = String(action.path || '');
-      const question = String(action.question || 'Describe all details in this image concisely.');
-      const f = readWorkspaceFile(workspace, targetPath);
-      if (!capabilities.vision) {
-        ok = false;
-        output = 'Active model does not support local vision.';
-      } else if (!f || f.kind !== 'image' || !f.assetUrl) {
-        ok = false;
-        output = `Image file "${targetPath}" not found in workspace. Available: ${workspace
-          .filter((x) => x.kind === 'image')
-          .map((x) => x.path)
-          .join(', ') || 'none'}`;
-      } else if (!callbacks.loadWorkspaceImage) {
-        ok = false;
-        output = 'Workspace image decoder unavailable.';
-      } else {
-        const decodedImg = await callbacks.loadWorkspaceImage(f.assetUrl, f.path);
-        await client.reset();
-        const vPrompt = formatSingleTurnPrompt(archKind, {
-          userPrompt: question,
-          includeImageTag: true,
-        });
-        const vEnc = await client.encode(vPrompt);
-        const vRes = await client.generate({
-          promptIds: vEnc.ids,
-          images: [{ data: decodedImg.data, width: decodedImg.width, height: decodedImg.height, channels: decodedImg.channels }],
-          audios: [],
-          generationMode: 'text',
-          maxNewTokens: 160,
-          chunkSize: 64,
-          sampling: { temperature: 0, topK: 1, topP: 1.0, repetitionPenalty: 1.0 },
-          stopOnEos: true,
-        });
-        totalPromptTokens += vRes.promptLen || vEnc.ids.length;
-        totalGeneratedTokens += vRes.generatedIds.length;
-        totalDecodeMs += vRes.decodeMs || 0;
-        totalPrefillMs += vRes.prefillMs || 0;
-        lastCurPos = vRes.curPos || lastCurPos;
-        output = (vRes.generatedText || '').trim() || '(No visual description generated)';
+      checkpoints.push(ckpt);
+      callbacks.onCheckpoint?.(ckpt);
+      callbacks.onOpenFile?.(targetPath, existing ? 'diff' : 'code');
+
+      diffText = computedDiff;
+      added = diffCounts.added;
+      removed = diffCounts.removed;
+      editedSinceLastTest = true;
+      for (const s of [...seenSignatures]) {
+        if (s.startsWith('run_command:') || s.startsWith('read_file:')) {
+          seenSignatures.delete(s);
+        }
       }
+
+      output = `Wrote ${content.length} chars to ${targetPath}`;
+      compactOut = `Wrote ${targetPath} (${content.length} chars)`;
+    } else if (toolName === 'run_command') {
+      const cmd = String(action.command || '').trim() || 'npm test';
+      const cmdRes = await sandbox.runCommand(cmd);
+      exitCode = cmdRes.exitCode;
+      ok = cmdRes.exitCode === 0;
+      const cleanOut = stripAnsi(cmdRes.output);
+      testSummary = cmdRes.testSummary || parseNodeTestOutput(cleanOut);
+      if (testSummary) {
+        lastTestSummary = testSummary;
+        editedSinceLastTest = false;
+      }
+
+      const compactOutText = compactCommandOutput(cleanOut);
+      output = `$ ${cmd} (exit ${cmdRes.exitCode}, ${Math.round(cmdRes.durationMs)}ms)\n${compactOutText || '(no output)'}`;
+      compactOut = testSummary
+        ? `$ ${cmd} -> exit ${cmdRes.exitCode} (${testSummary.passed}/${testSummary.total} passed)`
+        : `$ ${cmd} -> exit ${cmdRes.exitCode}`;
     }
 
     const toolDur = performance.now() - tTool0;
@@ -582,6 +991,12 @@ export async function runAgentTurn(opts: {
       ok,
       durationMs: toolDur,
       fsmMedianMs: fsmMs,
+      diffText,
+      added,
+      removed,
+      exitCode,
+      testSummary,
+      checkpointId,
     };
     toolCalls.push(record);
     callbacks.onToolStepComplete?.(record);
@@ -591,15 +1006,29 @@ export async function runAgentTurn(opts: {
       phase: 'tool',
       step,
       title: `${toolName} (${ok ? 'ok' : 'err'})`,
-      detail: output.slice(0, 600),
+      detail: output.slice(0, 700),
       durationMs: toolDur,
       fsmMedianMs: fsmMs,
+      promptTokens: promptLen,
       ok,
     };
     traceEntries.push(toolTrace);
     callbacks.onTraceEntry?.(toolTrace);
 
-    observations.push(`[Step ${step} ${toolName} -> ${ok ? 'OK' : 'ERROR'}]:\n${output.slice(0, 1200)}`);
+    const obsCap = toolName === 'read_file' || isAutoRead ? 5600 : 2400;
+    const obsFilePath =
+      toolName === 'read_file' || toolName === 'edit_file' || toolName === 'write_file'
+        ? normalizeWorkspacePath(String(action.path || ''))
+        : undefined;
+    observations.push({
+      step,
+      tool: toolName,
+      filePath: obsFilePath,
+      isAutoRead,
+      ok,
+      full: `[Step ${step} ${toolName} -> ${ok ? 'OK' : 'ERROR'}]:\n${output.slice(0, obsCap)}`,
+      compact: `[Step ${step} ${toolName} -> ${ok ? 'OK' : 'ERROR'}]: ${compactOut}`,
+    });
   }
 
   // Final Synthesis Stage
@@ -607,22 +1036,28 @@ export async function runAgentTurn(opts: {
   let audioUrl: string | undefined;
 
   const needVoiceSynth = Boolean(capabilities.audioOut && generationMode !== 'text');
-  const shouldSynthesize = !wasAborted && (toolCalls.length > 0 || needVoiceSynth || finishSummary.length < 140);
+  const shouldSynthesize =
+    !wasAborted && (toolCalls.length > 0 || needVoiceSynth || finishSummary.length < 140);
 
   if (shouldSynthesize) {
-    callbacks.onStatusText?.(lang === 'zh' ? '正在汇总最终答复...' : 'Synthesizing final response...');
+    callbacks.onStatusText?.(lang === 'zh' ? '正在汇总修改与测试结果...' : 'Synthesizing engineering summary...');
     const tSynth0 = performance.now();
     await client.reset();
 
-    const evidenceBlock = observations.length > 0
-      ? `\n\nTool Execution Results:\n${observations.join('\n\n')}`
-      : '';
+    const evidenceBlock =
+      observations.length > 0
+        ? `\n\nObserved Tool Execution Results:\n${buildCompactObservationsBlock(observations, 4, maxSeqLen <= 4096 ? 4800 : 8500)}`
+        : '';
+    const verifiedLine = lastTestSummary
+      ? `Verified latest test result: ${lastTestSummary.passed}/${lastTestSummary.total} tests passed (${lastTestSummary.failed} failed). CRITICAL: NEVER claim tests passed if failed > 0.`
+      : 'Verified latest test result: no test suite summary observed.';
     const finishNote = finishSummary ? `\n\nAgent Draft Summary:\n${finishSummary}` : '';
-    const synthUserPrompt = `${historyText ? `Prior conversation:\n${historyText}\n\n` : ''}Original user request:\n${userPrompt}${evidenceBlock}${finishNote}\n\nWrite a clear, helpful Markdown final answer grounded strictly in the observed tool results above.`;
+    const synthUserPrompt = `${historyText ? `Prior context:\n${historyText}\n\n` : ''}Original task:\n${userPrompt}${evidenceBlock}\n\n${verifiedLine}${finishNote}\n\nWrite a concise Markdown engineering summary stating exact files changed and exact observed test results.`;
 
     const useThinking = Boolean(capabilities.thinking && enableThinking && !needVoiceSynth);
     const synthPrompt = formatSingleTurnPrompt(archKind, {
-      systemPrompt: 'You are Ignis Assistant. Present crisp, accurate Markdown answers grounded in verified tool outputs.',
+      systemPrompt:
+        'You are Ignis Code Assistant. Summarize code changes and observed test/command results accurately in Markdown.',
       userPrompt: synthUserPrompt,
       enableThinking: useThinking,
       effort,
@@ -639,6 +1074,7 @@ export async function runAgentTurn(opts: {
     try {
       const enc = await client.encode(synthPrompt);
       synthPromptLen = enc.ids.length;
+      peakPromptTokens = Math.max(peakPromptTokens, synthPromptLen);
       synthRes = await client.generate({
         promptIds: enc.ids,
         images: [],
@@ -648,7 +1084,7 @@ export async function runAgentTurn(opts: {
         maxThinkingTokens: archKind === 'spark' && useThinking ? (effort === 'low' ? 256 : 512) : 0,
         chunkSize: 64,
         sampling: {
-          temperature: 0.4,
+          temperature: 0.35,
           topK: 40,
           topP: 0.95,
           repetitionPenalty: archKind === 'spark' ? 1.05 : 1.0,
@@ -662,10 +1098,12 @@ export async function runAgentTurn(opts: {
     if (synthRes.wavBytes && synthRes.wavBytes.byteLength > 44) {
       audioUrl = URL.createObjectURL(new Blob([new Uint8Array(synthRes.wavBytes)], { type: 'audio/wav' }));
     }
-    finalText = thinkPrefix ? `${thinkPrefix}${synthRes.generatedText || ''}` : synthRes.generatedText || finishSummary;
+    finalText = thinkPrefix
+      ? `${thinkPrefix}${synthRes.generatedText || ''}`
+      : synthRes.generatedText || finishSummary;
     totalPromptTokens += synthRes.promptLen || synthPromptLen;
     totalGeneratedTokens += synthRes.generatedIds.length;
-    totalDecodeMs += synthRes.decodeMs || (performance.now() - tSynth0);
+    totalDecodeMs += synthRes.decodeMs || performance.now() - tSynth0;
     totalPrefillMs += synthRes.prefillMs || 0;
     lastCurPos = synthRes.curPos || lastCurPos;
     wasAborted = wasAborted || Boolean(synthRes.aborted);
@@ -674,9 +1112,10 @@ export async function runAgentTurn(opts: {
       id: `trace-synth-${Date.now()}`,
       phase: 'synthesis',
       step: toolCalls.length + 1,
-      title: needVoiceSynth ? 'Final Synthesis + 24 kHz Voice' : 'Final Response Synthesis',
+      title: needVoiceSynth ? 'Final Synthesis + 24 kHz Voice' : 'Final Engineering Summary',
       detail: `${synthRes.generatedIds.length} tokens @ ${synthRes.decodeTokPerSec.toFixed(1)} tok/s`,
       durationMs: performance.now() - tSynth0,
+      promptTokens: synthPromptLen,
       ok: true,
     };
     traceEntries.push(synthTrace);
@@ -691,10 +1130,13 @@ export async function runAgentTurn(opts: {
     toolCalls,
     traceEntries,
     workspaceFiles: workspace,
-    artifact: latestArtifact,
+    checkpoints,
+    testSummary: lastTestSummary,
     audioUrl,
     totalPromptTokens,
     totalGeneratedTokens,
+    peakPromptTokens,
+    maxSeqLen,
     decodeTokPerSec: totalDecodeMs > 0 ? totalGeneratedTokens / (totalDecodeMs / 1000) : 0,
     prefillMs: totalPrefillMs,
     curPos: lastCurPos,

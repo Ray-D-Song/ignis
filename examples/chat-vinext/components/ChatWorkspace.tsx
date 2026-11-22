@@ -1,10 +1,55 @@
 'use client';
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { Bot, MessageSquare, Plus } from 'lucide-react';
 import type { ModelPreset } from '@/lib/model-paths';
 import { IgnisClient } from '../../../runtime/ignis-client.mjs';
 import { decodeWav, resampleLinear } from '../../../runtime/multimodal/audio-dsp.mjs';
 import { detectDeviceProfile } from '../../../runtime/device-profile.mjs';
+import {
+  runAgentTurn,
+  type AgentToolCallRecord,
+  type AgentTraceEntry,
+  type ApprovalDecision,
+  type ApprovalRequest,
+  type ApprovalPolicy,
+  type PendingAudioInput,
+  type PendingImageInput,
+} from '@/lib/agent-harness';
+import { COPY, type UiLang } from '@/lib/i18n';
+import {
+  buildSparkSystemPrefix,
+  getArchKind,
+  splitThinking,
+  type OmniGenMode,
+} from '@/lib/prompt-templates';
+import { TerminalChannel } from '@/lib/terminal-channel';
+import {
+  bootAndStartFullStack,
+  startOrRestartDevServer,
+  wcAttachInteractiveShell,
+  wcDeleteFile,
+  wcListProjectFiles,
+  wcReadFile,
+  wcResetStarterProject,
+  wcRunCommand,
+  wcWriteFile,
+  type SandboxBootStatus,
+} from '@/lib/webcontainer-manager';
+import {
+  createInitialWorkspace,
+  inferFileKind,
+  normalizeWorkspacePath,
+  readWorkspaceFile,
+  upsertWorkspaceFile,
+  type WorkspaceCheckpoint,
+  type WorkspaceFile,
+} from '@/lib/workspace-fs';
+import { CodeEditorPane } from './CodeEditorPane';
+import { Composer } from './Composer';
+import { ThreadView, type LoadProgressState, type StudioMessage } from './ThreadView';
+import { TopBar } from './TopBar';
+import { WorkspacePane, type FsmPreset, type WorkspaceTab } from './WorkspacePane';
 
 type IgnisDeviceProfile = Awaited<ReturnType<typeof detectDeviceProfile>>;
 
@@ -27,31 +72,6 @@ interface IgnisTokenEvent {
   step: number;
   tokPerSec?: number;
 }
-import { COPY, type UiLang } from '@/lib/i18n';
-import {
-  buildSparkSystemPrefix,
-  getArchKind,
-  splitThinking,
-  type OmniGenMode,
-} from '@/lib/prompt-templates';
-import {
-  createInitialWorkspace,
-  upsertWorkspaceFile,
-  type WorkspaceFile,
-} from '@/lib/workspace-fs';
-import {
-  runAgentTurn,
-  type AgentArtifact,
-  type AgentToolCallRecord,
-  type AgentTraceEntry,
-  type PendingAudioInput,
-  type PendingImageInput,
-} from '@/lib/agent-harness';
-import { TopBar } from './TopBar';
-import { LeftRail } from './LeftRail';
-import { ThreadView, type LoadProgressState, type StudioMessage } from './ThreadView';
-import { Composer } from './Composer';
-import { WorkspacePane, type FsmPreset, type WorkspaceTab } from './WorkspacePane';
 
 const CUSTOM_MODEL_ID = '__custom__';
 
@@ -150,10 +170,10 @@ export function ChatWorkspace({
   const [termsAcked, setTermsAcked] = useState(false);
 
   const [mode, setMode] = useState<'agent' | 'chat'>('agent');
-  const [leftRailOpen, setLeftRailOpen] = useState(true);
-  const [rightPaneOpen, setRightPaneOpen] = useState(false);
+  const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicy>('auto');
+  const [editorOpen, setEditorOpen] = useState(true);
+  const [rightPaneOpen, setRightPaneOpen] = useState(true);
   const [workspaceTab, setWorkspaceTab] = useState<WorkspaceTab>('preview');
-  const [hasUnreadArtifact, setHasUnreadArtifact] = useState(false);
 
   const [status, setStatus] = useState<'idle' | 'loading' | 'ready' | 'generating' | 'error'>('idle');
   const [statusText, setStatusText] = useState<string>(COPY[initialLang].statusIdleShort);
@@ -171,15 +191,29 @@ export function ChatWorkspace({
   const [fsmSchemaText, setFsmSchemaText] = useState(JSON.stringify(FSM_PRESETS[0].schema, null, 2));
   const [enableNgram, setEnableNgram] = useState(false);
 
+  // Coding project state
   const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFile[]>(() => createInitialWorkspace());
-  const [selectedFilePath, setSelectedFilePath] = useState<string>('revenue_q4.csv');
-  const [activeArtifact, setActiveArtifact] = useState<AgentArtifact | null>(null);
+  const [selectedFilePath, setSelectedFilePath] = useState<string>('server/stats.mjs');
+  const [editorMode, setEditorMode] = useState<'code' | 'diff'>('code');
+  const [diffOriginals, setDiffOriginals] = useState<Record<string, string>>({});
+  const [checkpoints, setCheckpoints] = useState<WorkspaceCheckpoint[]>([]);
   const [traceEntries, setTraceEntries] = useState<AgentTraceEntry[]>([]);
+  const [contextBudget, setContextBudget] = useState({ peak: 0, max: 4096 });
+  const [previewRefreshSeq, setPreviewRefreshSeq] = useState(0);
 
+  // WebContainer runtime state
+  const [sandboxStatus, setSandboxStatus] = useState<SandboxBootStatus>('idle');
+  const [sandboxDetail, setSandboxDetail] = useState('');
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [shellChannel] = useState(() => new TerminalChannel());
+  const [serverChannel] = useState(() => new TerminalChannel());
+
+  // Thread + composer + HITL state
   const [messages, setMessages] = useState<StudioMessage[]>([]);
   const [input, setInput] = useState('');
   const [pendingImage, setPendingImage] = useState<PendingImageInput | null>(null);
   const [pendingAudio, setPendingAudio] = useState<PendingAudioInput | null>(null);
+  const [pendingApproval, setPendingApproval] = useState<ApprovalRequest | null>(null);
 
   const [gpuCaps, setGpuCaps] = useState('Detecting WebGPU...');
   const [deviceProfile, setDeviceProfile] = useState<IgnisDeviceProfile | null>(null);
@@ -204,6 +238,7 @@ export function ChatWorkspace({
   const scrollEndRef = useRef<HTMLDivElement | null>(null);
   const workspaceRef = useRef(workspaceFiles);
   workspaceRef.current = workspaceFiles;
+  const approvalResolverRef = useRef<((d: ApprovalDecision) => void) | null>(null);
 
   const customModelPreset: ModelPreset = {
     id: CUSTOM_MODEL_ID,
@@ -235,44 +270,82 @@ export function ChatWorkspace({
   const archKind = getArchKind(activeModel);
   const termsBlocked = Boolean(activeModel?.requiresTermsAck && !termsAcked);
 
+  const pushShellOutput = useCallback(
+    (chunk: string) => {
+      shellChannel.push(chunk);
+    },
+    [shellChannel],
+  );
+
+  const pushServerOutput = useCallback(
+    (chunk: string) => {
+      serverChannel.push(chunk);
+    },
+    [serverChannel],
+  );
+
   const revokeAllObjectUrls = () => {
     for (const u of objectUrlsRef.current) URL.revokeObjectURL(u);
     objectUrlsRef.current = [];
   };
 
   useEffect(() => {
-    if (typeof window !== 'undefined' && window.innerWidth < 1024) {
-      setLeftRailOpen(false);
+    if (typeof window !== 'undefined' && window.innerWidth < 1200) {
+      setEditorOpen(false);
+      setRightPaneOpen(false);
     }
+
     (async () => {
       try {
         const profile = await detectDeviceProfile();
         setDeviceProfile(profile);
         if (!profile.supported) {
           setGpuCaps('WebGPU Unsupported');
-          return;
+        } else {
+          const iso = window.crossOriginIsolated ? 'COOP/COEP' : 'No-COI';
+          setGpuCaps(`f16:${profile.hasF16 ? '✓' : '✗'} · sg:${profile.hasSubgroups ? '✓' : '✗'} · ${iso}`);
         }
-        const iso = window.crossOriginIsolated ? 'COOP/COEP' : 'No-COI';
-        setGpuCaps(
-          `f16:${profile.hasF16 ? '✓' : '✗'} · sg:${profile.hasSubgroups ? '✓' : '✗'} · ${iso}`,
-        );
       } catch {
         setGpuCaps('WebGPU Probe Failed');
       }
     })();
 
+    // Boot StackBlitz WebContainer full-stack sandbox in parallel
+    bootAndStartFullStack({
+      onStatus: (st, detail) => {
+        setSandboxStatus(st);
+        if (detail) setSandboxDetail(detail);
+      },
+      onTerminalData: (chunk) => pushShellOutput(chunk),
+      onServerLog: (chunk) => pushServerOutput(chunk),
+      onServerReady: (url) => {
+        setPreviewUrl(url);
+      },
+      onError: (msg) => {
+        setSandboxStatus('error');
+        setSandboxDetail(msg);
+      },
+    }).catch(() => {
+      // status + detail already propagated via callbacks
+    });
+
     return () => {
       revokeAllObjectUrls();
+      if (approvalResolverRef.current) {
+        approvalResolverRef.current({ approved: false, reason: 'Unmounted' });
+        approvalResolverRef.current = null;
+      }
       if (clientRef.current) {
         clientRef.current.destroy();
         clientRef.current = null;
       }
     };
-  }, []);
+  }, [pushServerOutput, pushShellOutput]);
 
   useEffect(() => {
+    if (messages.length === 0 && !pendingApproval) return;
     scrollEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+  }, [messages, pendingApproval]);
 
   const handleModelChange = (nextId: string) => {
     setSelectedModelId(nextId);
@@ -518,18 +591,13 @@ export function ChatWorkspace({
       loadedModelIdRef.current = current.id;
       kvTurnsRef.current = 0;
       kvThinkingKeyRef.current = '';
+      setContextBudget({ peak: 0, max: maxSeq });
       const perfMem = (performance as Performance & { memory?: { usedJSHeapSize: number } }).memory;
       setStats((s) => ({
         ...s,
         initMs: `${(info.initMs / 1000).toFixed(2)}s`,
         cacheMode:
-          lang === 'zh'
-            ? info.cacheMisses === 0
-              ? `OPFS Hit (${info.cacheHits})`
-              : `Cached (${info.cacheMisses})`
-            : info.cacheMisses === 0
-              ? `OPFS Hit (${info.cacheHits})`
-              : `Cached (${info.cacheMisses})`,
+          info.cacheMisses === 0 ? `OPFS Hit (${info.cacheHits})` : `Cached (${info.cacheMisses})`,
         ctxPos: 0,
         maxCtx: maxSeq,
         heapMB: perfMem ? `${(perfMem.usedJSHeapSize / (1024 * 1024)).toFixed(1)} MB` : '-',
@@ -553,6 +621,11 @@ export function ChatWorkspace({
     if (clientRef.current && status === 'ready') {
       await clientRef.current.reset();
     }
+    if (approvalResolverRef.current) {
+      approvalResolverRef.current({ approved: false, reason: 'Session reset' });
+      approvalResolverRef.current = null;
+    }
+    setPendingApproval(null);
     revokeAllObjectUrls();
     kvTurnsRef.current = 0;
     kvThinkingKeyRef.current = '';
@@ -564,9 +637,140 @@ export function ChatWorkspace({
   };
 
   const stopGeneration = async () => {
+    if (approvalResolverRef.current) {
+      approvalResolverRef.current({ approved: false, reason: 'Stopped by user' });
+      approvalResolverRef.current = null;
+      setPendingApproval(null);
+    }
     if (clientRef.current && status === 'generating') {
       await clientRef.current.abort();
     }
+  };
+
+  const handleResolveApproval = (decision: ApprovalDecision) => {
+    setPendingApproval(null);
+    const res = approvalResolverRef.current;
+    approvalResolverRef.current = null;
+    res?.(decision);
+  };
+
+  const handleSaveFile = async (rawPath: string, content: string) => {
+    const clean = normalizeWorkspacePath(rawPath);
+    try {
+      await wcWriteFile(clean, content);
+    } catch {
+      // still update virtual buffer if container not yet ready
+    }
+    setWorkspaceFiles((prev) => upsertWorkspaceFile(prev, clean, content, false));
+    if (clean.startsWith('server/') || clean.startsWith('data/')) {
+      setPreviewRefreshSeq((s) => s + 1);
+    }
+  };
+
+  const handleRevertFile = async (rawPath: string) => {
+    const clean = normalizeWorkspacePath(rawPath);
+    const orig = diffOriginals[clean];
+    if (orig === undefined) return;
+    try {
+      await wcWriteFile(clean, orig);
+    } catch {
+      // ignore if container restarting
+    }
+    setWorkspaceFiles((prev) =>
+      upsertWorkspaceFile(prev, clean, orig, false, { addedLines: 0, removedLines: 0 }),
+    );
+    setDiffOriginals((prev) => {
+      const next = { ...prev };
+      delete next[clean];
+      return next;
+    });
+    setEditorMode('code');
+    if (clean.startsWith('server/') || clean.startsWith('data/')) {
+      setPreviewRefreshSeq((s) => s + 1);
+    }
+  };
+
+  const handleRollbackCheckpoint = async (checkpointId: string) => {
+    const cp = checkpoints.find((x) => x.id === checkpointId);
+    if (!cp) return;
+    if (cp.existedBefore) {
+      try {
+        await wcWriteFile(cp.path, cp.beforeContent);
+      } catch {
+        // ignore
+      }
+      setWorkspaceFiles((prev) =>
+        upsertWorkspaceFile(prev, cp.path, cp.beforeContent, false, { addedLines: 0, removedLines: 0 }),
+      );
+      setSelectedFilePath(cp.path);
+    } else {
+      try {
+        await wcDeleteFile(cp.path);
+      } catch {
+        // ignore
+      }
+      setWorkspaceFiles((prev) => prev.filter((f) => normalizeWorkspacePath(f.path) !== cp.path));
+    }
+    setDiffOriginals((prev) => {
+      const next = { ...prev };
+      delete next[cp.path];
+      return next;
+    });
+    setCheckpoints((prev) => prev.filter((x) => x.id !== checkpointId));
+    setEditorMode('code');
+    if (cp.path.startsWith('server/') || cp.path.startsWith('data/')) {
+      setPreviewRefreshSeq((s) => s + 1);
+    }
+    pushShellOutput(`\r\n[checkpoint] ${t.checkpointRestored}: ${cp.path}\r\n`);
+  };
+
+  const handleCreateFile = async (rawPath: string) => {
+    const clean = normalizeWorkspacePath(rawPath);
+    if (!clean) return;
+    try {
+      await wcWriteFile(clean, '');
+    } catch {
+      // ignore
+    }
+    setWorkspaceFiles((prev) => upsertWorkspaceFile(prev, clean, '', false));
+    setSelectedFilePath(clean);
+    setEditorMode('code');
+    setEditorOpen(true);
+  };
+
+  const handleUploadFiles = async (fileList: FileList) => {
+    let lastPath = '';
+    for (const file of Array.from(fileList)) {
+      const rel = normalizeWorkspacePath(file.name);
+      const text = await file.text();
+      try {
+        await wcWriteFile(rel, text);
+      } catch {
+        // ignore
+      }
+      setWorkspaceFiles((prev) => upsertWorkspaceFile(prev, rel, text, false));
+      lastPath = rel;
+    }
+    if (lastPath) {
+      setSelectedFilePath(lastPath);
+      setEditorMode('code');
+      setEditorOpen(true);
+    }
+  };
+
+  const handleResetProject = async () => {
+    try {
+      const resetFiles = await wcResetStarterProject();
+      setWorkspaceFiles(resetFiles);
+    } catch {
+      setWorkspaceFiles(createInitialWorkspace());
+    }
+    setDiffOriginals({});
+    setCheckpoints([]);
+    setSelectedFilePath('server/stats.mjs');
+    setEditorMode('code');
+    setPreviewRefreshSeq((s) => s + 1);
+    pushShellOutput('\r\n[workspace] Starter PulseBoard files restored.\r\n');
   };
 
   const sendDirectMessage = async (
@@ -840,7 +1044,6 @@ export function ChatWorkspace({
     client: IgnisClient,
     modelForTurn: ModelPreset,
     rawText: string,
-    overrideMode?: OmniGenMode,
     clearComposer = true,
   ) => {
     const imgAttach = clearComposer ? pendingImage : null;
@@ -853,6 +1056,9 @@ export function ChatWorkspace({
       setPendingImage(null);
       setPendingAudio(null);
     }
+
+    const curArch = getArchKind(modelForTurn);
+    const maxSeqLen = curArch === 'spark' ? 8192 : 4096;
 
     const userMsg: StudioMessage = {
       id: `u-${Date.now()}`,
@@ -869,36 +1075,66 @@ export function ChatWorkspace({
       content: '',
       modelLabel: shortModelName,
       toolCalls: [],
-      artifact: null,
+      checkpoints: [],
     };
 
     const historyText = messages
       .slice(-4)
-      .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${splitThinking(m.content).answer.slice(0, 300)}`)
+      .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${splitThinking(m.content).answer.slice(0, 260)}`)
       .join('\n');
 
     setMessages((prev) => [...prev, userMsg, assistantMsg]);
     setTraceEntries([]);
+    setContextBudget({ peak: 0, max: maxSeqLen });
     setStatus('generating');
-    setStatusText(t.loadingStep(1, 5, 'Planning'));
+    setStatusText(t.loadingStep(1, 12, 'FSM Tools'));
     kvTurnsRef.current = -1;
 
     try {
       const result = await runAgentTurn({
         client,
-        archKind: getArchKind(modelForTurn),
+        archKind: curArch,
+        maxSeqLen,
         capabilities: modelForTurn.capabilities,
         userPrompt: promptText,
         historyText,
         workspaceFiles: workspaceRef.current,
+        approvalPolicy,
         attachedImage: imgAttach,
         attachedAudio: audAttach,
-        generationMode: modelForTurn.capabilities.audioOut ? overrideMode ?? generationMode : 'text',
+        generationMode: modelForTurn.capabilities.audioOut ? generationMode : 'text',
         maxNewTokens,
-        maxSteps: 5,
+        maxSteps: 12,
         lang,
         enableThinking,
         effort,
+        sandbox: {
+          writeFile: wcWriteFile,
+          readFile: wcReadFile,
+          listFiles: async () => {
+            const existingMap = new Map(workspaceRef.current.map((f) => [f.path, f]));
+            const listed = await wcListProjectFiles();
+            return listed.map((f) => {
+              const prev = existingMap.get(f.path);
+              return prev
+                ? {
+                    ...f,
+                    kind: inferFileKind(f.path),
+                    modifiedByAgent: prev.modifiedByAgent,
+                    addedLines: prev.addedLines,
+                    removedLines: prev.removedLines,
+                  }
+                : f;
+            });
+          },
+          runCommand: async (command: string) => {
+            pushShellOutput(`\r\n$ ${command}\r\n`);
+            const res = await wcRunCommand(command, {
+              onOutput: (chunk) => pushShellOutput(chunk),
+            });
+            return res;
+          },
+        },
         callbacks: {
           onStatusText: (txt) => setStatusText(txt),
           onToolStepStart: (step, max) => {
@@ -910,24 +1146,35 @@ export function ChatWorkspace({
                 m.id === assistantId ? { ...m, toolCalls: [...(m.toolCalls || []), record] } : m,
               ),
             );
-            setStatusText(t.loadingStep(record.step, 5, record.tool));
+            setStatusText(t.loadingStep(record.step, 12, record.tool));
           },
           onTraceEntry: (entry) => {
             setTraceEntries((prev) => [...prev, entry]);
+            if (entry.promptTokens) {
+              setContextBudget((b) => ({ ...b, peak: Math.max(b.peak, entry.promptTokens || 0) }));
+            }
           },
           onWorkspaceUpdate: (nextFiles) => {
             setWorkspaceFiles(nextFiles);
             workspaceRef.current = nextFiles;
           },
-          onArtifact: (artifact) => {
-            setActiveArtifact(artifact);
-            setWorkspaceTab('preview');
-            setRightPaneOpen(true);
-            setHasUnreadArtifact(false);
-            setMessages((prev) =>
-              prev.map((m) => (m.id === assistantId ? { ...m, artifact } : m)),
-            );
+          onCheckpoint: (ckpt) => {
+            setCheckpoints((prev) => [ckpt, ...prev]);
+            if (ckpt.existedBefore) {
+              setDiffOriginals((prev) =>
+                prev[ckpt.path] !== undefined ? prev : { ...prev, [ckpt.path]: ckpt.beforeContent },
+              );
+            }
           },
+          onOpenFile: (filePath, nextMode = 'code') => {
+            setSelectedFilePath(filePath);
+            setEditorMode(nextMode);
+          },
+          onApprovalRequest: (req) =>
+            new Promise<ApprovalDecision>((resolve) => {
+              approvalResolverRef.current = resolve;
+              setPendingApproval(req);
+            }),
           onFinalToken: (rendered, liveTps) => {
             setMessages((prev) =>
               prev.map((m) => (m.id === assistantId ? { ...m, content: rendered } : m)),
@@ -935,13 +1182,6 @@ export function ChatWorkspace({
             if (liveTps > 0) {
               setStatusText(`${lang === 'zh' ? '生成中' : 'Synthesizing'} · ${liveTps.toFixed(1)} tok/s`);
             }
-          },
-          loadWorkspaceImage: async (assetUrl, name) => {
-            const resp = await fetch(assetUrl);
-            const blob = await resp.blob();
-            const previewUrl = URL.createObjectURL(blob);
-            objectUrlsRef.current.push(previewUrl);
-            return bitmapBlobToRgba(blob, name, previewUrl);
           },
         },
       });
@@ -959,12 +1199,17 @@ export function ChatWorkspace({
                 content: result.finalText,
                 audioUrl: result.audioUrl,
                 toolCalls: result.toolCalls,
-                artifact: result.artifact,
+                checkpoints: result.checkpoints,
+                testSummary: result.testSummary,
                 meta,
               }
             : m,
         ),
       );
+      setContextBudget({ peak: result.peakPromptTokens, max: result.maxSeqLen });
+      if (result.checkpoints.some((c) => c.path.startsWith('server/') || c.path.startsWith('data/'))) {
+        setPreviewRefreshSeq((s) => s + 1);
+      }
 
       const perfMem = (performance as Performance & { memory?: { usedJSHeapSize: number } }).memory;
       setStats((s) => ({
@@ -998,16 +1243,13 @@ export function ChatWorkspace({
     }
 
     if (mode === 'agent') {
-      await runAgentTask(client, resolved, input);
+      await runAgentTask(client, resolved, input, true);
     } else {
       await sendDirectMessage(client, resolved, input);
     }
   };
 
-  const handleRunStarter = async (
-    prompt: string,
-    opts?: { generationMode?: 'text' | 'interleaved' },
-  ) => {
+  const handleRunStarter = async (prompt: string) => {
     if (termsBlocked || status === 'loading' || status === 'generating') return;
     setMode('agent');
     let client = clientRef.current;
@@ -1020,7 +1262,7 @@ export function ChatWorkspace({
       resolved = loaded.resolvedModel;
     }
 
-    await runAgentTask(client, resolved, prompt, opts?.generationMode, false);
+    await runAgentTask(client, resolved, prompt, false);
   };
 
   const runDirectShowcase = async (kind: 'vqa' | 'voice' | 'fsm' | 'ngram') => {
@@ -1120,14 +1362,12 @@ export function ChatWorkspace({
             setStatusText(getReadyLabel(activeModel, nextLang));
           }
         }}
-        leftRailOpen={leftRailOpen}
-        onToggleLeftRail={() => setLeftRailOpen((v) => !v)}
+        editorOpen={editorOpen}
+        onToggleEditor={() => setEditorOpen((v) => !v)}
         rightPaneOpen={rightPaneOpen}
-        onToggleRightPane={() => {
-          setRightPaneOpen((v) => !v);
-          setHasUnreadArtifact(false);
-        }}
-        hasUnreadArtifact={hasUnreadArtifact}
+        onToggleRightPane={() => setRightPaneOpen((v) => !v)}
+        approvalPolicy={approvalPolicy}
+        onToggleApprovalPolicy={() => setApprovalPolicy((p) => (p === 'auto' ? 'ask' : 'auto'))}
         models={models}
         selectedModelId={selectedModelId}
         activeModel={activeModel}
@@ -1145,34 +1385,50 @@ export function ChatWorkspace({
       />
 
       <div className="studio-body">
-        {leftRailOpen && (
-          <LeftRail
-            lang={lang}
-            mode={mode}
-            onModeChange={(nextMode) => setMode(nextMode)}
-            onNewSession={resetChat}
-            canReset={messages.length > 0 || status === 'ready'}
-            busy={status === 'loading' || status === 'generating'}
-            workspaceFiles={workspaceFiles}
-            selectedFilePath={selectedFilePath}
-            onSelectFile={(filePath) => {
-              setSelectedFilePath(filePath);
-              setActiveArtifact(null);
-              setWorkspaceTab('preview');
-              setRightPaneOpen(true);
-            }}
-            onCreateFile={(newPath) => {
-              const next = upsertWorkspaceFile(workspaceFiles, newPath, '', false);
-              setWorkspaceFiles(next);
-              setSelectedFilePath(newPath);
-              setWorkspaceTab('files');
-              setRightPaneOpen(true);
-            }}
-            supportsVision={activeModel.capabilities.vision}
-          />
-        )}
+        <main className="agent-pane">
+          <div className="agent-subbar">
+            <div className="segmented" role="tablist" aria-label="Execution mode" style={{ width: 160 }}>
+              <button
+                id="btn-mode-agent"
+                type="button"
+                role="tab"
+                aria-selected={mode === 'agent'}
+                className={mode === 'agent' ? 'active' : ''}
+                disabled={status === 'loading' || status === 'generating'}
+                style={{ height: 24, fontSize: 12 }}
+                onClick={() => setMode('agent')}
+              >
+                <Bot size={12} />
+                <span>{t.modeAgent}</span>
+              </button>
+              <button
+                id="btn-mode-chat"
+                type="button"
+                role="tab"
+                aria-selected={mode === 'chat'}
+                className={mode === 'chat' ? 'active' : ''}
+                disabled={status === 'loading' || status === 'generating'}
+                style={{ height: 24, fontSize: 12 }}
+                onClick={() => setMode('chat')}
+              >
+                <MessageSquare size={12} />
+                <span>{t.modeChat}</span>
+              </button>
+            </div>
 
-        <main className="center-canvas">
+            <button
+              id="btn-new-session"
+              type="button"
+              className="icon-btn"
+              style={{ height: 26, fontSize: 12 }}
+              disabled={status === 'loading' || status === 'generating' || (messages.length === 0 && status !== 'ready')}
+              onClick={resetChat}
+            >
+              <Plus size={12} />
+              <span>{t.newSession}</span>
+            </button>
+          </div>
+
           {status === 'loading' && (
             <div className="load-progress-strip">
               <div className="load-progress-fill" style={{ width: `${loadPct}%` }} />
@@ -1187,20 +1443,21 @@ export function ChatWorkspace({
             loadProgress={loadProgress}
             activeModel={activeModel}
             termsBlocked={termsBlocked}
+            pendingApproval={pendingApproval}
+            onResolveApproval={handleResolveApproval}
             onLoadModel={() => {
               loadModel();
             }}
             onRunStarter={handleRunStarter}
-            onOpenArtifact={(art) => {
-              setActiveArtifact(art);
-              setWorkspaceTab('preview');
-              setRightPaneOpen(true);
-              setHasUnreadArtifact(false);
+            onInspectDiff={(path) => {
+              const target = readWorkspaceFile(workspaceRef.current, path)?.path || path;
+              setSelectedFilePath(target);
+              setEditorMode('diff');
+              setEditorOpen(true);
             }}
-            onPreviewHtml={(title, html) => {
-              setActiveArtifact({ id: `code-${Date.now()}`, title, html, createdAt: Date.now() });
-              setWorkspaceTab('preview');
-              setRightPaneOpen(true);
+            onRollbackCheckpoint={handleRollbackCheckpoint}
+            onPreviewHtml={(_, html) => {
+              handleSaveFile('preview-snippet.html', html);
             }}
             scrollEndRef={scrollEndRef}
           />
@@ -1225,27 +1482,54 @@ export function ChatWorkspace({
           />
         </main>
 
+        {editorOpen && (
+          <CodeEditorPane
+            lang={lang}
+            files={workspaceFiles}
+            selectedPath={selectedFilePath}
+            editorMode={editorMode}
+            diffOriginals={diffOriginals}
+            onSelectFile={(p) => {
+              setSelectedFilePath(p);
+              setEditorMode('code');
+            }}
+            onModeChange={setEditorMode}
+            onSaveFile={handleSaveFile}
+            onRevertFile={handleRevertFile}
+            onCreateFile={handleCreateFile}
+            onUploadFiles={handleUploadFiles}
+            onResetProject={handleResetProject}
+            busy={status === 'generating'}
+          />
+        )}
+
         {rightPaneOpen && (
           <WorkspacePane
             lang={lang}
             activeTab={workspaceTab}
             onTabChange={setWorkspaceTab}
             onClose={() => setRightPaneOpen(false)}
-            artifact={activeArtifact}
-            onClearArtifact={() => setActiveArtifact(null)}
-            workspaceFiles={workspaceFiles}
-            selectedFilePath={selectedFilePath}
-            onSelectFilePath={(p) => setSelectedFilePath(p)}
-            onSaveFileContent={(p, content) => {
-              setWorkspaceFiles((prev) => upsertWorkspaceFile(prev, p, content, false));
-            }}
-            onResetWorkspace={() => {
-              const init = createInitialWorkspace();
-              setWorkspaceFiles(init);
-              setSelectedFilePath('revenue_q4.csv');
-              setActiveArtifact(null);
+            sandboxStatus={sandboxStatus}
+            sandboxDetail={sandboxDetail}
+            previewUrl={previewUrl}
+            previewRefreshSeq={previewRefreshSeq}
+            shellChannel={shellChannel}
+            serverChannel={serverChannel}
+            onAttachShell={wcAttachInteractiveShell}
+            onRestartServer={() => {
+              startOrRestartDevServer({
+                onStatus: (st, detail) => {
+                  setSandboxStatus(st);
+                  if (detail) setSandboxDetail(detail);
+                },
+                onServerLog: (chunk) => pushServerOutput(chunk),
+                onServerReady: (url) => setPreviewUrl(url),
+              }).catch(() => {});
             }}
             traceEntries={traceEntries}
+            checkpoints={checkpoints}
+            onRollbackCheckpoint={handleRollbackCheckpoint}
+            contextBudget={contextBudget}
             deviceProfile={deviceProfile}
             gpuCaps={gpuCaps}
             stats={stats}

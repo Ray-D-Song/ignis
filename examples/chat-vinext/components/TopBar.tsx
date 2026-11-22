@@ -4,29 +4,33 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   Check,
   ChevronDown,
+  Code2,
+  Cpu,
   Download,
   Eye,
   Loader2,
-  PanelLeft,
+  Mic,
   PanelRight,
   RefreshCw,
+  ShieldAlert,
+  ShieldCheck,
   Volume2,
-  Mic,
-  Cpu,
 } from 'lucide-react';
-import type { ModelPreset } from '@/lib/model-paths';
+import type { ApprovalPolicy } from '@/lib/agent-harness';
 import { COPY, type UiLang } from '@/lib/i18n';
+import type { ModelPreset } from '@/lib/model-paths';
 
 export const CUSTOM_MODEL_ID = '__custom__';
 
 interface TopBarProps {
   lang: UiLang;
   onToggleLang: () => void;
-  leftRailOpen: boolean;
-  onToggleLeftRail: () => void;
+  editorOpen: boolean;
+  onToggleEditor: () => void;
   rightPaneOpen: boolean;
   onToggleRightPane: () => void;
-  hasUnreadArtifact: boolean;
+  approvalPolicy: ApprovalPolicy;
+  onToggleApprovalPolicy: () => void;
   models: ModelPreset[];
   selectedModelId: string;
   activeModel: ModelPreset;
@@ -59,11 +63,12 @@ export function TopBar(props: TopBarProps) {
   const {
     lang,
     onToggleLang,
-    leftRailOpen,
-    onToggleLeftRail,
+    editorOpen,
+    onToggleEditor,
     rightPaneOpen,
     onToggleRightPane,
-    hasUnreadArtifact,
+    approvalPolicy,
+    onToggleApprovalPolicy,
     models,
     selectedModelId,
     activeModel,
@@ -111,17 +116,6 @@ export function TopBar(props: TopBarProps) {
   return (
     <header className="topbar">
       <div className="topbar-left">
-        <button
-          id="btn-toggle-left-rail"
-          type="button"
-          className={`icon-btn ${leftRailOpen ? 'active' : ''}`}
-          onClick={onToggleLeftRail}
-          title="Toggle sidebar"
-          aria-label="Toggle sidebar"
-        >
-          <PanelLeft size={16} />
-        </button>
-
         <div className="brand-lockup">
           <SparkMark size={17} />
           <span className="brand-wordmark">{t.brandName}</span>
@@ -130,7 +124,7 @@ export function TopBar(props: TopBarProps) {
         <div className="topbar-divider hide-mobile" />
 
         <div className="model-picker-wrap" ref={pickerRef}>
-          {/* Keep accessible native <select> synced as first select in DOM */}
+          {/* Keep accessible native <select> synced as FIRST select in DOM */}
           <select
             id="model-select"
             aria-label={t.selectModel}
@@ -301,6 +295,21 @@ export function TopBar(props: TopBarProps) {
             </>
           )}
         </button>
+
+        <button
+          id="btn-approval-policy"
+          type="button"
+          className={`icon-btn hide-mobile ${approvalPolicy === 'ask' ? 'active' : ''}`}
+          style={{
+            borderColor: approvalPolicy === 'ask' ? 'var(--accent-border)' : undefined,
+            color: approvalPolicy === 'ask' ? '#fdba74' : undefined,
+          }}
+          onClick={onToggleApprovalPolicy}
+          title={approvalPolicy === 'ask' ? t.policyAskTitle : t.policyAutoTitle}
+        >
+          {approvalPolicy === 'ask' ? <ShieldAlert size={13} /> : <ShieldCheck size={13} />}
+          <span>{approvalPolicy === 'ask' ? t.policyAsk : t.policyAuto}</span>
+        </button>
       </div>
 
       <div className="topbar-right">
@@ -320,15 +329,25 @@ export function TopBar(props: TopBarProps) {
         </button>
 
         <button
+          id="btn-toggle-code"
+          type="button"
+          className={`icon-btn hide-mobile ${editorOpen ? 'active' : ''}`}
+          onClick={onToggleEditor}
+          title="Toggle CodeMirror Editor"
+          aria-label="Toggle Code Editor"
+        >
+          <Code2 size={15} />
+        </button>
+
+        <button
           id="btn-toggle-workspace"
           type="button"
           className={`icon-btn ${rightPaneOpen ? 'active' : ''}`}
           onClick={onToggleRightPane}
-          title="Toggle Workspace & Runtime Inspector"
+          title="Toggle Full-Stack Preview, Trace & Runtime"
           aria-label="Toggle Workspace Pane"
         >
           <PanelRight size={16} />
-          {hasUnreadArtifact && !rightPaneOpen && <span className="notify-dot" />}
         </button>
 
         <a

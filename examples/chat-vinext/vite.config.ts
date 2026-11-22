@@ -3,7 +3,7 @@ import vinext from 'vinext';
 
 const coopCoepHeaders = {
   'Cross-Origin-Opener-Policy': 'same-origin',
-  'Cross-Origin-Embedder-Policy': 'require-corp',
+  'Cross-Origin-Embedder-Policy': 'credentialless',
 };
 
 export default defineConfig({

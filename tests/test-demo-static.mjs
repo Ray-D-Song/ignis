@@ -194,6 +194,7 @@ async function main() {
     context = await chromium.launchPersistentContext(userDataDir, {
       ...(BROWSER_PATH ? { executablePath: BROWSER_PATH } : {}),
       headless: true,
+      viewport: { width: 1440, height: 900 },
       args: ['--headless=new'],
     });
 
@@ -203,7 +204,8 @@ async function main() {
     });
     page.on('pageerror', (e) => errors.push(String(e)));
 
-    await page.goto(pagesSrv.origin, { waitUntil: 'networkidle' });
+    await page.goto(pagesSrv.origin, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#model-select', { timeout: 20000 });
 
     // Assert crossOriginIsolated + COOP/COEP + clean Agent Hero + Hardware Readiness card
     const isolated = await page.evaluate(() => window.crossOriginIsolated === true);
@@ -217,86 +219,107 @@ async function main() {
       throw new Error(`Hero check failed: visible=${heroVisible}, text="${heroText}"`);
     }
 
-    await page.click('#btn-toggle-workspace');
+    if (!(await page.locator('#workspace-pane').isVisible())) {
+      await page.click('#btn-toggle-workspace');
+    }
     await page.click('#tab-btn-runtime');
+    await page.waitForFunction(
+      () => {
+        const txt = document.getElementById('hardware-card')?.textContent || '';
+        return txt.includes('tier') && txt.includes('COOP/COEP');
+      },
+      null,
+      { timeout: 20000 },
+    );
     const hwText = await page.locator('#hardware-card').innerText();
-    if (!hwText.includes('tier') || hwText.includes('WebGPU Unavailable')) {
+    if (!hwText.includes('tier') || !hwText.includes('f16:✓') || !hwText.includes('sg:✓') || hwText.includes('WebGPU Unavailable')) {
       throw new Error(`Hardware check failed: hwText="${hwText}"`);
     }
-    await page.click('#btn-close-workspace');
+    await page.click('#tab-btn-preview');
 
-    const selectedModel = await page.locator('select').first().inputValue();
-    if (selectedModel !== 'lfm3-omni-2b') {
-      throw new Error(`Expected default CDN preset 'lfm3-omni-2b', got '${selectedModel}'`);
+    const selectedModel = await page.locator('#model-select').inputValue();
+    if (selectedModel !== 'spark-4b-q8head') {
+      throw new Error(`Expected default CDN preset 'spark-4b-q8head', got '${selectedModel}'`);
     }
 
-    // 4. Load LFM3-Omni-2B cross-origin from Server B into OPFS + WebGPU
+    // 4. Load default Spark-X2.6 4B cross-origin from Server B into OPFS + WebGPU
     await page.click('#btn-load-model');
     await page.waitForFunction(
-      () => document.getElementById('status-text')?.textContent?.includes('Ready ·'),
+      () => document.getElementById('status-text')?.textContent?.includes('Ready · Spark'),
       null,
       { timeout: 120000 },
     );
     console.log('[status]', await page.locator('#status-text').innerText());
 
-    // 5. Pure-Browser Agent Harness E2E (FSM tool calls + workspace + artifact/js + trace)
-    await page.fill(
-      '#chat-input',
-      'Read revenue_q4.csv from the workspace, run JavaScript to calculate total Q4 revenue, render an SVG chart dashboard artifact, and summarize.',
-    );
-    await page.click('#btn-send');
+    // Wait for WebContainer PulseBoard full-stack server to boot & render live preview
+    await page.waitForSelector('#preview-iframe', { timeout: 120000 });
+    const previewFrame = page.frameLocator('#preview-iframe');
+    await previewFrame.locator('header h1').waitFor({ timeout: 30000 });
+    const preFixTitle = await previewFrame.locator('header h1').innerText();
+    const preFixRate = await previewFrame.locator('.kpi-card strong.accent').innerText();
+    console.log('[webcontainer-preview before fix]', preFixTitle, 'completionRate=', preFixRate);
+    if (!preFixTitle.includes('PulseBoard')) {
+      throw new Error(`Expected PulseBoard inside #preview-iframe, got "${preFixTitle}"`);
+    }
+
+    // 5. Ignis Code Agent Harness E2E (FSM tool calls + WebContainer npm test + multi-file bugfix)
+    await page.locator('.starter-card').first().click();
     await page.waitForFunction(
       () =>
         document.querySelectorAll('.msg.assistant').length >= 1 &&
-        document.getElementById('status-text')?.textContent?.includes('Ready ·'),
+        document.getElementById('status-text')?.textContent?.includes('Ready · Spark'),
       null,
-      { timeout: 150000 },
+      { timeout: 240000 },
     );
 
     const toolCount = await page.locator('.tool-call-card').count();
     const toolSummaries = await page.locator('.tool-call-summary').allInnerTexts();
     const agentAnswer = await page.locator('.msg.assistant .answer-body').last().innerText();
-    console.log('[agent-harness] tools=', toolCount, toolSummaries.map((s) => s.replace(/\s+/g, ' ')));
+    const verifierBadge = await page.locator('[data-testid="test-verifier-badge"]').last().innerText();
+    console.log('[agent-harness] tools=', toolCount, 'badge=', verifierBadge, toolSummaries.map((s) => s.replace(/\s+/g, ' ')));
     console.log('[agent-answer]', agentAnswer.trim().slice(0, 220));
-    if (toolCount < 1) {
-      throw new Error(`Expected at least 1 real FSM tool call in Agent mode, got ${toolCount}`);
+    if (toolCount < 3) {
+      throw new Error(`Expected at least 3 real FSM tool calls in Agent bugfix run, got ${toolCount}`);
+    }
+    if (!verifierBadge.includes('6/6 PASS')) {
+      throw new Error(`Expected 6/6 PASS from real WebContainer npm test verifier, got "${verifierBadge}"`);
     }
     if (agentAnswer.trim().length < 15) {
       throw new Error(`Expected substantive Agent answer, got "${agentAnswer}"`);
     }
 
-    if (!(await page.locator('#workspace-pane').isVisible())) {
-      await page.click('#btn-toggle-workspace');
+    // Assert live PulseBoard preview reflects the fixed stats calculation (50% -> 25%)
+    await page.waitForFunction(
+      () => {
+        const ifr = document.getElementById('preview-iframe');
+        const txt = ifr?.contentDocument?.querySelector('.kpi-card strong.accent')?.textContent || '';
+        return txt.includes('25%');
+      },
+      null,
+      { timeout: 20000 },
+    ).catch(async () => {
+      await previewFrame.locator('.kpi-card strong.accent', { hasText: '25%' }).waitFor({ timeout: 20000 });
+    });
+    const postFixRate = await previewFrame.locator('.kpi-card strong.accent').innerText();
+    console.log('[webcontainer-preview after fix] completionRate=', postFixRate);
+    if (!postFixRate.includes('25%')) {
+      throw new Error(`Expected updated PulseBoard KPI 25% inside #preview-iframe, got "${postFixRate}"`);
     }
+
     await page.click('#tab-btn-trace');
     const traceCount = await page.locator('[data-testid="trace-entry"]').count();
     console.log('[trace] entries=', traceCount);
-    if (traceCount < 2) {
-      throw new Error(`Expected >= 2 trace entries after Agent run, got ${traceCount}`);
+    if (traceCount < 4) {
+      throw new Error(`Expected >= 4 trace entries after Agent bugfix run, got ${traceCount}`);
     }
 
-    // 6. Showcase 1: Direct Omni VQA (demo-shapes.png) from Runtime tab
+    // 6. Showcase 1: Direct JSON Schema FSM on Spark-4B
     await page.click('#tab-btn-runtime');
-    await page.click('#showcase-vqa');
-    await page.waitForFunction(
-      () =>
-        document.querySelectorAll('.msg.assistant').length >= 2 &&
-        document.getElementById('status-text')?.textContent?.includes('Ready ·'),
-      null,
-      { timeout: 90000 },
-    );
-    const vqaAnswer = await page.locator('.msg.assistant .answer-body').last().innerText();
-    console.log('[showcase-vqa]', vqaAnswer.trim());
-    if (!/red|blue|square/i.test(vqaAnswer)) {
-      throw new Error(`Expected Omni VQA answer to describe red/blue/square, got: "${vqaAnswer}"`);
-    }
-
-    // 7. Showcase 2: Direct JSON Schema FSM
     await page.click('#showcase-fsm');
     await page.waitForFunction(
       () =>
-        document.querySelectorAll('.msg.assistant').length >= 3 &&
-        document.getElementById('status-text')?.textContent?.includes('Ready ·'),
+        document.querySelectorAll('.msg.assistant').length >= 2 &&
+        document.getElementById('status-text')?.textContent?.includes('Ready · Spark'),
       null,
       { timeout: 90000 },
     );
@@ -311,12 +334,12 @@ async function main() {
       throw new Error(`Unexpected FSM badge text: "${fsmBadge}"`);
     }
 
-    // 8. Showcase 3: Direct N-gram Speculative
+    // 7. Showcase 2: Direct N-gram Speculative on Spark-4B
     await page.click('#showcase-ngram');
     await page.waitForFunction(
       () =>
-        document.querySelectorAll('.msg.assistant').length >= 4 &&
-        document.getElementById('status-text')?.textContent?.includes('Ready ·'),
+        document.querySelectorAll('.msg.assistant').length >= 3 &&
+        document.getElementById('status-text')?.textContent?.includes('Ready · Spark'),
       null,
       { timeout: 90000 },
     );
@@ -325,6 +348,28 @@ async function main() {
     console.log('[showcase-ngram]', ngramAnswer.trim().slice(0, 120), '|', ngramBadge);
     if (!ngramBadge.includes('accepted')) {
       throw new Error(`Unexpected N-gram badge text: "${ngramBadge}"`);
+    }
+
+    // 8. Switch to LFM3-Omni 2B for Multimodal Vision VQA (demo-shapes.png)
+    await page.selectOption('#model-select', 'lfm3-omni-2b');
+    await page.click('#btn-load-model');
+    await page.waitForFunction(
+      () => document.getElementById('status-text')?.textContent?.includes('Ready · LFM3'),
+      null,
+      { timeout: 120000 },
+    );
+    await page.click('#showcase-vqa');
+    await page.waitForFunction(
+      () =>
+        document.querySelectorAll('.msg.assistant').length >= 4 &&
+        document.getElementById('status-text')?.textContent?.includes('Ready · LFM3'),
+      null,
+      { timeout: 90000 },
+    );
+    const vqaAnswer = await page.locator('.msg.assistant .answer-body').last().innerText();
+    console.log('[showcase-vqa]', vqaAnswer.trim());
+    if (!/red|blue|square/i.test(vqaAnswer)) {
+      throw new Error(`Expected Omni VQA answer to describe red/blue/square, got: "${vqaAnswer}"`);
     }
 
     // 9. Clear OPFS Cache
@@ -339,7 +384,7 @@ async function main() {
       throw new Error(`Console/page errors detected: ${errors.join(' | ')}`);
     }
 
-    console.log('[PASS] Static Cloudflare Pages + Cross-Origin R2 Showcase E2E verified (COEP credentialless + Agent Harness + LFM3 VQA + JSON FSM + N-gram + Clear OPFS)!');
+    console.log('[PASS] Static Cloudflare Pages + Cross-Origin R2 Ignis Code E2E verified (COEP credentialless + WebContainer PulseBoard + Spark-4B 6/6 Bugfix + JSON FSM + N-gram + LFM3 VQA + Clear OPFS)!');
   } finally {
     if (context) await context.close();
     pagesSrv.server.closeAllConnections?.();
