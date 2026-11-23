@@ -2321,3 +2321,15 @@ details.think-block pre {
 [data-theme='light'] .terms-banner a {
   color: #9a3412;
 }
+
+.pane-lazy-fallback {
+  flex: 1 1 320px;
+  min-width: 240px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-left: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text-muted);
+  font-size: 12.5px;
+}

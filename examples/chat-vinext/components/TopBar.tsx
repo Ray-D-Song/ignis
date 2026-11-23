@@ -28,6 +28,7 @@ export const CUSTOM_MODEL_ID = '__custom__';
 interface TopBarProps {
   lang: UiLang;
   onToggleLang: () => void;
+  mode: 'agent' | 'chat';
   theme: 'dark' | 'light';
   onToggleTheme: () => void;
   editorOpen: boolean;
@@ -64,6 +65,7 @@ export function TopBar(props: TopBarProps) {
   const {
     lang,
     onToggleLang,
+    mode,
     theme,
     onToggleTheme,
     editorOpen,
@@ -300,20 +302,22 @@ export function TopBar(props: TopBarProps) {
           )}
         </button>
 
-        <button
-          id="btn-approval-policy"
-          type="button"
-          className={`icon-btn hide-mobile ${approvalPolicy === 'ask' ? 'active' : ''}`}
-          style={{
-            borderColor: approvalPolicy === 'ask' ? 'var(--accent-border)' : undefined,
-            color: approvalPolicy === 'ask' ? '#fdba74' : undefined,
-          }}
-          onClick={onToggleApprovalPolicy}
-          title={approvalPolicy === 'ask' ? t.policyAskTitle : t.policyAutoTitle}
-        >
-          {approvalPolicy === 'ask' ? <ShieldAlert size={13} /> : <ShieldCheck size={13} />}
-          <span>{approvalPolicy === 'ask' ? t.policyAsk : t.policyAuto}</span>
-        </button>
+        {mode === 'agent' && (
+          <button
+            id="btn-approval-policy"
+            type="button"
+            className={`icon-btn hide-mobile ${approvalPolicy === 'ask' ? 'active' : ''}`}
+            style={{
+              borderColor: approvalPolicy === 'ask' ? 'var(--accent-border)' : undefined,
+              color: approvalPolicy === 'ask' ? '#fdba74' : undefined,
+            }}
+            onClick={onToggleApprovalPolicy}
+            title={approvalPolicy === 'ask' ? t.policyAskTitle : t.policyAutoTitle}
+          >
+            {approvalPolicy === 'ask' ? <ShieldAlert size={13} /> : <ShieldCheck size={13} />}
+            <span>{approvalPolicy === 'ask' ? t.policyAsk : t.policyAuto}</span>
+          </button>
+        )}
       </div>
 
       <div className="topbar-right">
@@ -322,18 +326,20 @@ export function TopBar(props: TopBarProps) {
           <span id="status-text">{statusText}</span>
         </div>
 
-        <button
-          id="btn-topbar-reset-workspace"
-          type="button"
-          className="icon-btn"
-          disabled={status === 'generating'}
-          onClick={onResetWorkspace}
-          title={t.resetWorkspace}
-          aria-label={t.resetWorkspace}
-        >
-          <RotateCcw size={14} />
-          <span className="hide-mobile">{t.resetWorkspace}</span>
-        </button>
+        {mode === 'agent' && (
+          <button
+            id="btn-topbar-reset-workspace"
+            type="button"
+            className="icon-btn"
+            disabled={status === 'generating'}
+            onClick={onResetWorkspace}
+            title={t.resetWorkspace}
+            aria-label={t.resetWorkspace}
+          >
+            <RotateCcw size={14} />
+            <span className="hide-mobile">{t.resetWorkspace}</span>
+          </button>
+        )}
 
         <button
           id="btn-lang-toggle"
@@ -357,27 +363,31 @@ export function TopBar(props: TopBarProps) {
           {theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
         </button>
 
-        <button
-          id="btn-toggle-code"
-          type="button"
-          className={`icon-btn hide-mobile ${editorOpen ? 'active' : ''}`}
-          onClick={onToggleEditor}
-          title="Toggle CodeMirror Editor"
-          aria-label="Toggle Code Editor"
-        >
-          <Code2 size={15} />
-        </button>
+        {mode === 'agent' && (
+          <>
+            <button
+              id="btn-toggle-code"
+              type="button"
+              className={`icon-btn hide-mobile ${editorOpen ? 'active' : ''}`}
+              onClick={onToggleEditor}
+              title="Toggle CodeMirror Editor"
+              aria-label="Toggle Code Editor"
+            >
+              <Code2 size={15} />
+            </button>
 
-        <button
-          id="btn-toggle-workspace"
-          type="button"
-          className={`icon-btn ${rightPaneOpen ? 'active' : ''}`}
-          onClick={onToggleRightPane}
-          title="Toggle Full-Stack Preview, Trace & Runtime"
-          aria-label="Toggle Workspace Pane"
-        >
-          <PanelRight size={16} />
-        </button>
+            <button
+              id="btn-toggle-workspace"
+              type="button"
+              className={`icon-btn ${rightPaneOpen ? 'active' : ''}`}
+              onClick={onToggleRightPane}
+              title="Toggle Full-Stack Preview, Trace & Runtime"
+              aria-label="Toggle Workspace Pane"
+            >
+              <PanelRight size={16} />
+            </button>
+          </>
+        )}
 
         <a
           href="https://github.com/Ray-D-Song/Ignis"

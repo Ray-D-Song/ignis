@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { Bot, MessageSquare, Plus } from 'lucide-react';
 import type { ModelPreset } from '@/lib/model-paths';
 import { IgnisClient } from '../../../runtime/ignis-client.mjs';
@@ -47,11 +47,17 @@ import {
   type WorkspaceFile,
 } from '@/lib/workspace-fs';
 import { loadPersistedWorkspace, savePersistedWorkspace } from '@/lib/workspace-persistence';
-import { CodeEditorPane } from './CodeEditorPane';
 import { Composer } from './Composer';
 import { ThreadView, type LoadProgressState, type StudioMessage } from './ThreadView';
 import { TopBar } from './TopBar';
-import { WorkspacePane, type FsmPreset, type WorkspaceTab } from './WorkspacePane';
+import type { FsmPreset, WorkspaceTab } from './WorkspacePane';
+
+const LazyCodeEditorPane = React.lazy(() =>
+  import('./CodeEditorPane').then((m) => ({ default: m.CodeEditorPane })),
+);
+const LazyWorkspacePane = React.lazy(() =>
+  import('./WorkspacePane').then((m) => ({ default: m.WorkspacePane })),
+);
 
 type IgnisDeviceProfile = Awaited<ReturnType<typeof detectDeviceProfile>>;
 
@@ -164,31 +170,60 @@ export function ChatWorkspace({
   const initialLang: UiLang = isPublicCdn ? 'en' : 'zh';
   const [lang, setLang] = useState<UiLang>(initialLang);
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
-  const themeReadyRef = useRef(false);
+  const manualThemeRef = useRef(false);
   const t = COPY[lang];
 
   useEffect(() => {
     try {
       const saved = window.localStorage.getItem('ignis-theme');
-      const next: 'dark' | 'light' = saved === 'light' || saved === 'dark' ? saved : 'dark';
+      if (saved === 'light' || saved === 'dark') {
+        manualThemeRef.current = true;
+        setTheme(saved);
+        document.documentElement.setAttribute('data-theme', saved);
+        return;
+      }
+    } catch {
+      // ignore storage errors
+    }
+
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
+      document.documentElement.setAttribute('data-theme', 'dark');
+      return;
+    }
+
+    const mql = window.matchMedia('(prefers-color-scheme: light)');
+    const applySystemTheme = (matchesLight: boolean) => {
+      if (manualThemeRef.current) return;
+      const next: 'dark' | 'light' = matchesLight ? 'light' : 'dark';
       setTheme(next);
       document.documentElement.setAttribute('data-theme', next);
-    } catch {
-      document.documentElement.setAttribute('data-theme', 'dark');
-    } finally {
-      themeReadyRef.current = true;
+    };
+
+    applySystemTheme(mql.matches);
+    const onChange = (ev: MediaQueryListEvent) => applySystemTheme(ev.matches);
+    if (typeof mql.addEventListener === 'function') {
+      mql.addEventListener('change', onChange);
+      return () => mql.removeEventListener('change', onChange);
     }
+    mql.addListener(onChange);
+    return () => mql.removeListener(onChange);
   }, []);
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
-    if (!themeReadyRef.current) return;
+  }, [theme]);
+
+  const handleToggleTheme = () => {
+    manualThemeRef.current = true;
+    const next: 'dark' | 'light' = theme === 'dark' ? 'light' : 'dark';
+    setTheme(next);
+    document.documentElement.setAttribute('data-theme', next);
     try {
-      window.localStorage.setItem('ignis-theme', theme);
+      window.localStorage.setItem('ignis-theme', next);
     } catch {
       // ignore storage errors
     }
-  }, [theme]);
+  };
 
   const defaultModelId = models[0]?.id || CUSTOM_MODEL_ID;
   const [selectedModelId, setSelectedModelId] = useState(defaultModelId);
@@ -196,7 +231,8 @@ export function ChatWorkspace({
   const [customPresetOverride, setCustomPresetOverride] = useState<Partial<ModelPreset> | null>(null);
   const [termsAcked, setTermsAcked] = useState(false);
 
-  const [mode, setMode] = useState<'agent' | 'chat'>('agent');
+  const [mode, setMode] = useState<'agent' | 'chat'>('chat');
+  const sandboxBootStartedRef = useRef(false);
   const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicy>('auto');
   const [editorOpen, setEditorOpen] = useState(true);
   const [rightPaneOpen, setRightPaneOpen] = useState(true);
@@ -319,8 +355,6 @@ export function ChatWorkspace({
   };
 
   useEffect(() => {
-    let cancelled = false;
-
     if (typeof window !== 'undefined' && window.innerWidth < 1200) {
       setEditorOpen(false);
       setRightPaneOpen(false);
@@ -341,10 +375,31 @@ export function ChatWorkspace({
       }
     })();
 
-    // Restore persisted workspace files first, then boot WebContainer full-stack sandbox
+    return () => {
+      revokeAllObjectUrls();
+      if (approvalResolverRef.current) {
+        approvalResolverRef.current({ approved: false, reason: 'Unmounted' });
+        approvalResolverRef.current = null;
+      }
+      if (clientRef.current) {
+        clientRef.current.destroy();
+        clientRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (mode !== 'agent' || sandboxBootStartedRef.current) return;
+    sandboxBootStartedRef.current = true;
+    let cancelled = false;
+
+    // Lazy-restore persisted workspace and boot WebContainer only when switching to Harness
     (async () => {
       const savedFiles = await loadPersistedWorkspace();
-      if (cancelled) return;
+      if (cancelled) {
+        sandboxBootStartedRef.current = false;
+        return;
+      }
       if (savedFiles && savedFiles.length > 0) {
         setWorkspaceFiles(savedFiles);
         workspaceRef.current = savedFiles;
@@ -377,17 +432,8 @@ export function ChatWorkspace({
 
     return () => {
       cancelled = true;
-      revokeAllObjectUrls();
-      if (approvalResolverRef.current) {
-        approvalResolverRef.current({ approved: false, reason: 'Unmounted' });
-        approvalResolverRef.current = null;
-      }
-      if (clientRef.current) {
-        clientRef.current.destroy();
-        clientRef.current = null;
-      }
     };
-  }, [pushServerOutput, pushShellOutput]);
+  }, [mode, pushServerOutput, pushShellOutput]);
 
   useEffect(() => {
     if (!hydratedWorkspaceRef.current) return;
@@ -1435,8 +1481,9 @@ export function ChatWorkspace({
             setStatusText(getReadyLabel(activeModel, nextLang));
           }
         }}
+        mode={mode}
         theme={theme}
-        onToggleTheme={() => setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'))}
+        onToggleTheme={handleToggleTheme}
         editorOpen={editorOpen}
         onToggleEditor={() => setEditorOpen((v) => !v)}
         rightPaneOpen={rightPaneOpen}
@@ -1467,19 +1514,6 @@ export function ChatWorkspace({
           <div className="agent-subbar">
             <div className="segmented" role="tablist" aria-label="Execution mode" style={{ width: 160 }}>
               <button
-                id="btn-mode-agent"
-                type="button"
-                role="tab"
-                aria-selected={mode === 'agent'}
-                className={mode === 'agent' ? 'active' : ''}
-                disabled={status === 'loading' || status === 'generating'}
-                style={{ height: 24, fontSize: 12 }}
-                onClick={() => setMode('agent')}
-              >
-                <Bot size={12} />
-                <span>{t.modeAgent}</span>
-              </button>
-              <button
                 id="btn-mode-chat"
                 type="button"
                 role="tab"
@@ -1491,6 +1525,19 @@ export function ChatWorkspace({
               >
                 <MessageSquare size={12} />
                 <span>{t.modeChat}</span>
+              </button>
+              <button
+                id="btn-mode-agent"
+                type="button"
+                role="tab"
+                aria-selected={mode === 'agent'}
+                className={mode === 'agent' ? 'active' : ''}
+                disabled={status === 'loading' || status === 'generating'}
+                style={{ height: 24, fontSize: 12 }}
+                onClick={() => setMode('agent')}
+              >
+                <Bot size={12} />
+                <span>{t.modeAgent}</span>
               </button>
             </div>
 
@@ -1515,6 +1562,7 @@ export function ChatWorkspace({
 
           <ThreadView
             lang={lang}
+            mode={mode}
             messages={messages}
             status={status}
             statusText={statusText}
@@ -1560,94 +1608,98 @@ export function ChatWorkspace({
           />
         </main>
 
-        {editorOpen && (
-          <CodeEditorPane
-            lang={lang}
-            theme={theme}
-            files={workspaceFiles}
-            selectedPath={selectedFilePath}
-            editorMode={editorMode}
-            diffOriginals={diffOriginals}
-            onSelectFile={(p) => {
-              setSelectedFilePath(p);
-              setEditorMode('code');
-            }}
-            onModeChange={setEditorMode}
-            onSaveFile={handleSaveFile}
-            onRevertFile={handleRevertFile}
-            onCreateFile={handleCreateFile}
-            onUploadFiles={handleUploadFiles}
-            onResetProject={handleResetProject}
-            busy={status === 'generating'}
-          />
+        {mode === 'agent' && editorOpen && (
+          <Suspense fallback={<div className="pane-lazy-fallback">{t.loadingHarness}</div>}>
+            <LazyCodeEditorPane
+              lang={lang}
+              theme={theme}
+              files={workspaceFiles}
+              selectedPath={selectedFilePath}
+              editorMode={editorMode}
+              diffOriginals={diffOriginals}
+              onSelectFile={(p) => {
+                setSelectedFilePath(p);
+                setEditorMode('code');
+              }}
+              onModeChange={setEditorMode}
+              onSaveFile={handleSaveFile}
+              onRevertFile={handleRevertFile}
+              onCreateFile={handleCreateFile}
+              onUploadFiles={handleUploadFiles}
+              onResetProject={handleResetProject}
+              busy={status === 'generating'}
+            />
+          </Suspense>
         )}
 
-        {rightPaneOpen && (
-          <WorkspacePane
-            lang={lang}
-            theme={theme}
-            activeTab={workspaceTab}
-            onTabChange={setWorkspaceTab}
-            onClose={() => setRightPaneOpen(false)}
-            sandboxStatus={sandboxStatus}
-            sandboxDetail={sandboxDetail}
-            previewUrl={previewUrl}
-            previewRefreshSeq={previewRefreshSeq}
-            shellChannel={shellChannel}
-            serverChannel={serverChannel}
-            onAttachShell={wcAttachInteractiveShell}
-            onRestartServer={() => {
-              startOrRestartDevServer({
-                onStatus: (st, detail) => {
-                  setSandboxStatus(st);
-                  if (detail) setSandboxDetail(detail);
-                },
-                onServerLog: (chunk) => pushServerOutput(chunk),
-                onServerReady: (url) => setPreviewUrl(url),
-              }).catch(() => {});
-            }}
-            traceEntries={traceEntries}
-            checkpoints={checkpoints}
-            onRollbackCheckpoint={handleRollbackCheckpoint}
-            contextBudget={contextBudget}
-            deviceProfile={deviceProfile}
-            gpuCaps={gpuCaps}
-            stats={stats}
-            status={status}
-            activeModel={activeModel}
-            archKind={archKind}
-            enableThinking={enableThinking}
-            onThinkingChange={setEnableThinking}
-            effort={effort}
-            onEffortChange={setEffort}
-            generationMode={generationMode}
-            onGenerationModeChange={setGenerationMode}
-            enableFsm={enableFsm}
-            onFsmToggle={(next) => {
-              setEnableFsm(next);
-              if (next) {
-                setEnableNgram(false);
-                setGenerationMode('text');
-              }
-            }}
-            fsmPresets={FSM_PRESETS}
-            fsmPresetId={fsmPresetId}
-            onFsmPresetChange={(id) => {
-              setFsmPresetId(id);
-              const found = FSM_PRESETS.find((x) => x.id === id);
-              if (found) setFsmSchemaText(JSON.stringify(found.schema, null, 2));
-            }}
-            fsmSchemaText={fsmSchemaText}
-            onFsmSchemaTextChange={setFsmSchemaText}
-            enableNgram={enableNgram}
-            onNgramToggle={setEnableNgram}
-            temperature={temperature}
-            onTemperatureChange={setTemperature}
-            maxNewTokens={maxNewTokens}
-            onMaxNewTokensChange={setMaxNewTokens}
-            onRunShowcase={runDirectShowcase}
-            onClearOpfs={clearOpfsCache}
-          />
+        {mode === 'agent' && rightPaneOpen && (
+          <Suspense fallback={<div className="pane-lazy-fallback">{t.loadingHarness}</div>}>
+            <LazyWorkspacePane
+              lang={lang}
+              theme={theme}
+              activeTab={workspaceTab}
+              onTabChange={setWorkspaceTab}
+              onClose={() => setRightPaneOpen(false)}
+              sandboxStatus={sandboxStatus}
+              sandboxDetail={sandboxDetail}
+              previewUrl={previewUrl}
+              previewRefreshSeq={previewRefreshSeq}
+              shellChannel={shellChannel}
+              serverChannel={serverChannel}
+              onAttachShell={wcAttachInteractiveShell}
+              onRestartServer={() => {
+                startOrRestartDevServer({
+                  onStatus: (st, detail) => {
+                    setSandboxStatus(st);
+                    if (detail) setSandboxDetail(detail);
+                  },
+                  onServerLog: (chunk) => pushServerOutput(chunk),
+                  onServerReady: (url) => setPreviewUrl(url),
+                }).catch(() => {});
+              }}
+              traceEntries={traceEntries}
+              checkpoints={checkpoints}
+              onRollbackCheckpoint={handleRollbackCheckpoint}
+              contextBudget={contextBudget}
+              deviceProfile={deviceProfile}
+              gpuCaps={gpuCaps}
+              stats={stats}
+              status={status}
+              activeModel={activeModel}
+              archKind={archKind}
+              enableThinking={enableThinking}
+              onThinkingChange={setEnableThinking}
+              effort={effort}
+              onEffortChange={setEffort}
+              generationMode={generationMode}
+              onGenerationModeChange={setGenerationMode}
+              enableFsm={enableFsm}
+              onFsmToggle={(next) => {
+                setEnableFsm(next);
+                if (next) {
+                  setEnableNgram(false);
+                  setGenerationMode('text');
+                }
+              }}
+              fsmPresets={FSM_PRESETS}
+              fsmPresetId={fsmPresetId}
+              onFsmPresetChange={(id) => {
+                setFsmPresetId(id);
+                const found = FSM_PRESETS.find((x) => x.id === id);
+                if (found) setFsmSchemaText(JSON.stringify(found.schema, null, 2));
+              }}
+              fsmSchemaText={fsmSchemaText}
+              onFsmSchemaTextChange={setFsmSchemaText}
+              enableNgram={enableNgram}
+              onNgramToggle={setEnableNgram}
+              temperature={temperature}
+              onTemperatureChange={setTemperature}
+              maxNewTokens={maxNewTokens}
+              onMaxNewTokensChange={setMaxNewTokens}
+              onRunShowcase={runDirectShowcase}
+              onClearOpfs={clearOpfsCache}
+            />
+          </Suspense>
         )}
       </div>
     </div>

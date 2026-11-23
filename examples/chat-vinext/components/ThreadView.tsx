@@ -85,6 +85,7 @@ export interface StudioMessage {
 
 interface ThreadViewProps {
   lang: UiLang;
+  mode: 'agent' | 'chat';
   messages: StudioMessage[];
   status: 'idle' | 'loading' | 'ready' | 'generating' | 'error';
   statusText: string;
@@ -355,6 +356,7 @@ function InlineApprovalCard({
 export function ThreadView(props: ThreadViewProps) {
   const {
     lang,
+    mode,
     messages,
     status,
     statusText,
@@ -408,7 +410,9 @@ export function ThreadView(props: ThreadViewProps) {
                     <div className="idle-readiness-desc">
                       {termsBlocked
                         ? t.idleBannerTermsHint
-                        : t.idleBannerDesc(displayName, activeModel.sizeLabel)}
+                        : mode === 'chat'
+                          ? t.idleBannerDescChat(displayName, activeModel.sizeLabel)
+                          : t.idleBannerDesc(displayName, activeModel.sizeLabel)}
                     </div>
                   </div>
                   <button
@@ -427,31 +431,33 @@ export function ThreadView(props: ThreadViewProps) {
                 </div>
               )}
 
-              <div className="starter-grid">
-                {t.starters.map((s) => (
-                  <button
-                    key={s.id}
-                    type="button"
-                    className="starter-card"
-                    disabled={busy || termsBlocked}
-                    onClick={() => onRunStarter(s.prompt)}
-                  >
-                    <div className="starter-card-head">
-                      {s.id === 'build_kanban' ? (
-                        <Layers size={15} style={{ color: 'var(--accent)', flexShrink: 0 }} />
-                      ) : s.id === 'build_pomodoro' ? (
-                        <Clock size={15} style={{ color: 'var(--accent)', flexShrink: 0 }} />
-                      ) : s.id === 'build_expense' ? (
-                        <BarChart3 size={15} style={{ color: 'var(--accent)', flexShrink: 0 }} />
-                      ) : (
-                        <Sparkles size={15} style={{ color: 'var(--accent)', flexShrink: 0 }} />
-                      )}
-                      <span>{s.title}</span>
-                    </div>
-                    <div className="starter-card-desc">{s.subtitle}</div>
-                  </button>
-                ))}
-              </div>
+              {mode === 'agent' && (
+                <div className="starter-grid">
+                  {t.starters.map((s) => (
+                    <button
+                      key={s.id}
+                      type="button"
+                      className="starter-card"
+                      disabled={busy || termsBlocked}
+                      onClick={() => onRunStarter(s.prompt)}
+                    >
+                      <div className="starter-card-head">
+                        {s.id === 'build_kanban' ? (
+                          <Layers size={15} style={{ color: 'var(--accent)', flexShrink: 0 }} />
+                        ) : s.id === 'build_pomodoro' ? (
+                          <Clock size={15} style={{ color: 'var(--accent)', flexShrink: 0 }} />
+                        ) : s.id === 'build_expense' ? (
+                          <BarChart3 size={15} style={{ color: 'var(--accent)', flexShrink: 0 }} />
+                        ) : (
+                          <Sparkles size={15} style={{ color: 'var(--accent)', flexShrink: 0 }} />
+                        )}
+                        <span>{s.title}</span>
+                      </div>
+                      <div className="starter-card-desc">{s.subtitle}</div>
+                    </button>
+                  ))}
+                </div>
+              )}
             </>
           )}
         </div>

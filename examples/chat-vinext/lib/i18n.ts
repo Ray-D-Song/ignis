@@ -124,6 +124,9 @@ export const COPY = {
     idleBannerTitle: 'Local coding model not loaded yet',
     idleBannerDesc: (name: string, size?: string) =>
       `Load ${name}${size ? ` (${size})` : ''} into browser WebGPU first — Vite WebContainer is booting in parallel — or click any app starter below.`,
+    idleBannerDescChat: (name: string, size?: string) =>
+      `Load ${name}${size ? ` (${size})` : ''} directly in your browser via WebGPU + OPFS, or type below to auto-load and start chatting.`,
+    loadingHarness: 'Loading Harness IDE...',
     themeLightTitle: 'Switch to light theme',
     themeDarkTitle: 'Switch to dark theme',
     idleBannerCta: 'Load Model',
@@ -269,6 +272,9 @@ export const COPY = {
     idleBannerTitle: '尚未加载本地编码模型',
     idleBannerDesc: (name: string, size?: string) =>
       `右侧 Vite WebContainer 正在并行就绪；点击加载 ${name}${size ? `（${size}）` : ''}，或直接点击下方应用模板自动加载并开始构建。`,
+    idleBannerDescChat: (name: string, size?: string) =>
+      `直接点击加载 ${name}${size ? `（${size}）` : ''} 至浏览器 WebGPU，或在下方输入问题自动加载并开始对话。`,
+    loadingHarness: '正在加载 Harness 工作台...',
     themeLightTitle: '切换为浅色模式',
     themeDarkTitle: '切换为深色模式',
     idleBannerCta: '加载模型',
