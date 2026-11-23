@@ -1,44 +1,23 @@
 > **English** | [简体中文](README.zh-CN.md)
 
-# Ignis
+<p align="center">
+  <img src="assets/logo.svg" alt="Ignis Logo" width="72" height="72" />
+</p>
 
-**A zero-dependency, browser-native WebGPU LLM and Full-Omni multimodal inference engine built from first principles.**
+<h1 align="center">Ignis</h1>
 
-[**Live Demo**](https://ignis.ray-d-song.com) · [**ignis-webgpu**](packages/core/README.md) · [**ignis-webgpu-packer**](packages/packer/README.md) · [**Contributing**](CONTRIBUTING.md)
+<p align="center">
+  <strong>A zero-dependency, browser-native WebGPU LLM and Full-Omni multimodal inference engine.</strong>
+</p>
+
+<p align="center">
+  <a href="https://ignis.ray-d-song.com"><strong>Live Demo</strong></a> ·
+  <a href="packages/core/README.md"><strong>ignis-webgpu</strong></a> ·
+  <a href="packages/packer/README.md"><strong>ignis-webgpu-packer</strong></a> ·
+  <a href="CONTRIBUTING.md"><strong>Contributing</strong></a>
+</p>
 
 Ignis does not wrap ONNX Runtime, llama.cpp/WASM, or Apache TVM. Every layer—from its 256-byte-aligned `.ignis` binary shards and OPFS `SyncAccessHandle` streaming loader, to strict W3C baseline WGSL kernels, Rust/WASM tokenizers, JSON Schema FSM logit masking, and GPU-resident speculative decoding—is engineered specifically around browser sandbox constraints (`ArrayBuffer` caps, COOP/COEP isolation, WGSL subgroup divergence, and VRAM limits).
-
-## Why Ignis?
-
-- **OPFS Externalized Embeddings & 2.8 GiB PLE Streaming**: Instead of pinning massive `vocab_size × hidden_dim` embedding matrices in VRAM, `embd.ignis` and Gemma 4's `2.82 GB` `ple_embd.ignis` live in Origin Private File System and stream row-by-row via Worker `createSyncAccessHandle()` (`~0.1 ms` per token lookup, saving gigabytes of GPU memory).
-- **One Engine, Full-Omni Native Pipelines**: Declarative architecture blueprints (`packer/blueprints.py` + `kernels/codegen.mjs` + `runtime/ignis-engine.mjs`) run standard Transformers (`Spark-X2.6-4B`, `Llama`, `Qwen2/3`, `Phi3`), Hybrid ShortConv+SWA Audio/Vision Omni (`LiquidAI/LFM3-Omni-2B` with 24 kHz `LiquidCodec` speech synthesis), and `262K`-vocab Per-Layer-Embedding Omni (`google/gemma-4-E4B-it` with SigLIP2 Vision + Chunked Conformer Audio) without per-model JS rewrites.
-- **Strict W3C WebGPU Baseline + Verified Tiered Degradation**: Zero experimental `@builtin(subgroup_id)` or `@builtin(num_subgroups)` assumptions (which break Chrome/Edge even when `subgroups` is advertised). Includes bit-accurate `useSubgroups = false` shared-memory tree reduction (`cos = 0.99999999996`) and **`INT3_G64_ASYM`** quantization (packing `32 × 3-bit` weights into `3 × u32`, shrinking `LFM3-Omni-2B` GPU weights to **`755.1 MiB`**).
-- **Sub-Millisecond Rust/WASM Tokenizer & JSON Schema FSM**: Single zero-JS-dependency `ignis_tokenizer.wasm` supports Byte-Level BPE (`131K` Spark) and SentencePiece `ByteFallback` (`128K` LFM3, `262K` Gemma-4) with 100% Oracle parity, plus a compiled NFA -> DFA -> packed `u32` bitset FSM (`response_format`) masking `131K+` logits in **`0.285 ms/tok` median** (`p95 = 2.05 ms/tok`).
-- **Dual-Mode Lossless Speculative Decoding**:
-  - **N-gram Lookup** (0 MiB extra VRAM): `84.5%` acceptance and **`134.0 tok/s` (`1.30x`)** on Spark-X2.6-4B.
-  - **Draft-Target** (`INT3_G64` draft -> `INT4/INT8` target): Zero-readback GPU `ShortConv` state snapshot/rollback + Leviathan lossless rejection sampling, bit-identical to greedy autoregressive decoding (`90.2%` acceptance on LFM3-Omni-2B).
-
-## Architecture
-
-```mermaid
-flowchart LR
-  subgraph Storage["Browser Storage & Network"]
-    CDN["HTTPS Shards / Local Model"] -->|"Range stream (no full-RAM blob)"| OPFS["OPFS Cache (.ignis)"]
-    OPFS -->|"SyncAccessHandle row reads"| Embd["Host Row Lookup (embd.ignis / ple_embd.ignis)"]
-  end
-
-  subgraph Worker["Dedicated Web Worker (Isolated Heap ~1-73 MB)"]
-    Tok["Rust/WASM Tokenizer & JSON Schema DFA FSM"] --> Engine["IgnisEngine (Declarative Blueprint)"]
-    MM["Lfm3OmniRuntime / Gemma4OmniRuntime (Vision + Audio + 24 kHz LiquidCodec)"] --> Engine
-    Spec["Speculative Coordinator (N-gram / Draft-Target)"] --> Engine
-  end
-
-  subgraph WebGPU["Strict W3C WebGPU Baseline"]
-    Embd -->|"16 MiB StagingBuffer"| Shards["VRAM Quants (INT3_G64 / INT4_G64 / INT8_G64)"]
-    Engine -->|"Single-submit Decode Graph"| Kernels["WGSL Mega-Kernels & Z-Tiled Output"]
-    Kernels -->|"Optional Shared-Memory Fallback"| Shards
-  end
-```
 
 ## Verified Benchmarks (Thorium 138 · AMD Radeon RX 6800 XT)
 
@@ -52,6 +31,31 @@ Every number below is measured on real desktop hardware in Thorium 138 (`shader-
 | **`INT3_G64` Degradation** (`LFM3-Omni-2B` body) | **`755.10 MiB`** | `useSubgroups=false` cosine `0.99999999996`; Q3 greedy token IDs match Q4 100% |
 | **JSON Schema FSM** (`131K / 128K` vocabs × 3 schemas) | `+0 MiB` VRAM | **6/6** strictly valid JSON; **`0.285 ms/tok`** median mask time (`n = 162`) |
 | **Speculative Decode** (`N-gram k=5` / `INT3->INT4` Draft-Target) | `0 MiB` (N-gram) | Spark N-gram **`134.0 tok/s` (`1.30x`)**; LFM3 Draft-Target `90.2%` accept (`4.36 tok/round`) |
+
+## Why Ignis?
+
+- **OPFS Externalized Embeddings & 2.8 GiB PLE Streaming**: Instead of pinning massive `vocab_size × hidden_dim` embedding matrices in VRAM, `embd.ignis` and Gemma 4's `2.82 GB` `ple_embd.ignis` live in Origin Private File System and stream row-by-row via Worker `createSyncAccessHandle()` (`~0.1 ms` per token lookup, saving gigabytes of GPU memory).
+- **One Engine, Full-Omni Native Pipelines**: Declarative architecture blueprints (`packer/blueprints.py` + `kernels/codegen.mjs` + `runtime/ignis-engine.mjs`) run standard Transformers (`Spark-X2.6-4B`, `Llama`, `Qwen2/3`, `Phi3`), Hybrid ShortConv+SWA Audio/Vision Omni (`LiquidAI/LFM3-Omni-2B` with 24 kHz `LiquidCodec` speech synthesis), and `262K`-vocab Per-Layer-Embedding Omni (`google/gemma-4-E4B-it` with SigLIP2 Vision + Chunked Conformer Audio) without per-model JS rewrites.
+- **Strict W3C WebGPU Baseline + Verified Tiered Degradation**: Zero experimental `@builtin(subgroup_id)` or `@builtin(num_subgroups)` assumptions (which break Chrome/Edge even when `subgroups` is advertised). Includes bit-accurate `useSubgroups = false` shared-memory tree reduction (`cos = 0.99999999996`) and **`INT3_G64_ASYM`** quantization (packing `32 × 3-bit` weights into `3 × u32`, shrinking `LFM3-Omni-2B` GPU weights to **`755.1 MiB`**).
+- **Sub-Millisecond Rust/WASM Tokenizer & JSON Schema FSM**: Single zero-JS-dependency `ignis_tokenizer.wasm` supports Byte-Level BPE (`131K` Spark) and SentencePiece `ByteFallback` (`128K` LFM3, `262K` Gemma-4) with 100% Oracle parity, plus a compiled NFA -> DFA -> packed `u32` bitset FSM (`response_format`) masking `131K+` logits in **`0.285 ms/tok` median** (`p95 = 2.05 ms/tok`).
+- **Dual-Mode Lossless Speculative Decoding**:
+  - **N-gram Lookup** (0 MiB extra VRAM): `84.5%` acceptance and **`134.0 tok/s` (`1.30x`)** on Spark-X2.6-4B.
+  - **Draft-Target** (`INT3_G64` draft -> `INT4/INT8` target): Zero-readback GPU `ShortConv` state snapshot/rollback + Leviathan lossless rejection sampling, bit-identical to greedy autoregressive decoding (`90.2%` acceptance on LFM3-Omni-2B).
+
+## Ignis vs. WebLLM
+
+| Dimension | **Ignis** | **WebLLM (MLC-LLM / TVM)** |
+| :--- | :--- | :--- |
+| **Runtime & Build Pipeline** | Zero-dependency JS + pure W3C WGSL mega-kernels + single Rust/WASM (`1.3 MiB`); pack Safetensors in minutes via pure Python (`ignis-pack`) without compiling TVM/C++ | Compiles models through Apache TVM + C++/Emscripten WASM runtime (`mlc_llm` toolchain required per compiled model library) |
+| **Adding Architectures** | Declarative JSON blueprint + WGSL codegen; hybrid ShortConv, KV-sharing, and PLE architectures run on one shared engine | Requires TVM Relax IR graph compilation & compiled `.wasm` shader libraries per architecture/context configuration |
+| **OPFS Externalized Embeddings & VRAM** | Externalizes `embd.ignis` & Gemma 4's `2.82 GB` `ple_embd.ignis` to OPFS (`SyncAccessHandle` row reads, `~0.1 ms`), saving GiBs of VRAM on large-vocab models | Weights and embedding tables are loaded into WebGPU GPU buffers via Cache API / IndexedDB chunks |
+| **Full-Omni Multimodal & Audio Output** | Native vision + audio-in + 24 kHz `LiquidCodec` neural audio synthesis (`LFM3-Omni-2B`, `Gemma-4-E4B-it`) | Primarily text & vision-language (`Phi-3.5-vision`, `Qwen2-VL`, `Llama-3.2-Vision`); no native neural speech synthesis |
+| **Structured JSON Schema FSM** | Built-in Rust/WASM Thompson NFA -> DFA -> packed `u32` bitset masking across `131K+` tokens (`0.285 ms/tok` median) | Employs WASM XGrammar engine for CFG / JSON schema constrained decoding |
+| **Speculative Decoding** | Built-in **N-gram Lookup** (`0 MiB` extra VRAM, `1.30x` on Spark-4B) + GPU **Draft-Target** (`INT3` -> `INT4`/`INT8`) | Focused on standard autoregressive decoding |
+| **Quantization & WGSL Portability** | `INT4_G64` + `INT8_G64` LM Head + `INT3_G64` degradation (`755 MiB` LFM3-2B); zero `@builtin(subgroup_id)` with verified shared-memory fallback | Broad `q4f16_1` / `q4f32_1` / `q0f16` TVM quantization presets; mature Chrome Extension & Service Worker adapters |
+| **Ecosystem & Model Catalog** | Focused reference blueprints (`Spark`, `LFM3-Omni`, `Gemma 4`, `Llama`/`Qwen`/`Phi`) & customizable `ignis-webgpu-packer` | Wide pre-built MLC Hub catalog (`Llama`, `Qwen`, `Mistral`, `Phi`, `SmolLM`, `Gemma 2`) and longstanding community adoption |
+
+## Architecture
 
 ## Quickstart
 
