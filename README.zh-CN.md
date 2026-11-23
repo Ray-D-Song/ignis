@@ -27,7 +27,7 @@
 | **Rust/WASM JSON Schema FSM** | **`0.285 ms/tok`** 中位掩码开销 | Spark-4B + LFM3 × 3 类复杂 Schema **6/6 100% 合法严格匹配** |
 | **双模式投机解码 (`N-gram` + `Draft-Target`)** | Zero-VRAM / Dual-Engine | Greedy **100% 比特级等价**；Spark N-gram **`134.0 tok/s`（`1.30x`）**；LFM3 ShortConv 接受率 **`90.2%`** |
 
-## 核心能力全景
+## 为什么选择 Ignis？
 
 * **多架构统一 Declarative Blueprint 引擎**：
   * 原生一套引擎支持 **Spark-X2.6-4B**（Ring SWA + Full + Sigmoid Gate）、**Llama / Qwen2 / Qwen3 / Phi3**、**LiquidAI/LFM3-Omni-2B**（ShortConv `K=7` + SWA + Full + 图像/音频理解 + DepthDecoder + 24 kHz LiquidCodec 语音合成）与 **google/gemma-4-E4B-it**（`262K` 词表 Z-Tiling + 42 层 KV-Sharing + 外置 `INT8_ROW` PLE + SigLIP2 + Chunked Conformer）。
