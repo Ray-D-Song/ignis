@@ -11,6 +11,60 @@ function alignUp(v, align = 4) {
   return Math.ceil(v / align) * align;
 }
 
+function delayMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isLockError(err) {
+  return Boolean(
+    err &&
+      (err.name === 'NoModificationAllowedError' ||
+        /NoModificationAllowedError|Access Handles cannot be created/i.test(String(err.message || err))),
+  );
+}
+
+async function tryOpenReadSyncHandle(fh) {
+  if (typeof fh.createSyncAccessHandle !== 'function') return null;
+  const openOnce = async () => {
+    try {
+      return await fh.createSyncAccessHandle({ mode: 'read-only' });
+    } catch (err) {
+      if (err?.name === 'TypeError') {
+        return await fh.createSyncAccessHandle();
+      }
+      throw err;
+    }
+  };
+  try {
+    return await openOnce();
+  } catch (err) {
+    if (!isLockError(err)) throw err;
+    await delayMs(120);
+    try {
+      return await openOnce();
+    } catch (retryErr) {
+      if (isLockError(retryErr)) return null;
+      throw retryErr;
+    }
+  }
+}
+
+async function openWriteSyncHandleWithRetry(fh) {
+  const retryDelays = [100, 200, 400, 800];
+  for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
+    try {
+      return await fh.createSyncAccessHandle();
+    } catch (err) {
+      if (isLockError(err) && attempt < retryDelays.length) {
+        await delayMs(retryDelays[attempt]);
+        continue;
+      }
+      throw err;
+    }
+  }
+  return fh.createSyncAccessHandle();
+}
+
 async function getModelDir(modelKey) {
   const root = await navigator.storage.getDirectory();
   const ignisDir = await root.getDirectoryHandle(CACHE_ROOT, { create: true });
@@ -30,7 +84,7 @@ async function readJsonFromDir(dirHandle, filename) {
 async function writeBytesToOpfs(dirHandle, filename, uint8OrBuffer) {
   const fh = await dirHandle.getFileHandle(filename, { create: true });
   if (typeof fh.createSyncAccessHandle === 'function') {
-    const access = await fh.createSyncAccessHandle();
+    const access = await openWriteSyncHandleWithRetry(fh);
     try {
       access.truncate(0);
       const data = uint8OrBuffer instanceof Uint8Array ? uint8OrBuffer : new Uint8Array(uint8OrBuffer);
@@ -68,7 +122,7 @@ async function streamUrlToOpfs(url, dirHandle, filename, expectedBytes, onChunk)
   };
 
   if (typeof fh.createSyncAccessHandle === 'function') {
-    const access = await fh.createSyncAccessHandle();
+    const access = await openWriteSyncHandleWithRetry(fh);
     try {
       access.truncate(0);
       let offset = 0;
@@ -130,7 +184,19 @@ export async function ensureOpfsModel(modelBaseUrl, modelKey, { onProgress } = {
   const manifestText = await manifestResp.text();
   const manifest = JSON.parse(manifestText);
 
-  const cachedState = (await readJsonFromDir(dirHandle, '.cache-state.json')) || { shards: {} };
+  let hasMatchingManifest = false;
+  try {
+    const mfHandle = await dirHandle.getFileHandle('manifest.json');
+    const mfFile = await mfHandle.getFile();
+    if (mfFile.size === manifestText.length) {
+      hasMatchingManifest = (await mfFile.text()) === manifestText;
+    }
+  } catch {
+    hasMatchingManifest = false;
+  }
+
+  const existingCacheState = await readJsonFromDir(dirHandle, '.cache-state.json');
+  const cachedState = existingCacheState || { shards: {} };
   let cacheHits = 0;
   let cacheMisses = 0;
 
@@ -214,12 +280,14 @@ export async function ensureOpfsModel(modelBaseUrl, modelKey, { onProgress } = {
       cached: hasTokenizer,
     });
   }
+  let wroteTokenizer = false;
   if (!hasTokenizer) {
     const tokResp = await fetch(`${modelBaseUrl}/tokenizer.json`);
     if (tokResp.ok) {
       const tokBytes = new Uint8Array(await tokResp.arrayBuffer());
       await writeBytesToOpfs(dirHandle, 'tokenizer.json', tokBytes);
       cachedState.hasTokenizer = true;
+      wroteTokenizer = true;
     }
     if (onProgress) {
       onProgress({
@@ -236,8 +304,12 @@ export async function ensureOpfsModel(modelBaseUrl, modelKey, { onProgress } = {
     }
   }
 
-  await writeBytesToOpfs(dirHandle, 'manifest.json', new TextEncoder().encode(manifestText));
-  await writeBytesToOpfs(dirHandle, '.cache-state.json', new TextEncoder().encode(JSON.stringify(cachedState)));
+  if (!hasMatchingManifest || cacheMisses > 0 || wroteTokenizer) {
+    await writeBytesToOpfs(dirHandle, 'manifest.json', new TextEncoder().encode(manifestText));
+  }
+  if (!existingCacheState || cacheMisses > 0 || wroteTokenizer) {
+    await writeBytesToOpfs(dirHandle, '.cache-state.json', new TextEncoder().encode(JSON.stringify(cachedState)));
+  }
 
   return { dirHandle, manifest, cacheHits, cacheMisses, hasTokenizer: !!cachedState.hasTokenizer };
 }
@@ -296,8 +368,8 @@ export async function uploadOpfsShardsToGpu(
         label: sInfo.file,
       });
 
-      if (typeof fh.createSyncAccessHandle === 'function') {
-        const access = await fh.createSyncAccessHandle();
+      const access = await tryOpenReadSyncHandle(fh);
+      if (access) {
         try {
           const chunk = new Uint8Array(Math.min(stagingBytes, sInfo.bytes));
           let offset = 0;
@@ -375,8 +447,8 @@ export class OpfsEmbeddingTable {
 
   static async open(dirHandle, embdMeta, maxCacheRows = 4096, filename = 'embd.ignis') {
     const fh = await dirHandle.getFileHandle(filename);
-    if (typeof fh.createSyncAccessHandle === 'function') {
-      const access = await fh.createSyncAccessHandle();
+    const access = await tryOpenReadSyncHandle(fh);
+    if (access) {
       return new OpfsEmbeddingTable(access, null, embdMeta.offset, embdMeta.row_stride, embdMeta.shape[1], maxCacheRows);
     }
     const file = await fh.getFile();
