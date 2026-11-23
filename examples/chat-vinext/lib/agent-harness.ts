@@ -749,9 +749,12 @@ export async function runAgentTurn(params: {
     const before = existing ? existing.content : '';
 
     if (existing && normalizeToLf(before).trim() === normalizeToLf(content).trim()) {
+      const alreadyModifiedThisTurn = checkpoints.some((c) => normalizeWorkspacePath(c.path) === targetPath);
       return {
         ok: false,
-        error: `write rejected: content is identical to existing ${targetPath}. Write new application code implementing the user's request.`,
+        error: alreadyModifiedThisTurn
+          ? `[Pi Harness]: ${targetPath} already has this exact updated content from your earlier edit. Do NOT call "write" on ${targetPath} again — call "reply" now.`
+          : `write rejected: content is identical to existing ${targetPath}. Write new application code implementing the user's request.`,
       };
     }
 
@@ -1131,7 +1134,9 @@ export async function runAgentTurn(params: {
       const outText = ev.result.content.map((c) => c.text).join('\n');
       const dur = performance.now() - (actionStartTimeMap.get(ev.toolCallId) ?? performance.now());
       const isRepeatedGuard =
-        (ev.toolName === 'read' || ev.toolName === 'bash') && ev.isError && outText.startsWith('[Pi Harness]:');
+        (ev.toolName === 'read' || ev.toolName === 'bash' || ev.toolName === 'write') &&
+        ev.isError &&
+        outText.startsWith('[Pi Harness]:');
       lastToolError = ev.isError && !isRepeatedGuard;
 
       if (!isRepeatedGuard) {
@@ -1536,9 +1541,12 @@ export async function runAgentTurn(params: {
       !lastToolError &&
       toolResults.some(
         (tr) =>
-          tr.toolName === 'bash' &&
-          tr.isError &&
-          Boolean(tr.content[0]?.text?.startsWith('[Pi Harness]: Command')),
+          (tr.toolName === 'bash' &&
+            tr.isError &&
+            Boolean(tr.content[0]?.text?.startsWith('[Pi Harness]: Command'))) ||
+          (tr.toolName === 'write' &&
+            tr.isError &&
+            Boolean(tr.content[0]?.text?.startsWith('[Pi Harness]:'))),
       ),
     getSteeringMessages: ({ lastAssistantMessage }) => {
       if (lastAssistantMessage.stopReason !== 'stop') return [];
