@@ -21,16 +21,18 @@ Ignis does not wrap ONNX Runtime, llama.cpp/WASM, or Apache TVM. Every layer—f
 
 ## Verified Benchmarks (Thorium 138 · AMD Radeon RX 6800 XT)
 
-Every number below is measured on real desktop hardware in Thorium 138 (`shader-f16` + `subgroups`) against PyTorch BF16 reference outputs:
-
-| Model / Capability | GPU VRAM (Loaded) | Throughput / Accuracy |
-| :--- | :--- | :--- |
-| **Spark-X2.6-4B** (`INT4_G64` body, `INT8_G64` LM Head) | `2,371.34 MiB` (`+322 MiB` OPFS) | **`85.44 tok/s`** raw / **`86.0 -> 81.8 tok/s`** multi-turn chat (`cos = 0.9990–0.9997` vs BF16) |
-| **LiquidAI/LFM3-Omni-2B** (Text + Vision + Audio + 24 kHz Voice) | `1,054.86 MiB` (`+251.95 MiB` OPFS) | **15/15** PyTorch parity checks (`Text cos=0.9981`, `VQA 0.9981`, `Audio 0.9990`, `24 kHz WAV 0.9990`) |
-| **google/gemma-4-E4B-it** (`262K` Vocab + Q8 PLE + SigLIP2 + Conformer) | `2,588.7 MiB` base / `3,075.8 MiB` peak | **10/10** PyTorch parity checks (`Text cos=0.9988`, `VQA 0.9934`, `Audio 0.9590`, Top-1 match) |
-| **`INT3_G64` Degradation** (`LFM3-Omni-2B` body) | **`755.10 MiB`** | `useSubgroups=false` cosine `0.99999999996`; Q3 greedy token IDs match Q4 100% |
-| **JSON Schema FSM** (`131K / 128K` vocabs × 3 schemas) | `+0 MiB` VRAM | **6/6** strictly valid JSON; **`0.285 ms/tok`** median mask time (`n = 162`) |
-| **Speculative Decode** (`N-gram k=5` / `INT3->INT4` Draft-Target) | `0 MiB` (N-gram) | Spark N-gram **`134.0 tok/s` (`1.30x`)**; LFM3 Draft-Target `90.2%` accept (`4.36 tok/round`) |
+| Metric (Qwen3-1.7B · 4-bit · `ctx=4096`) | **Ignis** (`qwen3-1.7b-ignis-q4`) | **WebLLM** (`Qwen3-1.7B-q4f16_1-MLC`) | Delta |
+| :--- | :--- | :--- | :--- |
+| **GPU Weight Shards / Memory Layout** | `923.40 MiB` GPU (`+299.07 MiB` OPFS externalized embd) | `923.16 MiB` `.bin` (`2036.66 MB` est. VRAM) | Same GPU weights; Ignis keeps embd on OPFS |
+| **Local Storage Usage** (`navigator.storage`) | `1293.38 MB` (OPFS) | `986.19 MB` (Cache API) | +307.2 MB disk for lower VRAM |
+| **Cold / Warm Initialization** | `6432.4 ms` / `2865.9 ms` | `6416.8 ms` / `2865.6 ms` | Parity |
+| **First-Run Warmup (TTFT / Decode)** | **`79.6 ms`** / **`90.81 tok/s`** | `16061.0 ms` / `30.51 tok/s` | No first-query shader compile stall |
+| **Short Prompt Decode** (`~128 tok`, 3-run avg) | **`90.30 tok/s`** | `53.94 tok/s` | **1.67×** |
+| **Short Prompt Prefill** (3-run avg) | **`841.0 tok/s`** | `481.7 tok/s` | **1.75×** |
+| **Medium Context Prefill / TTFT** (`~450 tok`, 2-run avg) | **`918.0 tok/s`** / **`483.7 ms`** | `593.1 tok/s` / `767.2 ms` | **1.55×** / **-37.0% TTFT** |
+| **Medium Context Decode** (2-run avg) | **`92.11 tok/s`** | `51.38 tok/s` | **1.79×** |
+| **Sustained Decode** (`~256 tok`, 2-run avg) | **`96.84 tok/s`** | `52.83 tok/s` | **1.83×** |
+| **Repetitive Text** (N-gram `k=5` vs standard) | **`180.82 tok/s`** (`94/125` accepted) | `53.67 tok/s` (standard) | **3.37×** |
 
 ## Why Ignis?
 

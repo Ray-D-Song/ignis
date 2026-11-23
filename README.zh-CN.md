@@ -18,14 +18,18 @@
 
 ## 真机实测指标摘要（Thorium 138 · AMD RX 6800 XT）
 
-| 模型 / 能力 | 显存 / 耗时 | 精度 / 速度实测结果 |
-| :--- | :--- | :--- |
-| **Spark-X2.6-4B** (`INT8_G64` LM Head) | `2.32 GiB` VRAM | Wall **`85.4 tok/s`**（`vinext` 多轮 `86.0 / 81.8 tok/s`），vs BF16 `cos=0.9990~0.9997` |
-| **LFM3-Omni-2B** (Full Omni) | `1054.86 MiB` GPU | 15/15 全模态对拍全过；Text `cos=0.9981` / VQA `cos=0.9981` / Audio `cos=0.9990` / 24kHz WAV `cos=0.9990` |
-| **Gemma-4-E4B-it** (Full Omni + Q8 PLE) | `2588.7 MiB` Base / `3075.8 MiB` Peak | 10/10 全模态对拍全过；Text `cos=0.9988` / VQA `cos=0.9934` / Audio `cos=0.9590`（`Top-1` 全中） |
-| **`INT3_G64` 硬件降级 (`LFM3-2B`)** | **`755.10 MiB`** GPU | `useSubgroups=false` 余弦 `0.99999999996`；Q3 Greedy Token IDs 与 Q4 100% 一致 |
-| **Rust/WASM JSON Schema FSM** | **`0.285 ms/tok`** 中位掩码开销 | Spark-4B + LFM3 × 3 类复杂 Schema **6/6 100% 合法严格匹配** |
-| **双模式投机解码 (`N-gram` + `Draft-Target`)** | Zero-VRAM / Dual-Engine | Greedy **100% 比特级等价**；Spark N-gram **`134.0 tok/s`（`1.30x`）**；LFM3 ShortConv 接受率 **`90.2%`** |
+| 指标（Qwen3-1.7B · 4-bit · `ctx=4096`） | **Ignis** (`qwen3-1.7b-ignis-q4`) | **WebLLM** (`Qwen3-1.7B-q4f16_1-MLC`) | 对比 |
+| :--- | :--- | :--- | :--- |
+| **GPU 权重分片 / 显存形态** | `923.40 MiB` GPU（`+299.07 MiB` OPFS 外置 Embedding） | `923.16 MiB` `.bin`（预估 `2036.66 MB` VRAM） | GPU 权重持平，Ignis 词表常驻 OPFS |
+| **本地缓存占用**（`navigator.storage`） | `1293.38 MB`（OPFS） | `986.19 MB`（Cache API） | +307.2 MB 换取更低显存占用 |
+| **冷启动 / 热启动初始化** | `6432.4 ms` / `2865.9 ms` | `6416.8 ms` / `2865.6 ms` | 基本持平 |
+| **首次热身推理（TTFT / Decode）** | **`79.6 ms`** / **`90.81 tok/s`** | `16061.0 ms` / `30.51 tok/s` | 无首跑着色器卡顿 |
+| **短 Prompt Decode**（`~128 tok`，3 次均值） | **`90.30 tok/s`** | `53.94 tok/s` | **1.67×** |
+| **短 Prompt Prefill**（3 次均值） | **`841.0 tok/s`** | `481.7 tok/s` | **1.75×** |
+| **中等上下文 Prefill / TTFT**（`~450 tok`，2 次均值） | **`918.0 tok/s`** / **`483.7 ms`** | `593.1 tok/s` / `767.2 ms` | **1.55×** / **TTFT -37.0%** |
+| **中等上下文 Decode**（2 次均值） | **`92.11 tok/s`** | `51.38 tok/s` | **1.79×** |
+| **较长文本持续生成**（`~256 tok`，2 次均值） | **`96.84 tok/s`** | `52.83 tok/s` | **1.83×** |
+| **高重复文本生成**（N-gram `k=5` vs 常规解码） | **`180.82 tok/s`**（`94/125` 命中） | `53.67 tok/s`（常规自回归） | **3.37×** |
 
 ## 为什么选择 Ignis？
 
