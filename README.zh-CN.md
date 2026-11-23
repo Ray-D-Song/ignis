@@ -57,6 +57,18 @@
 | **量化格式与驱动兼容性** | `INT4_G64` + `INT8_G64` LM Head + `INT3_G64` 硬件降级（LFM3-2B 仅 `755 MiB`）；全内核禁用 `@builtin(subgroup_id)` 并提供共享内存无误差回退 | 提供丰富的 `q4f16_1` / `q4f32_1` / `q0f16` 量化预设，Chrome 插件与 Service Worker 生态非常成熟 |
 | **生态与预构建模型库** | 聚焦高效参考架构（`Spark`、`LFM3-Omni`、`Gemma 4`、`Llama`/`Qwen`/`Phi`）与轻量化自有打包工具 | 拥有广泛的 MLC Hub 预编译模型仓库（`Llama`、`Qwen`、`Mistral`、`Phi`、`SmolLM`、`Gemma 2`）与长期社区沉淀 |
 
+### Ignis 的核心优势与什么时候应该采用 Ignis
+
+当你的浏览器端应用命中以下任意场景时，推荐采用 **Ignis**：
+
+- **显存预算紧张或超大词表模型部署**：利用 OPFS Worker 同步行读取外置 Embedding / PLE 表（如 Gemma 4 高达 `2.82 GB` 的 `ple_embd.ignis`）并配合 `INT3_G64` 量化降级（将 `LFM3-Omni-2B` GPU 权重压至 `755.1 MiB`），在消费级笔记本与浏览器显存受限环境下也能跑起多模态大模型。
+- **需要原生 Full-Omni 视觉、语音输入与语音播报**：同一运行时内置图像理解、音频理解与 `24 kHz` `LiquidCodec` 神经网络语音合成，适合实时语音助手与多模态交互。
+- **构建浏览器原生 Agent、结构化工具调用与代码/JSON 编辑**：自研 Rust/WASM JSON Schema FSM 约束解码（中位 `0.285 ms/tok`）可 100% 保证合法 JSON 工具输出，叠加零额外显存的 **N-gram**（`Spark-4B` `134.0 tok/s` / `1.30x`）与 **Draft-Target** 无损投机解码显著提升重复代码或结构化文本生成速度。
+- **不想维护 TVM/C++ 编译链、需要快速接入自有或新架构模型**：纯 Python CLI（`ignis-webgpu-packer`）分钟级打包 HuggingFace Safetensors，一套声明式引擎直接支持 Ring SWA、ShortConv、KV 共享、PLE 等混合架构，打包静态前端资源零外部运行时依赖。
+- **需要更高的跨驱动 / 跨浏览器 WebGPU 稳定性**：严格遵循 W3C WebGPU 基线（禁用高风险的 `@builtin(subgroup_id)` 假设），并提供比特级精确的 `useSubgroups = false` 共享内存回退路径。
+
+> 如果你的核心诉求是直接复用 MLC Hub 现成的海量预编译纯文本/常见 VLM 模型，或依赖成熟 Chrome 扩展 / Service Worker 模板，WebLLM 会是更省心的选择。
+
 ## 快速开始与自动化测试
 
 ```bash

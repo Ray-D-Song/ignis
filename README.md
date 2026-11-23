@@ -55,6 +55,18 @@ Every number below is measured on real desktop hardware in Thorium 138 (`shader-
 | **Quantization & WGSL Portability** | `INT4_G64` + `INT8_G64` LM Head + `INT3_G64` degradation (`755 MiB` LFM3-2B); zero `@builtin(subgroup_id)` with verified shared-memory fallback | Broad `q4f16_1` / `q4f32_1` / `q0f16` TVM quantization presets; mature Chrome Extension & Service Worker adapters |
 | **Ecosystem & Model Catalog** | Focused reference blueprints (`Spark`, `LFM3-Omni`, `Gemma 4`, `Llama`/`Qwen`/`Phi`) & customizable `ignis-webgpu-packer` | Wide pre-built MLC Hub catalog (`Llama`, `Qwen`, `Mistral`, `Phi`, `SmolLM`, `Gemma 2`) and longstanding community adoption |
 
+### When to Choose Ignis
+
+Choose **Ignis** when your browser application needs one or more of the following advantages:
+
+- **Tight GPU VRAM budgets or huge vocabularies**: OPFS-externalized embedding & PLE tables (`2.82 GB` `ple_embd.ignis` for Gemma 4) plus `INT3_G64` degradation (`755.1 MiB` GPU weights for `LFM3-Omni-2B`) run multi-billion-parameter models in browser GPUs where pinning full tables in VRAM is tight or fails.
+- **Full-Omni speech & multimodal interaction**: Native single-worker support for image inputs, audio inputs, and `24 kHz` neural voice output (`LiquidCodec`) alongside text.
+- **Browser-native Agents, structured outputs, or code/JSON editing**: Built-in Rust/WASM JSON Schema FSM decoding (`0.285 ms/tok` median) guarantees schema-valid tool calls, while zero-VRAM **N-gram** (`134.0 tok/s` / `1.30x` on Spark-4B) and **Draft-Target** speculative decoding accelerate repetitive edits without sacrificing lossless greedy parity.
+- **Fast iteration on custom HuggingFace checkpoints without TVM C++ builds**: Pack models to 256B-aligned `.ignis` shards in minutes with pure Python (`ignis-webgpu-packer`) and run hybrid architectures (Ring SWA, ShortConv, KV-Sharing, PLE) via declarative blueprints.
+- **Broad WebGPU driver portability**: Strict W3C WGSL baseline avoids experimental `@builtin(subgroup_id)` assumptions and includes a bit-accurate shared-memory fallback (`useSubgroups = false`).
+
+> If you only need standard text/vision chat from MLC's existing pre-compiled Hub catalog or mature Chrome Extension service-worker templates, **WebLLM** is a strong, battle-tested choice.
+
 ## Architecture
 
 ## Quickstart
