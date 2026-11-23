@@ -1189,7 +1189,28 @@ html, body {
 .tool-stack {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
+}
+
+.tool-step-group {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.tool-step-thought {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  padding-left: 10px;
+  border-left: 2px solid var(--border-strong);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.tool-step-thought.is-streaming {
+  border-left-color: var(--accent-border);
+  color: var(--text);
 }
 
 .tool-call-card {

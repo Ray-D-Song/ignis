@@ -351,8 +351,8 @@ export function WorkspacePane(props: WorkspacePaneProps) {
                       <span>{entry.title}</span>
                     </span>
                     <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-muted)' }}>
-                      {entry.fsmMedianMs !== undefined && entry.fsmMedianMs !== null
-                        ? `${entry.fsmMedianMs.toFixed(2)}ms/t · `
+                      {entry.decodeTokPerSec !== undefined && entry.decodeTokPerSec !== null && entry.decodeTokPerSec > 0
+                        ? `${entry.decodeTokPerSec.toFixed(1)} tok/s · `
                         : ''}
                       {Math.max(1, Math.round(entry.durationMs))} ms
                     </span>
@@ -586,7 +586,7 @@ export function WorkspacePane(props: WorkspacePaneProps) {
                   onClick={() => onRunShowcase('fsm')}
                 >
                   <span>JSON Schema FSM</span>
-                  <small>0.3 ms/tok DFA</small>
+                  <small>WASM DFA</small>
                 </button>
                 <button
                   id="showcase-ngram"

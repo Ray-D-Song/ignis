@@ -20,6 +20,7 @@ export interface PiToolCallContent {
   arguments: Record<string, unknown>;
   thought?: string;
   fsmMedianMs?: number | null;
+  decodeTokPerSec?: number | null;
   promptTokens?: number;
   durationMs?: number;
 }

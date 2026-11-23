@@ -273,20 +273,20 @@ async function main() {
     await page.click('#tab-btn-preview');
 
     const selectedModel = await page.locator('#model-select').inputValue();
-    if (selectedModel !== 'spark-4b-q8head') {
-      throw new Error(`Expected default CDN preset 'spark-4b-q8head', got '${selectedModel}'`);
+    if (selectedModel !== 'spark-1.7b-q8head') {
+      throw new Error(`Expected default CDN preset 'spark-1.7b-q8head', got '${selectedModel}'`);
     }
     const cdnOptions = await page.locator('#model-select option').evaluateAll((opts) =>
       opts.map((o) => o.value),
     );
-    if (!cdnOptions.includes('spark-1.7b-q8head')) {
-      throw new Error(`Expected CDN model list to include 'spark-1.7b-q8head', got ${JSON.stringify(cdnOptions)}`);
+    if (!cdnOptions.includes('spark-4b-q8head')) {
+      throw new Error(`Expected CDN model list to include 'spark-4b-q8head', got ${JSON.stringify(cdnOptions)}`);
     }
     if (cdnOptions.includes('gemma-4-e4b')) {
       throw new Error(`Expected 'gemma-4-e4b' to be removed from CDN model selector, got ${JSON.stringify(cdnOptions)}`);
     }
 
-    // 4. Load default Spark-X2.6 4B cross-origin from Server B into OPFS + WebGPU
+    // 4. Load default Spark-X2.6 1.7B cross-origin from Server B into OPFS + WebGPU
     await page.click('#btn-load-model');
     await page.waitForFunction(
       () => document.getElementById('status-text')?.textContent?.includes('Ready · Spark'),
@@ -394,7 +394,7 @@ async function main() {
     if (typeof parsedJson.engine !== 'string' || typeof parsedJson.storage !== 'string' || typeof parsedJson.inBrowser !== 'boolean') {
       throw new Error(`FSM JSON missing expected typed properties: ${fsmAnswer}`);
     }
-    if (!fsmBadge.includes('JSON.parse ✓') || !fsmBadge.includes('ms/tok')) {
+    if (!fsmBadge.includes('JSON.parse ✓') || !fsmBadge.includes('tok/s')) {
       throw new Error(`Unexpected FSM badge text: "${fsmBadge}"`);
     }
 
@@ -414,11 +414,11 @@ async function main() {
       throw new Error(`Unexpected N-gram badge text: "${ngramBadge}"`);
     }
 
-    // 8. Switch to Spark-X2.6 1.7B, reset workspace, and verify Pi Agent Markdown Notes build
-    await page.selectOption('#model-select', 'spark-1.7b-q8head');
+    // 8. Switch to Spark-X2.6 4B, reset workspace, and verify Pi Agent Markdown Notes build
+    await page.selectOption('#model-select', 'spark-4b-q8head');
     await page.click('#btn-load-model');
     await page.waitForFunction(
-      () => document.getElementById('status-text')?.textContent?.includes('Ready · Spark-X2.6 1.7B'),
+      () => document.getElementById('status-text')?.textContent?.includes('Ready · Spark-X2.6 4B'),
       null,
       { timeout: 120000 },
     );
@@ -431,21 +431,21 @@ async function main() {
     await page.waitForFunction(
       () =>
         document.querySelectorAll('.msg.assistant').length >= 4 &&
-        document.getElementById('status-text')?.textContent?.includes('Ready · Spark-X2.6 1.7B'),
+        document.getElementById('status-text')?.textContent?.includes('Ready · Spark-X2.6 4B'),
       null,
       { timeout: 180000 },
     );
-    const spark17Tools = await page.locator('.msg.assistant').last().locator('.tool-call-summary').allInnerTexts();
-    const spark17Out = await page.locator('.msg.assistant .answer-body').last().innerText();
-    console.log('[spark-1.7b agent] tools=', spark17Tools.map((s) => s.replace(/\s+/g, ' ')), '| answer=', spark17Out.trim().slice(0, 140));
-    if (spark17Tools.length < 1 || !spark17Tools.some((s) => /Write|Edit/i.test(s))) {
+    const spark4Tools = await page.locator('.msg.assistant').last().locator('.tool-call-summary').allInnerTexts();
+    const spark4Out = await page.locator('.msg.assistant .answer-body').last().innerText();
+    console.log('[spark-4b agent] tools=', spark4Tools.map((s) => s.replace(/\s+/g, ' ')), '| answer=', spark4Out.trim().slice(0, 140));
+    if (spark4Tools.length < 1 || !spark4Tools.some((s) => /Write|Edit/i.test(s))) {
       await page.click('#tab-btn-trace').catch(() => {});
-      const spark17Traces = await page.locator('[data-testid="trace-entry"]').allInnerTexts().catch(() => []);
-      console.error('[spark-1.7b trace]', spark17Traces.map((s) => s.replace(/\s+/g, ' ')));
-      throw new Error(`Expected Spark-1.7B Pi Agent to execute Write/Edit tool call, got ${JSON.stringify(spark17Tools)}`);
+      const spark4Traces = await page.locator('[data-testid="trace-entry"]').allInnerTexts().catch(() => []);
+      console.error('[spark-4b trace]', spark4Traces.map((s) => s.replace(/\s+/g, ' ')));
+      throw new Error(`Expected Spark-4B Pi Agent to execute Write/Edit tool call, got ${JSON.stringify(spark4Tools)}`);
     }
-    if (spark17Out.trim().length < 5 || spark17Out.includes('\uFFFD')) {
-      throw new Error(`Unexpected Spark-1.7B Agent output: "${spark17Out}"`);
+    if (spark4Out.trim().length < 5 || spark4Out.includes('\uFFFD')) {
+      throw new Error(`Unexpected Spark-4B Agent output: "${spark4Out}"`);
     }
     const mdDeadline = Date.now() + 20000;
     let mdPreviewBody = '';
@@ -457,9 +457,9 @@ async function main() {
       await page.waitForTimeout(400);
     }
     const mdViteErrs = await previewFrame.locator('vite-error-overlay').count();
-    console.log('[spark-1.7b markdown preview]', mdPreviewBody.replace(/\s+/g, ' ').slice(0, 140), 'viteErrs=', mdViteErrs);
+    console.log('[spark-4b markdown preview]', mdPreviewBody.replace(/\s+/g, ' ').slice(0, 140), 'viteErrs=', mdViteErrs);
     if (!mdPreviewBody || mdPreviewBody.includes('Edit src/App.jsx and save to test HMR') || mdViteErrs > 0) {
-      throw new Error(`Expected Spark-1.7B Markdown notes preview without Vite errors, got "${mdPreviewBody}" (viteErrs=${mdViteErrs})`);
+      throw new Error(`Expected Spark-4B Markdown notes preview without Vite errors, got "${mdPreviewBody}" (viteErrs=${mdViteErrs})`);
     }
 
     // 9. Switch to LFM3-Omni 2B for Multimodal Vision VQA (demo-shapes.png)

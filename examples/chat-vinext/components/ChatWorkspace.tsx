@@ -1031,6 +1031,7 @@ export function ChatWorkspace({
                 meta,
                 fsmValid,
                 fsmMedianMs,
+                decodeTokPerSec: res.decodeTokPerSec,
                 specAccepted,
                 specProposed,
               }
@@ -1162,13 +1163,23 @@ export function ChatWorkspace({
         },
         callbacks: {
           onStatusText: (txt) => setStatusText(txt),
+          onStepThought: (thought, liveTps) => {
+            setMessages((prev) =>
+              prev.map((m) => (m.id === assistantId ? { ...m, streamingThought: thought } : m)),
+            );
+            if (liveTps > 0) {
+              setStatusText(`${lang === 'zh' ? '思考中' : 'Thinking'} · ${liveTps.toFixed(1)} tok/s`);
+            }
+          },
           onToolStepStart: (step, max) => {
             setStatusText(t.loadingStep(step, max, 'FSM Tool'));
           },
           onToolStepComplete: (record: AgentToolCallRecord) => {
             setMessages((prev) =>
               prev.map((m) =>
-                m.id === assistantId ? { ...m, toolCalls: [...(m.toolCalls || []), record] } : m,
+                m.id === assistantId
+                  ? { ...m, streamingThought: undefined, toolCalls: [...(m.toolCalls || []), record] }
+                  : m,
               ),
             );
             setStatusText(t.loadingStep(record.step, 12, record.tool));
@@ -1222,6 +1233,8 @@ export function ChatWorkspace({
             ? {
                 ...m,
                 content: result.finalText,
+                streamingThought: undefined,
+                replyThought: result.replyThought,
                 audioUrl: result.audioUrl,
                 toolCalls: result.toolCalls,
                 checkpoints: result.checkpoints,

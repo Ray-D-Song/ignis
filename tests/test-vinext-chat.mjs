@@ -157,16 +157,16 @@ async function main() {
       throw new Error(`Expected toggle back to 'dark', got '${restoredDark}'`);
     }
 
-    // Verify default selected model is Spark-4B Q8Head & Spark-1.7B is selectable
+    // Verify default selected model is Spark-1.7B Q8Head & Spark-4B is selectable
     const selectedVal = await page.locator('#model-select').inputValue();
-    if (selectedVal !== 'spark-4b-q8head') {
-      throw new Error(`Expected default model spark-4b-q8head, got ${selectedVal}`);
+    if (selectedVal !== 'spark-1.7b-q8head') {
+      throw new Error(`Expected default model spark-1.7b-q8head, got ${selectedVal}`);
     }
     const modelOptions = await page.locator('#model-select option').evaluateAll((opts) =>
       opts.map((o) => o.value),
     );
-    if (!modelOptions.includes('spark-1.7b-q8head')) {
-      throw new Error(`Expected model selector to include 'spark-1.7b-q8head', got ${JSON.stringify(modelOptions)}`);
+    if (!modelOptions.includes('spark-4b-q8head')) {
+      throw new Error(`Expected model selector to include 'spark-4b-q8head', got ${JSON.stringify(modelOptions)}`);
     }
     if (modelOptions.includes('gemma-4-e4b')) {
       throw new Error(`Expected 'gemma-4-e4b' to be removed from model selector, got ${JSON.stringify(modelOptions)}`);

@@ -75,6 +75,7 @@ export interface AgentToolCallRecord {
   ok: boolean;
   durationMs: number;
   fsmMedianMs: number | null;
+  decodeTokPerSec?: number | null;
   diffText?: string;
   added?: number;
   removed?: number;
@@ -91,6 +92,7 @@ export interface AgentTraceEntry {
   detail: string;
   durationMs: number;
   fsmMedianMs?: number | null;
+  decodeTokPerSec?: number | null;
   promptTokens?: number;
   ok: boolean;
 }
@@ -119,6 +121,7 @@ export interface CodingSandboxAdapter {
 
 export interface AgentTurnCallbacks {
   onStatusText?: (text: string) => void;
+  onStepThought?: (thought: string, liveTps: number) => void;
   onToolStepStart?: (step: number, maxSteps: number) => void;
   onToolStepComplete?: (record: AgentToolCallRecord) => void;
   onTraceEntry?: (entry: AgentTraceEntry) => void;
@@ -131,6 +134,7 @@ export interface AgentTurnCallbacks {
 
 export interface AgentTurnResult {
   finalText: string;
+  replyThought?: string;
   toolCalls: AgentToolCallRecord[];
   traceEntries: AgentTraceEntry[];
   workspaceFiles: WorkspaceFile[];
@@ -1141,6 +1145,7 @@ export async function runAgentTurn(params: {
           ok: !ev.isError,
           durationMs: dur,
           fsmMedianMs: tc?.fsmMedianMs ?? null,
+          decodeTokPerSec: tc?.decodeTokPerSec ?? null,
           diffText: det.diffText,
           added: det.added,
           removed: det.removed,
@@ -1160,6 +1165,7 @@ export async function runAgentTurn(params: {
         detail: det.compactOut || outText.slice(0, 220),
         durationMs: dur,
         fsmMedianMs: tc?.fsmMedianMs ?? null,
+        decodeTokPerSec: tc?.decodeTokPerSec ?? null,
         promptTokens: tc?.promptTokens,
         ok: !ev.isError,
       };
@@ -1228,20 +1234,46 @@ export async function runAgentTurn(params: {
       !isReadOnlyQuestion
         ? actionOnlySchema
         : schema);
-    const stepRes = await client.generate({
-      promptIds: enc.ids,
-      images: [],
-      audios: [],
-      generationMode: 'text',
-      maxNewTokens: Math.min(reserveGen - 32, Math.max(256, maxSeqLen - enc.ids.length - 32)),
-      chunkSize: 64,
-      sampling: { temperature: 0, topK: 1, topP: 1.0, repetitionPenalty: 1.0 },
-      responseFormat: {
-        type: 'json_schema',
-        json_schema: { name: 'pi_coding_action', schema: effectiveSchema, strict: true },
-      },
-      stopOnEos: true,
-    });
+    let streamedDec = '';
+    let lastStreamedThought = '';
+    client.onToken = (ev: { text: string; fullText?: string; tokPerSec?: number }) => {
+      const full = ev.fullText !== undefined ? ev.fullText : (streamedDec += ev.text || '');
+      const m = full.match(/"thought"\s*:\s*"((?:[^"\\]|\\.)*)/);
+      if (m) {
+        const thoughtText = m[1]
+          .replace(/\\$/, '')
+          .replace(/\\(["\\/nrt])/g, (_s, ch) => {
+            if (ch === 'n') return '\n';
+            if (ch === 'r') return '';
+            if (ch === 't') return '\t';
+            return ch;
+          })
+          .trim();
+        if (thoughtText && thoughtText !== lastStreamedThought) {
+          lastStreamedThought = thoughtText;
+          callbacks.onStepThought?.(thoughtText, ev.tokPerSec || 0);
+        }
+      }
+    };
+    let stepRes;
+    try {
+      stepRes = await client.generate({
+        promptIds: enc.ids,
+        images: [],
+        audios: [],
+        generationMode: 'text',
+        maxNewTokens: Math.min(reserveGen - 32, Math.max(256, maxSeqLen - enc.ids.length - 32)),
+        chunkSize: 64,
+        sampling: { temperature: 0, topK: 1, topP: 1.0, repetitionPenalty: 1.0 },
+        responseFormat: {
+          type: 'json_schema',
+          json_schema: { name: 'pi_coding_action', schema: effectiveSchema, strict: true },
+        },
+        stopOnEos: true,
+      });
+    } finally {
+      client.onToken = null;
+    }
 
     const promptLen = stepRes.promptLen || enc.ids.length;
     totalPromptTokens += promptLen;
@@ -1257,6 +1289,7 @@ export async function runAgentTurn(params: {
     }
 
     const fsmMs = median(stepRes.fsmMaskMsSamples);
+    const stepTokPerSec = stepRes.decodeTokPerSec || 0;
     const rawJson = splitThinking(stepRes.generatedText || '').answer.trim();
 
     let action: Record<string, unknown> | null = null;
@@ -1271,6 +1304,7 @@ export async function runAgentTurn(params: {
         detail: rawJson.slice(0, 320),
         durationMs: stepRes.decodeMs || 0,
         fsmMedianMs: fsmMs,
+        decodeTokPerSec: stepTokPerSec,
         promptTokens: promptLen,
         ok: false,
       };
@@ -1300,6 +1334,7 @@ export async function runAgentTurn(params: {
       detail: thought ? `${thought}\n${JSON.stringify(cleanArgs).slice(0, 260)}` : JSON.stringify(cleanArgs).slice(0, 260),
       durationMs: stepRes.decodeMs || 0,
       fsmMedianMs: fsmMs,
+      decodeTokPerSec: stepTokPerSec,
       promptTokens: promptLen,
       ok: true,
     };
@@ -1327,7 +1362,7 @@ export async function runAgentTurn(params: {
         kind: 'reply',
         thought,
         text: String(action.text || '').trim(),
-        decodeTokPerSec: stepRes.decodeTokPerSec || 0,
+        decodeTokPerSec: stepTokPerSec,
       };
     }
 
@@ -1339,6 +1374,7 @@ export async function runAgentTurn(params: {
       arguments: cleanArgs,
       thought,
       fsmMedianMs: fsmMs,
+      decodeTokPerSec: stepTokPerSec,
       promptTokens: promptLen,
       durationMs: stepRes.decodeMs || 0,
     };
@@ -1347,6 +1383,7 @@ export async function runAgentTurn(params: {
   };
 
   let directReplyText = '';
+  let directReplyThought = '';
 
   const updatedTranscript = await agent.prompt(effectiveTaskPrompt, {
     maxTurns: maxSteps,
@@ -1367,6 +1404,10 @@ export async function runAgentTurn(params: {
 
       if (stepOutcome.kind === 'reply') {
         directReplyText = stepOutcome.text;
+        directReplyThought = stepOutcome.thought;
+        if (stepOutcome.thought) {
+          callbacks.onStepThought?.(stepOutcome.thought, stepOutcome.decodeTokPerSec);
+        }
         return {
           role: 'assistant',
           content: [{ type: 'text', text: stepOutcome.text }],
@@ -1612,6 +1653,7 @@ export async function runAgentTurn(params: {
 
   return {
     finalText,
+    replyThought: directReplyThought || undefined,
     toolCalls,
     traceEntries,
     workspaceFiles: workspace,

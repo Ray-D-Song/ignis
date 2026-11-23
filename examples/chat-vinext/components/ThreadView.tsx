@@ -76,6 +76,9 @@ export interface StudioMessage {
   meta?: string;
   fsmValid?: boolean;
   fsmMedianMs?: number | null;
+  decodeTokPerSec?: number | null;
+  streamingThought?: string;
+  replyThought?: string;
   specAccepted?: number;
   specProposed?: number;
 }
@@ -511,79 +514,85 @@ export function ThreadView(props: ThreadViewProps) {
                     {m.toolCalls.map((tc) => {
                       const filePath = typeof tc.args.path === 'string' ? tc.args.path : '';
                       return (
-                        <details key={tc.id} className="tool-call-card">
-                          <summary className="tool-call-summary">
-                            <span className="tool-call-left">
-                              <ChevronRight size={13} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />
-                              <ToolIcon tool={tc.tool} />
-                              <span
-                                style={{
-                                  fontWeight: 500,
-                                  fontFamily: tc.tool === 'run_command' ? 'var(--font-mono)' : undefined,
-                                  overflow: 'hidden',
-                                  textOverflow: 'ellipsis',
-                                  whiteSpace: 'nowrap',
-                                }}
-                              >
-                                {summarizeToolCall(tc, lang)}
-                              </span>
-                            </span>
-                            <span className="tool-call-meta">
-                              {(tc.added !== undefined || tc.removed !== undefined) && (
-                                <span style={{ color: '#86efac' }}>
-                                  +{tc.added ?? 0}/-{tc.removed ?? 0}
-                                </span>
-                              )}
-                              {tc.testSummary && (
+                        <div key={tc.id} className="tool-step-group">
+                          {tc.thought && <div className="tool-step-thought">{tc.thought}</div>}
+                          <details className="tool-call-card">
+                            <summary className="tool-call-summary">
+                              <span className="tool-call-left">
+                                <ChevronRight size={13} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />
+                                <ToolIcon tool={tc.tool} />
                                 <span
                                   style={{
-                                    color: tc.testSummary.failed === 0 ? '#86efac' : '#fca5a5',
+                                    fontWeight: 500,
+                                    fontFamily: tc.tool === 'run_command' ? 'var(--font-mono)' : undefined,
+                                    overflow: 'hidden',
+                                    textOverflow: 'ellipsis',
+                                    whiteSpace: 'nowrap',
                                   }}
                                 >
-                                  {tc.testSummary.passed}/{tc.testSummary.total}
+                                  {summarizeToolCall(tc, lang)}
                                 </span>
-                              )}
-                              {tc.fsmMedianMs !== null && tc.fsmMedianMs !== undefined && (
-                                <span>FSM {tc.fsmMedianMs.toFixed(2)}ms/t</span>
-                              )}
-                              <span>{Math.max(1, Math.round(tc.durationMs))}ms</span>
-                              {tc.ok ? (
-                                <CheckCircle2 size={12} style={{ color: 'var(--ok)' }} />
-                              ) : (
-                                <XCircle size={12} style={{ color: 'var(--danger)' }} />
-                              )}
-                            </span>
-                          </summary>
-                          <div className="tool-call-body">
-                            {tc.thought && <div className="tool-call-thought">{tc.thought}</div>}
-                            {tc.diffText ? (
-                              <>
-                                <ColorizedDiffBlock diffText={tc.diffText} />
-                                {filePath && (
-                                  <div>
-                                    <button
-                                      type="button"
-                                      className="icon-btn"
-                                      style={{ height: 24, fontSize: 11.5 }}
-                                      onClick={() => onInspectDiff(filePath)}
-                                    >
-                                      <GitCompare size={12} />
-                                      <span>{t.diffTab} · {filePath}</span>
-                                    </button>
-                                  </div>
+                              </span>
+                              <span className="tool-call-meta">
+                                {(tc.added !== undefined || tc.removed !== undefined) && (
+                                  <span style={{ color: '#86efac' }}>
+                                    +{tc.added ?? 0}/-{tc.removed ?? 0}
+                                  </span>
                                 )}
-                              </>
-                            ) : (
-                              <>
-                                <pre className="tool-call-pre">{JSON.stringify(tc.args, null, 2)}</pre>
-                                <pre className="tool-call-pre">{tc.output}</pre>
-                              </>
-                            )}
-                          </div>
-                        </details>
+                                {tc.testSummary && (
+                                  <span
+                                    style={{
+                                      color: tc.testSummary.failed === 0 ? '#86efac' : '#fca5a5',
+                                    }}
+                                  >
+                                    {tc.testSummary.passed}/{tc.testSummary.total}
+                                  </span>
+                                )}
+                                {tc.decodeTokPerSec !== null &&
+                                  tc.decodeTokPerSec !== undefined &&
+                                  tc.decodeTokPerSec > 0 && <span>{tc.decodeTokPerSec.toFixed(1)} tok/s</span>}
+                                <span>{Math.max(1, Math.round(tc.durationMs))}ms</span>
+                                {tc.ok ? (
+                                  <CheckCircle2 size={12} style={{ color: 'var(--ok)' }} />
+                                ) : (
+                                  <XCircle size={12} style={{ color: 'var(--danger)' }} />
+                                )}
+                              </span>
+                            </summary>
+                            <div className="tool-call-body">
+                              {tc.diffText ? (
+                                <>
+                                  <ColorizedDiffBlock diffText={tc.diffText} />
+                                  {filePath && (
+                                    <div>
+                                      <button
+                                        type="button"
+                                        className="icon-btn"
+                                        style={{ height: 24, fontSize: 11.5 }}
+                                        onClick={() => onInspectDiff(filePath)}
+                                      >
+                                        <GitCompare size={12} />
+                                        <span>{t.diffTab} · {filePath}</span>
+                                      </button>
+                                    </div>
+                                  )}
+                                </>
+                              ) : (
+                                <>
+                                  <pre className="tool-call-pre">{JSON.stringify(tc.args, null, 2)}</pre>
+                                  <pre className="tool-call-pre">{tc.output}</pre>
+                                </>
+                              )}
+                            </div>
+                          </details>
+                        </div>
                       );
                     })}
                   </div>
+                )}
+
+                {isLastGenerating && m.streamingThought && (
+                  <div className="tool-step-thought is-streaming">{m.streamingThought}</div>
                 )}
 
                 {isLastGenerating && pendingApproval && (
@@ -601,6 +610,10 @@ export function ThreadView(props: ThreadViewProps) {
                     </summary>
                     <pre>{parsed.think}</pre>
                   </details>
+                )}
+
+                {m.replyThought && !parsed.think && (
+                  <div className="tool-step-thought">{m.replyThought}</div>
                 )}
 
                 {parsed.answer ? (
@@ -651,8 +664,8 @@ export function ThreadView(props: ThreadViewProps) {
                         data-testid="fsm-badge"
                       >
                         FSM: {m.fsmValid ? 'JSON.parse ✓' : 'JSON Invalid ✗'}
-                        {m.fsmMedianMs !== null && m.fsmMedianMs !== undefined
-                          ? ` · ${m.fsmMedianMs.toFixed(3)} ms/tok`
+                        {m.decodeTokPerSec !== null && m.decodeTokPerSec !== undefined && m.decodeTokPerSec > 0
+                          ? ` · ${m.decodeTokPerSec.toFixed(1)} tok/s`
                           : ''}
                       </span>
                     )}
