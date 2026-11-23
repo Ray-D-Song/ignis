@@ -1,6 +1,12 @@
 import type { WebContainer, WebContainerProcess } from '@webcontainer/api';
 import { STARTER_PROJECT_FILES, toWebContainerTree } from './starter-project';
 import { inferFileKind, normalizeWorkspacePath, type WorkspaceFile } from './workspace-fs';
+import {
+  clearPersistedWorkspace,
+  computePackageDepsKey,
+  loadNpmCacheSnapshot,
+  saveNpmCacheSnapshot,
+} from './workspace-persistence';
 
 export type SandboxBootStatus =
   | 'idle'
@@ -39,6 +45,7 @@ export interface InteractiveShellHandle {
 }
 
 export interface BootCallbacks {
+  initialFiles?: WorkspaceFile[];
   onStatus?: (status: SandboxBootStatus, detail?: string) => void;
   onTerminalData?: (chunk: string) => void;
   onServerLog?: (chunk: string) => void;
@@ -133,6 +140,26 @@ function parentDir(relPath: string): string {
 
 const SKIP_DIRS = new Set(['node_modules', '.git', '.vite', 'dist', '.next']);
 
+async function cacheNodeModulesSnapshot(wc: WebContainer, explicitDepsKey?: string): Promise<void> {
+  let depsKey = explicitDepsKey || '';
+  if (!depsKey) {
+    try {
+      const pkgText = await wc.fs.readFile('package.json', 'utf8');
+      depsKey = computePackageDepsKey(pkgText);
+    } catch {
+      return;
+    }
+  }
+  if (!depsKey) return;
+  const snapshot = await wc.export('node_modules', {
+    format: 'binary',
+    includes: ['**/*'],
+  });
+  if (snapshot && snapshot.byteLength > 0) {
+    await saveNpmCacheSnapshot(depsKey, snapshot);
+  }
+}
+
 async function ensureContainerBooted(
   callbacks: BootCallbacks = {},
 ): Promise<WebContainer> {
@@ -155,7 +182,11 @@ async function ensureContainerBooted(
     });
     s.instance = wc;
 
-    const tree = toWebContainerTree(STARTER_PROJECT_FILES);
+    const initial =
+      callbacks.initialFiles && callbacks.initialFiles.length > 0
+        ? callbacks.initialFiles
+        : STARTER_PROJECT_FILES;
+    const tree = toWebContainerTree(initial);
     await wc.mount(tree as Parameters<WebContainer['mount']>[0]);
     return wc;
   })().catch((err) => {
@@ -196,12 +227,38 @@ export async function bootAndStartFullStack(
   s.readyPromise = (async () => {
     const wc = await ensureContainerBooted(callbacks);
 
+    let depsKey = '';
+    try {
+      const pkgText = await wc.fs.readFile('package.json', 'utf8');
+      depsKey = computePackageDepsKey(pkgText);
+    } catch {
+      depsKey = '';
+    }
+
     let hasVite = false;
     try {
       await wc.fs.readFile('node_modules/vite/package.json', 'utf8');
       hasVite = true;
     } catch {
       hasVite = false;
+    }
+
+    if (!hasVite && depsKey) {
+      const cached = await loadNpmCacheSnapshot(depsKey);
+      if (cached) {
+        s.status = 'installing';
+        s.statusDetail = 'Restoring cached npm dependencies...';
+        callbacks.onStatus?.('installing', s.statusDetail);
+        try {
+          await wc.fs.mkdir('node_modules', { recursive: true });
+          await wc.mount(cached, { mountPoint: 'node_modules' });
+          await wc.fs.readFile('node_modules/vite/package.json', 'utf8');
+          hasVite = true;
+          callbacks.onTerminalData?.('\r\n[cache] Restored cached node_modules from browser storage.\r\n');
+        } catch {
+          hasVite = false;
+        }
+      }
     }
 
     if (!hasVite) {
@@ -227,6 +284,10 @@ export async function bootAndStartFullStack(
         callbacks.onStatus?.('error', msg);
         callbacks.onError?.(msg);
         throw new Error(msg);
+      }
+
+      if (depsKey) {
+        void cacheNodeModulesSnapshot(wc, depsKey).catch(() => {});
       }
     }
 
@@ -403,6 +464,14 @@ export async function wcRunCommand(
   clearTimeout(timer);
   await Promise.race([pipePromise, new Promise((r) => setTimeout(r, 120))]);
 
+  if (
+    !timedOut &&
+    exitCode === 0 &&
+    /\b(?:npm|pnpm|yarn)\s+(?:i|install|add|remove|uninstall|rm)\b/i.test(command.trim())
+  ) {
+    void cacheNodeModulesSnapshot(wc).catch(() => {});
+  }
+
   const clean = stripAnsi(rawOutput).trim();
   const testSummary = parseNodeTestOutput(clean);
 
@@ -470,13 +539,64 @@ export async function wcAttachInteractiveShell(
   };
 }
 
+async function pruneExtraWorkspaceEntries(
+  wc: WebContainer,
+  dirPath: string,
+  starterSet: Set<string>,
+): Promise<void> {
+  const entries = await wc.fs.readdir(dirPath, { withFileTypes: true });
+  for (const ent of entries) {
+    if (SKIP_DIRS.has(ent.name) || ent.name === 'package-lock.json') continue;
+    const rel = dirPath === '.' ? ent.name : `${dirPath}/${ent.name}`;
+    const norm = normalizeWorkspacePath(rel);
+    if (ent.isDirectory()) {
+      const hasStarterInside = [...starterSet].some((p) => p.startsWith(`${norm}/`));
+      if (!hasStarterInside) {
+        await wc.fs.rm(norm, { recursive: true, force: true }).catch(() => {});
+      } else {
+        await pruneExtraWorkspaceEntries(wc, norm, starterSet);
+      }
+    } else if (ent.isFile() && !starterSet.has(norm)) {
+      await wc.fs.rm(norm, { force: true }).catch(() => {});
+    }
+  }
+}
+
 export async function wcResetStarterProject(): Promise<WorkspaceFile[]> {
   const wc = await ensureContainerBooted();
+  const starterSet = new Set(STARTER_PROJECT_FILES.map((s) => normalizeWorkspacePath(s.path)));
+  let prevDepsKey = '';
+  try {
+    prevDepsKey = computePackageDepsKey(await wc.fs.readFile('package.json', 'utf8'));
+  } catch {
+    prevDepsKey = '';
+  }
+
+  await pruneExtraWorkspaceEntries(wc, '.', starterSet).catch(() => {});
+
   for (const spec of STARTER_PROJECT_FILES) {
     const dir = parentDir(spec.path);
     if (dir) await wc.fs.mkdir(dir, { recursive: true });
     await wc.fs.writeFile(spec.path, spec.content);
   }
+
+  const starterPkg = STARTER_PROJECT_FILES.find((f) => f.path === 'package.json')?.content || '';
+  const starterDepsKey = computePackageDepsKey(starterPkg);
+  if (prevDepsKey && prevDepsKey !== starterDepsKey) {
+    const starterCache = await loadNpmCacheSnapshot(starterDepsKey);
+    if (starterCache) {
+      try {
+        await wc.fs.rm('node_modules', { recursive: true, force: true }).catch(() => {});
+        await wc.fs.mkdir('node_modules', { recursive: true });
+        await wc.mount(starterCache, { mountPoint: 'node_modules' });
+      } catch {
+        // ignore starter cache restore failure
+      }
+    }
+  }
+
+  await clearPersistedWorkspace();
+
   const now = Date.now();
   return STARTER_PROJECT_FILES.map((f) => ({
     path: f.path,

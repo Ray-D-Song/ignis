@@ -46,6 +46,7 @@ import {
   type WorkspaceCheckpoint,
   type WorkspaceFile,
 } from '@/lib/workspace-fs';
+import { loadPersistedWorkspace, savePersistedWorkspace } from '@/lib/workspace-persistence';
 import { CodeEditorPane } from './CodeEditorPane';
 import { Composer } from './Composer';
 import { ThreadView, type LoadProgressState, type StudioMessage } from './ThreadView';
@@ -264,6 +265,7 @@ export function ChatWorkspace({
   const scrollEndRef = useRef<HTMLDivElement | null>(null);
   const workspaceRef = useRef(workspaceFiles);
   workspaceRef.current = workspaceFiles;
+  const hydratedWorkspaceRef = useRef(false);
   const approvalResolverRef = useRef<((d: ApprovalDecision) => void) | null>(null);
   const piTranscriptRef = useRef<PiAgentMessage[]>([]);
 
@@ -317,6 +319,8 @@ export function ChatWorkspace({
   };
 
   useEffect(() => {
+    let cancelled = false;
+
     if (typeof window !== 'undefined' && window.innerWidth < 1200) {
       setEditorOpen(false);
       setRightPaneOpen(false);
@@ -337,26 +341,42 @@ export function ChatWorkspace({
       }
     })();
 
-    // Boot StackBlitz WebContainer full-stack sandbox in parallel
-    bootAndStartFullStack({
-      onStatus: (st, detail) => {
-        setSandboxStatus(st);
-        if (detail) setSandboxDetail(detail);
-      },
-      onTerminalData: (chunk) => pushShellOutput(chunk),
-      onServerLog: (chunk) => pushServerOutput(chunk),
-      onServerReady: (url) => {
-        setPreviewUrl(url);
-      },
-      onError: (msg) => {
-        setSandboxStatus('error');
-        setSandboxDetail(msg);
-      },
-    }).catch(() => {
-      // status + detail already propagated via callbacks
-    });
+    // Restore persisted workspace files first, then boot WebContainer full-stack sandbox
+    (async () => {
+      const savedFiles = await loadPersistedWorkspace();
+      if (cancelled) return;
+      if (savedFiles && savedFiles.length > 0) {
+        setWorkspaceFiles(savedFiles);
+        workspaceRef.current = savedFiles;
+        const preferred =
+          savedFiles.find((f) => f.path === 'src/App.jsx')?.path || savedFiles[0].path;
+        setSelectedFilePath(preferred);
+        pushShellOutput(`\r\n[workspace] Restored ${savedFiles.length} saved files from browser storage.\r\n`);
+      }
+      hydratedWorkspaceRef.current = true;
+
+      bootAndStartFullStack({
+        initialFiles: savedFiles && savedFiles.length > 0 ? savedFiles : undefined,
+        onStatus: (st, detail) => {
+          setSandboxStatus(st);
+          if (detail) setSandboxDetail(detail);
+        },
+        onTerminalData: (chunk) => pushShellOutput(chunk),
+        onServerLog: (chunk) => pushServerOutput(chunk),
+        onServerReady: (url) => {
+          setPreviewUrl(url);
+        },
+        onError: (msg) => {
+          setSandboxStatus('error');
+          setSandboxDetail(msg);
+        },
+      }).catch(() => {
+        // status + detail already propagated via callbacks
+      });
+    })();
 
     return () => {
+      cancelled = true;
       revokeAllObjectUrls();
       if (approvalResolverRef.current) {
         approvalResolverRef.current({ approved: false, reason: 'Unmounted' });
@@ -368,6 +388,14 @@ export function ChatWorkspace({
       }
     };
   }, [pushServerOutput, pushShellOutput]);
+
+  useEffect(() => {
+    if (!hydratedWorkspaceRef.current) return;
+    const timer = setTimeout(() => {
+      void savePersistedWorkspace(workspaceFiles);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [workspaceFiles]);
 
   useEffect(() => {
     if (messages.length === 0 && !pendingApproval) return;
@@ -784,9 +812,12 @@ export function ChatWorkspace({
   const handleResetProject = async () => {
     try {
       const resetFiles = await wcResetStarterProject();
+      workspaceRef.current = resetFiles;
       setWorkspaceFiles(resetFiles);
     } catch {
-      setWorkspaceFiles(createInitialWorkspace());
+      const fallbackFiles = createInitialWorkspace();
+      workspaceRef.current = fallbackFiles;
+      setWorkspaceFiles(fallbackFiles);
     }
     setDiffOriginals({});
     setCheckpoints([]);
@@ -1412,6 +1443,9 @@ export function ChatWorkspace({
         onToggleRightPane={() => setRightPaneOpen((v) => !v)}
         approvalPolicy={approvalPolicy}
         onToggleApprovalPolicy={() => setApprovalPolicy((p) => (p === 'auto' ? 'ask' : 'auto'))}
+        onResetWorkspace={() => {
+          void handleResetProject();
+        }}
         models={models}
         selectedModelId={selectedModelId}
         activeModel={activeModel}

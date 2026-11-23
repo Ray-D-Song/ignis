@@ -13,6 +13,7 @@ import {
   Moon,
   PanelRight,
   RefreshCw,
+  RotateCcw,
   ShieldAlert,
   ShieldCheck,
   Sun,
@@ -35,6 +36,7 @@ interface TopBarProps {
   onToggleRightPane: () => void;
   approvalPolicy: ApprovalPolicy;
   onToggleApprovalPolicy: () => void;
+  onResetWorkspace: () => void;
   models: ModelPreset[];
   selectedModelId: string;
   activeModel: ModelPreset;
@@ -70,6 +72,7 @@ export function TopBar(props: TopBarProps) {
     onToggleRightPane,
     approvalPolicy,
     onToggleApprovalPolicy,
+    onResetWorkspace,
     models,
     selectedModelId,
     activeModel,
@@ -318,6 +321,19 @@ export function TopBar(props: TopBarProps) {
           <span className={`status-dot ${dotClass}`} />
           <span id="status-text">{statusText}</span>
         </div>
+
+        <button
+          id="btn-topbar-reset-workspace"
+          type="button"
+          className="icon-btn"
+          disabled={status === 'generating'}
+          onClick={onResetWorkspace}
+          title={t.resetWorkspace}
+          aria-label={t.resetWorkspace}
+        >
+          <RotateCcw size={14} />
+          <span className="hide-mobile">{t.resetWorkspace}</span>
+        </button>
 
         <button
           id="btn-lang-toggle"
