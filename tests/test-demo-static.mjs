@@ -200,7 +200,18 @@ async function main() {
 
     const page = context.pages()[0] || await context.newPage();
     page.on('console', (m) => {
-      if (m.type() === 'error') errors.push(`${m.text()} (${m.location()?.url || ''})`);
+      if (m.type() === 'error') {
+        const text = m.text();
+        const url = m.location()?.url || '';
+        const isWebContainerHmrNoise =
+          url.includes('.webcontainer-api.io') &&
+          (text.includes('504 (Outdated Request)') ||
+            text.includes('failed to connect to websocket') ||
+            text.includes('Error during WebSocket handshake'));
+        if (!isWebContainerHmrNoise) {
+          errors.push(`${text} (${url})`);
+        }
+      }
     });
     page.on('pageerror', (e) => errors.push(String(e)));
 
@@ -428,6 +439,9 @@ async function main() {
     const spark17Out = await page.locator('.msg.assistant .answer-body').last().innerText();
     console.log('[spark-1.7b agent] tools=', spark17Tools.map((s) => s.replace(/\s+/g, ' ')), '| answer=', spark17Out.trim().slice(0, 140));
     if (spark17Tools.length < 1 || !spark17Tools.some((s) => /Write|Edit/i.test(s))) {
+      await page.click('#tab-btn-trace').catch(() => {});
+      const spark17Traces = await page.locator('[data-testid="trace-entry"]').allInnerTexts().catch(() => []);
+      console.error('[spark-1.7b trace]', spark17Traces.map((s) => s.replace(/\s+/g, ' ')));
       throw new Error(`Expected Spark-1.7B Pi Agent to execute Write/Edit tool call, got ${JSON.stringify(spark17Tools)}`);
     }
     if (spark17Out.trim().length < 5 || spark17Out.includes('\uFFFD')) {

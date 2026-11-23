@@ -149,64 +149,68 @@ export interface AgentTurnResult {
 }
 
 /** Strict WASM JSON Schema FSM covering Pi's 4 core tools + reply. */
-export function buildAgentActionSchema(): Record<string, unknown> {
-  return {
-    oneOf: [
-      {
-        type: 'object',
-        properties: {
-          thought: { type: 'string' },
-          tool: { const: 'read' },
-          path: { type: 'string' },
-        },
-        required: ['thought', 'tool', 'path'],
-        additionalProperties: false,
+export function buildAgentActionSchema(options?: { allowReply?: boolean; allowRead?: boolean }): Record<string, unknown> {
+  const branches: Record<string, unknown>[] = [];
+  if (options?.allowRead !== false) {
+    branches.push({
+      type: 'object',
+      properties: {
+        thought: { type: 'string' },
+        tool: { const: 'read' },
+        path: { type: 'string' },
       },
-      {
-        type: 'object',
-        properties: {
-          thought: { type: 'string' },
-          tool: { const: 'write' },
-          path: { type: 'string' },
-          content: { type: 'string' },
-        },
-        required: ['thought', 'tool', 'path', 'content'],
-        additionalProperties: false,
+      required: ['thought', 'tool', 'path'],
+      additionalProperties: false,
+    });
+  }
+  branches.push(
+    {
+      type: 'object',
+      properties: {
+        thought: { type: 'string' },
+        tool: { const: 'write' },
+        path: { type: 'string' },
+        content: { type: 'string' },
       },
-      {
-        type: 'object',
-        properties: {
-          thought: { type: 'string' },
-          tool: { const: 'edit' },
-          path: { type: 'string' },
-          oldText: { type: 'string' },
-          newText: { type: 'string' },
-        },
-        required: ['thought', 'tool', 'path', 'oldText', 'newText'],
-        additionalProperties: false,
+      required: ['thought', 'tool', 'path', 'content'],
+      additionalProperties: false,
+    },
+    {
+      type: 'object',
+      properties: {
+        thought: { type: 'string' },
+        tool: { const: 'edit' },
+        path: { type: 'string' },
+        oldText: { type: 'string' },
+        newText: { type: 'string' },
       },
-      {
-        type: 'object',
-        properties: {
-          thought: { type: 'string' },
-          tool: { const: 'bash' },
-          command: { type: 'string' },
-        },
-        required: ['thought', 'tool', 'command'],
-        additionalProperties: false,
+      required: ['thought', 'tool', 'path', 'oldText', 'newText'],
+      additionalProperties: false,
+    },
+    {
+      type: 'object',
+      properties: {
+        thought: { type: 'string' },
+        tool: { const: 'bash' },
+        command: { type: 'string' },
       },
-      {
-        type: 'object',
-        properties: {
-          thought: { type: 'string' },
-          tool: { const: 'reply' },
-          text: { type: 'string' },
-        },
-        required: ['thought', 'tool', 'text'],
-        additionalProperties: false,
+      required: ['thought', 'tool', 'command'],
+      additionalProperties: false,
+    },
+  );
+  if (options?.allowReply !== false) {
+    branches.push({
+      type: 'object',
+      properties: {
+        thought: { type: 'string' },
+        tool: { const: 'reply' },
+        text: { type: 'string' },
       },
-    ],
-  };
+      required: ['thought', 'tool', 'text'],
+      additionalProperties: false,
+    });
+  }
+  return { oneOf: branches };
 }
 
 function median(values?: number[]): number | null {
@@ -467,7 +471,8 @@ function validateCodeSyntax(
       } else {
         const matched = [...installedPkgs].some((pkg) => spec === pkg || spec.startsWith(`${pkg}/`));
         if (!matched) {
-          return `${targetPath}: SyntaxError: Package '${spec}' is not installed in package.json (only react and react-dom are installed). Write pure React + CSS without external packages.`;
+          const pkgName = spec.startsWith('@') ? spec.split('/').slice(0, 2).join('/') : spec.split('/')[0];
+          return `${targetPath}: Package '${spec}' is not installed in package.json yet. Run bash ("npm install ${pkgName}") first to install it, or implement without external packages.`;
         }
       }
     }
@@ -645,6 +650,8 @@ export async function runAgentTurn(params: {
   const toolCalls: AgentToolCallRecord[] = [];
   const preparedMutations = new Map<string, PreparedMutation>();
   const freshReadPaths = new Set<string>();
+  const freshBashCommands = new Set<string>();
+  let verifiedBuildSinceEdit = false;
 
   let totalPromptTokens = 0;
   let totalGeneratedTokens = 0;
@@ -658,10 +665,15 @@ export async function runAgentTurn(params: {
   let approveAllThisRun = false;
   let stepCounter = 0;
   let retriedReplyGate = false;
+  let consecutiveRepeatedReadBlocks = 0;
 
   const hasPriorCheckpointsInTranscript = transcriptMessages.some(
     (m) => m.role === 'toolResult' && (m.toolName === 'write' || m.toolName === 'edit') && !m.isError,
   );
+  const isReadOnlyQuestion =
+    /^\s*(?:what|why|how|explain|describe|summarize|list|show|review|audit|tell me|什么|为什么|解释|介绍|总结|列出|查看|分析)/i.test(
+      userPrompt.trim(),
+    );
 
   // Build seed transcript if continuing from text history without prior Pi messages
   let baseMessages: PiAgentMessage[] = [...transcriptMessages];
@@ -923,6 +935,9 @@ export async function runAgentTurn(params: {
         const { targetPath, content, before, existedBefore, added, removed, diffText } = prepared;
         await sandbox.writeFile(targetPath, content);
         freshReadPaths.add(normalizeWorkspacePath(targetPath));
+        freshBashCommands.clear();
+        verifiedBuildSinceEdit = false;
+        consecutiveRepeatedReadBlocks = 0;
         workspace = upsertWorkspaceFile(workspace, targetPath, content, true, {
           addedLines: added,
           removedLines: removed,
@@ -989,6 +1004,9 @@ export async function runAgentTurn(params: {
         const existing = readWorkspaceFile(workspace, targetPath);
         await sandbox.writeFile(targetPath, updatedContent);
         freshReadPaths.add(normalizeWorkspacePath(targetPath));
+        freshBashCommands.clear();
+        verifiedBuildSinceEdit = false;
+        consecutiveRepeatedReadBlocks = 0;
         workspace = upsertWorkspaceFile(workspace, targetPath, updatedContent, true, {
           addedLines: (existing?.addedLines || 0) + added,
           removedLines: (existing?.removedLines || 0) + removed,
@@ -1048,6 +1066,26 @@ export async function runAgentTurn(params: {
         }
 
         const cmdRes = await sandbox.runCommand(cmd);
+        consecutiveRepeatedReadBlocks = 0;
+        const normalizedCmd = cmd.trim();
+        const isPkgInstallCmd = /\b(?:npm|pnpm|yarn)\s+(?:i|install|add|remove|uninstall|rm)\b/i.test(normalizedCmd);
+        if (cmdRes.exitCode === 0 && normalizedCmd) {
+          freshBashCommands.add(normalizedCmd);
+          if (isPkgInstallCmd && sandbox.readFile) {
+            try {
+              const latestPkg = await sandbox.readFile('package.json');
+              if (typeof latestPkg === 'string' && latestPkg.trim()) {
+                workspace = upsertWorkspaceFile(workspace, 'package.json', latestPkg, false);
+                freshReadPaths.delete('package.json');
+                callbacks.onWorkspaceUpdate?.(workspace);
+              }
+            } catch {
+              // ignore if package.json cannot be refreshed
+            }
+          } else if (checkpoints.length > 0) {
+            verifiedBuildSinceEdit = true;
+          }
+        }
         const cleanOut = stripAnsi(cmdRes.output);
         const testSummary = cmdRes.testSummary || parseNodeTestOutput(cleanOut);
         if (testSummary) lastTestSummaryRef.current = testSummary;
@@ -1070,6 +1108,7 @@ export async function runAgentTurn(params: {
   ];
 
   const schema = buildAgentActionSchema();
+  const actionOnlySchema = buildAgentActionSchema({ allowReply: false, allowRead: false });
   const agent = new PiAgent({
     systemPrompt: '',
     messages: baseMessages,
@@ -1087,10 +1126,11 @@ export async function runAgentTurn(params: {
       const det = (ev.result.details || {}) as ToolResultDetails;
       const outText = ev.result.content.map((c) => c.text).join('\n');
       const dur = performance.now() - (actionStartTimeMap.get(ev.toolCallId) ?? performance.now());
-      const isRepeatedReadGuard = ev.toolName === 'read' && ev.isError && outText.startsWith('[Pi Harness]:');
-      lastToolError = ev.isError && !isRepeatedReadGuard;
+      const isRepeatedGuard =
+        (ev.toolName === 'read' || ev.toolName === 'bash') && ev.isError && outText.startsWith('[Pi Harness]:');
+      lastToolError = ev.isError && !isRepeatedGuard;
 
-      if (!isRepeatedReadGuard) {
+      if (!isRepeatedGuard) {
         const record: AgentToolCallRecord = {
           id: ev.toolCallId,
           step: stepCounter,
@@ -1132,6 +1172,8 @@ export async function runAgentTurn(params: {
     context: PiAgentContext,
     turnIndex: number,
     extraHint = '',
+    overrideSchema?: Record<string, unknown>,
+    allowJsonRetry = true,
   ): Promise<{
     kind: 'toolCall';
     tc: PiToolCallContent;
@@ -1156,9 +1198,11 @@ export async function runAgentTurn(params: {
     const statusHint =
       freshReadPaths.size > 0 && checkpoints.length === 0
         ? `\n[Status]: Already read [${[...freshReadPaths].join(', ')}]. Do NOT read them again; call "write" on src/App.jsx (keep code concise, under 85 lines) or read another unread file.`
-        : checkpoints.length > 0 && !lastToolError
-          ? `\n[Status]: Modified [${[...new Set(checkpoints.map((c) => c.path))].join(', ')}]. Update any remaining files, optionally run "bash" ("npm run build"), or call "reply" to finish.`
-          : '';
+        : verifiedBuildSinceEdit && checkpoints.length > 0 && !lastToolError
+          ? `\n[Status]: Modified [${[...new Set(checkpoints.map((c) => c.path))].join(', ')}] and verified command succeeded (exit 0). Do NOT call "bash" or "read" again — call "reply" now.`
+          : checkpoints.length > 0 && !lastToolError
+            ? `\n[Status]: Modified [${[...new Set(checkpoints.map((c) => c.path))].join(', ')}]. Call "reply" now if the task is complete (or edit/write another file such as src/App.css).`
+            : '';
     const buildPrompt = (ctxText: string) =>
       formatSingleTurnPrompt(archKind, {
         systemPrompt: sysPrompt,
@@ -1176,6 +1220,14 @@ export async function runAgentTurn(params: {
     peakPromptTokens = Math.max(peakPromptTokens, enc.ids.length);
     await client.reset();
     const tDec0 = performance.now();
+    const effectiveSchema =
+      overrideSchema ??
+      (consecutiveRepeatedReadBlocks >= 1 &&
+      checkpoints.length === 0 &&
+      !hasPriorCheckpointsInTranscript &&
+      !isReadOnlyQuestion
+        ? actionOnlySchema
+        : schema);
     const stepRes = await client.generate({
       promptIds: enc.ids,
       images: [],
@@ -1186,7 +1238,7 @@ export async function runAgentTurn(params: {
       sampling: { temperature: 0, topK: 1, topP: 1.0, repetitionPenalty: 1.0 },
       responseFormat: {
         type: 'json_schema',
-        json_schema: { name: 'pi_coding_action', schema, strict: true },
+        json_schema: { name: 'pi_coding_action', schema: effectiveSchema, strict: true },
       },
       stopOnEos: true,
     });
@@ -1224,11 +1276,13 @@ export async function runAgentTurn(params: {
       };
       traceEntries.push(traceFail);
       callbacks.onTraceEntry?.(traceFail);
-      if (!extraHint) {
+      if (allowJsonRetry) {
         return runDecisionStep(
           context,
           turnIndex,
-          '[Retry]: Your previous JSON action exceeded step length and was truncated. Keep code concise (under 75 lines, no comments) inside write/edit and try again.',
+          '[Retry]: Your previous JSON action exceeded step length and was truncated. Keep code concise (under 65 lines, no comments) inside write/edit and try again.',
+          effectiveSchema,
+          false,
         );
       }
       return { kind: 'stop', reason: 'error', message: 'Model output exceeded single-step JSON budget.' };
@@ -1253,6 +1307,22 @@ export async function runAgentTurn(params: {
     callbacks.onTraceEntry?.(decisionTrace);
 
     if (toolName === 'reply') {
+      if (
+        checkpoints.length === 0 &&
+        !hasPriorCheckpointsInTranscript &&
+        !isReadOnlyQuestion &&
+        !retriedReplyGate &&
+        !extraHint
+      ) {
+        retriedReplyGate = true;
+        return runDecisionStep(
+          context,
+          turnIndex,
+          '[Retry]: No workspace files were modified yet. Call "write" on src/App.jsx with concise, complete application code (under 75 lines, no comments) or run "bash" to install a needed package now.',
+          actionOnlySchema,
+          true,
+        );
+      }
       return {
         kind: 'reply',
         thought,
@@ -1317,14 +1387,26 @@ export async function runAgentTurn(params: {
       if (name === 'read') {
         const targetPath = normalizeWorkspacePath(String(args.path ?? ''));
         if (targetPath && freshReadPaths.has(targetPath)) {
+          consecutiveRepeatedReadBlocks++;
           return {
             block: true,
             reason: `[Pi Harness]: ${targetPath} is already shown in full in the tool results above and has not changed. Do NOT call 'read' on ${targetPath} again — call 'write' on src/App.jsx with the complete new application code (or read a different unread file such as src/App.css).`,
           };
         }
+        consecutiveRepeatedReadBlocks = 0;
         return;
       }
+      if (name === 'bash') {
+        const cmd = String(args.command ?? '').trim();
+        if (cmd && freshBashCommands.has(cmd)) {
+          return {
+            block: true,
+            reason: `[Pi Harness]: Command "${cmd}" already succeeded (exit 0) and no files changed since. Do NOT run bash again — call "reply" now.`,
+          };
+        }
+      }
       if (name !== 'write' && name !== 'edit' && name !== 'bash') {
+        consecutiveRepeatedReadBlocks = 0;
         return;
       }
 
@@ -1406,7 +1488,17 @@ export async function runAgentTurn(params: {
           return { block: true, reason: `[User Denied ${name}]: ${denyReason}.` };
         }
       }
+      consecutiveRepeatedReadBlocks = 0;
     },
+    shouldStopAfterTurn: ({ toolResults }) =>
+      checkpoints.length > 0 &&
+      !lastToolError &&
+      toolResults.some(
+        (tr) =>
+          tr.toolName === 'bash' &&
+          tr.isError &&
+          Boolean(tr.content[0]?.text?.startsWith('[Pi Harness]: Command')),
+      ),
     getSteeringMessages: ({ lastAssistantMessage }) => {
       if (lastAssistantMessage.stopReason !== 'stop') return [];
       const needFixAfterError = lastToolError && stepCounter < maxSteps - 1;
@@ -1415,7 +1507,7 @@ export async function runAgentTurn(params: {
         retriedReplyGate = true;
         directReplyText = '';
         const msg = needFixAfterError
-          ? '[Pi Steering]: The previous tool call failed. Recover by calling "write" on src/App.jsx with valid, complete pure React + CSS code before replying.'
+          ? '[Pi Steering]: The previous tool call failed. Recover by installing any missing package via "bash" or calling "write" on src/App.jsx with valid code before replying.'
           : '[Pi Steering]: No code files were modified yet. Call "write" on src/App.jsx now to implement the application before replying.';
         return [{ role: 'user', content: msg, timestamp: Date.now() }];
       }

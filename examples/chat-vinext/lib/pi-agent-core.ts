@@ -466,7 +466,7 @@ ${workspaceTree}
 
 Guidelines:
 - Check unfamiliar files once with read before editing; use write to build or replace src/App.jsx completely and keep code concise (under ~85 lines, minimal comments).
-- Only react and react-dom are installed in package.json. NEVER import external npm packages (e.g. marked, react-markdown, lucide-react, axios); write pure React, SVG, and CSS directly.
+- You may install npm packages with bash (e.g. "npm install <pkg>") before importing them, or write pure React, SVG, and CSS directly when no external package is needed.
 - If a tool call returns an error, inspect the error and recover cleanly (prefer write if edit fails to match).
 - Only report file changes and command outputs you actually observed.
 - ${langRule}`;
